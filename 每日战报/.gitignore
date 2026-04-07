@@ -1,3 +1,4 @@
+# Why: 子目录级别的 gitignore，补充根目录规则覆盖不到的条目
 .env
 __pycache__/
 *.pyc
@@ -5,5 +6,5 @@ __pycache__/
 *.bak
 .vscode/
 .idea/
-_test_*
-test_l3_data.py
+.ruff_cache/
+.pytest_cache/

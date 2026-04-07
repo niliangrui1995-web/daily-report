@@ -29,6 +29,10 @@ venv/
 Thumbs.db
 .DS_Store
 
+# 缓存
+.pytest_cache/
+.ruff_cache/
+
 # 归档历史（已从 git 移除跟踪）
 _archive/
 

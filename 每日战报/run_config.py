@@ -36,6 +36,8 @@ def get_run_config(now: datetime) -> str:
     today = now.date()
     prev_day = _get_prev_trading_day(today)
     
+    # Why: now 来自 datetime.now()（naive，本地北京时间），prev_open 也用 naive 保持一致
+    # 若 now 带 tzinfo 则 prev_open 也会带，确保 delta 计算不会抛 TypeError
     prev_open = datetime.combine(prev_day, datetime.min.time()).replace(hour=9, tzinfo=now.tzinfo)
     delta_hours = max(int((now - prev_open).total_seconds() / 3600), 24)
     delta_hours = min(delta_hours, 240)

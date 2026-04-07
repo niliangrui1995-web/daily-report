@@ -1,0 +1,540 @@
+__doc__ = '\n原生 SDK 适配器 — 伪装成 LangChain ChatOpenAI\n\n核心原理：\n  外部接口完全兼容 LangChain 的 .invoke(messages) 方法\n  内部根据模型名自动选择 Anthropic SDK 或 Google GenAI SDK 直连\n  附带三层防风控重试（致命熔断/限流退避/超时重试）\n  支持 bind_tools() 方法进行工具调用\n\n【⚠️核心维护规则 / Agent 指令】\n1. 绝对兼容底线：入参和出参必须严格死守 LangChain `invoke` / `bind_tools` 的标准数据结构。严禁私自破坏这套“伪装皮囊”，否则下游所有 P 层的 Agent 调用都会集体宕机报错。\n2. 防风控与重试红线：内置的三层防风控（401/403号池熔断、429限流指数退避、超时重试）及 UA 伪装指纹（FAKE_HEADERS）是扛封号的血泪经验。修改时坚决不许删改休眠退避逻辑（time.sleep），防止把中转 API 和代理服务打崩溃。\n3. 推理链（Thinking）保留：针对 Claude 等模型返回的 `thinking` 思维链块，是理解 AI 决策过程的核弹级情报。在解析返回消息时，严禁将其当做废数据抹去，必须妥善挂载在 `thinking_content` 字段上放行给外层记录。\n4. Thinking 模式硬性约束：当模型名含 "thinking" 时，`temperature` 必须强制为 `1`、`max_tokens` 必须设为 `128000`——这是 Anthropic API 的硬性要求，不是可调参数。改了就炸，API 会直接拒绝请求。\n\n用法：\n  adapter = NativeLLMAdapter(model="claude-sonnet-4-6", base_url="http://127.0.0.1:8045")\n  result = adapter.invoke([SystemMessage(...), HumanMessage(...)])\n  # result.content == "模型返回的文本"\n\n  # 工具调用模式\n  bound = adapter.bind_tools([tool1, tool2])\n  result = bound.invoke(messages)\n  # result.tool_calls == [{"name": "...", "args": {...}, "id": "..."}]\n'
+
+import os
+import re
+import json
+import time
+import random
+import logging
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+
+try:
+    from pydantic import ConfigDict
+except ImportError:
+    ConfigDict = None
+
+try:
+    from langchain_core.runnables import RunnableSerializable
+    from langchain_core.messages import AIMessage as LCMessage
+    HAS_LANGCHAIN = True
+except ImportError:
+    RunnableSerializable = object
+    LCMessage = None
+    HAS_LANGCHAIN = False
+
+logger = logging.getLogger(__name__)
+
+FAKE_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+}
+
+@dataclass
+class FakeToolCall:
+    """模拟 LangChain 的 ToolCall"""
+    name: str
+    args: Dict[str, Any]
+    id: str
+
+@dataclass
+class FakeAIMessage:
+    """模拟 LangChain 的 AIMessage，支持 .content / .tool_calls / .thinking_content"""
+    content: str
+    type: str = 'ai'
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    thinking_content: str = ''
+
+def _format_tool_schema(tool: Any) -> Dict[str, Any]:
+    if hasattr(tool, 'name') and hasattr(tool, 'description'):
+        schema = {
+            'name': tool.name,
+            'description': tool.description or ''
+        }
+        if hasattr(tool, 'args_schema') and tool.args_schema:
+            try:
+                schema['parameters'] = tool.args_schema.schema()
+            except Exception:
+                pass
+        return schema
+    if isinstance(tool, dict):
+        return tool
+    return {'name': str(tool), 'description': ''}
+
+def _build_tools_prompt(tools: List[Any]) -> str:
+    if not tools:
+        return ''
+    lines = [
+        '\n\n## Available Tools\n',
+        'You have the following tools available. To call a tool, respond with a JSON block in this EXACT format:\n',
+        '```tool_call\n{"name": "tool_name", "arguments": {"param1": "value1"}}\n```\n',
+        'You may call MULTIPLE tools by including multiple tool_call blocks.\n',
+        'If you need to call a tool, respond ONLY with tool_call blocks and nothing else.\n',
+        'If you do NOT need to call any tool, respond with your analysis directly.\n\n',
+        '### Tool Definitions:\n'
+    ]
+    for tool in tools:
+        schema = _format_tool_schema(tool)
+        lines.append(f"**{schema['name']}**: {schema.get('description', '')}")
+        if 'parameters' in schema:
+            props = schema['parameters'].get('properties', {})
+            if props:
+                lines.append("  Parameters:")
+                for pname, pinfo in props.items():
+                    ptype = pinfo.get('type', 'string')
+                    pdesc = pinfo.get('description', '')
+                    lines.append(f"  - `{pname}` ({ptype}): {pdesc}")
+        lines.append("")
+    return "\n".join(lines)
+
+def _parse_tool_calls(text: str) -> List[Dict[str, Any]]:
+    tool_calls = []
+    pattern = r'```tool_call\s*\n?(.*?)\n?```'
+    matches = re.findall(pattern, text, re.DOTALL)
+    for match in matches:
+        try:
+            data = json.loads(match.strip())
+            tool_call = {
+                'name': data.get('name', ''),
+                'args': data.get('arguments', data.get('args', {})),
+                'id': f"call_{uuid.uuid4().hex[:8]}",
+                'type': 'tool_call'
+            }
+            tool_calls.append(tool_call)
+        except json.JSONDecodeError:
+            logger.warning(f"无法解析 tool_call JSON: {match[:100]}")
+
+    if not tool_calls:
+        json_pattern = r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\s*\}'
+        json_matches = re.findall(json_pattern, text, re.DOTALL)
+        for name, args_str in json_matches:
+            try:
+                args = json.loads(args_str)
+                tool_call = {
+                    'name': name,
+                    'args': args,
+                    'id': f"call_{uuid.uuid4().hex[:8]}",
+                    'type': 'tool_call'
+                }
+                tool_calls.append(tool_call)
+            except json.JSONDecodeError as e:
+                logger.warning(f"无法解析后备提取的 tool_call JSON: {args_str[:100]}... Error: {e}")
+
+    return tool_calls
+
+class NativeLLMAdapter(RunnableSerializable):
+    """
+    原生 SDK 适配器 — 继承 LangChain Runnable，可直接用在 prompt | llm 管道中
+
+    支持的模型：
+      - claude-*   → Anthropic 原生 SDK
+      - gemini-*   → Google GenAI 原生 SDK
+      - 其他       → 回退到 OpenAI 兼容协议
+
+    支持 bind_tools() 和 prompt | llm 管道
+    """
+    model: str = ''
+    base_url: str = ''
+    api_key: str = ''
+    max_retries: int = 3
+    timeout: float = 300.0
+    provider: str = 'openai_compat'
+    extra_kwargs: Dict[str, Any] = None
+    _bound_tools: List[Any] = None
+    _tools_prompt: str = ''
+
+    if ConfigDict:
+        model_config = ConfigDict(arbitrary_types_allowed=True)
+    else:
+        class Config:
+            """Pydantic 配置，允许任意类型字段"""
+            arbitrary_types_allowed = True
+
+    def __init__(
+        self,
+        model: str = '',
+        base_url: str = None,
+        api_key: str = None,
+        max_retries: int = 3,
+        timeout: float = 300.0,
+        **kwargs
+    ):
+        resolved_base_url = base_url or os.environ.get('ANTIGRAVITY_BASE_URL', 'http://127.0.0.1:8045')
+        resolved_api_key = api_key or os.environ.get('ANTIGRAVITY_API_KEY', os.environ.get('OPENAI_API_KEY', ''))
+
+        model_lower = model.lower()
+        if 'claude' in model_lower or 'opus' in model_lower:
+            provider = 'anthropic'
+        elif 'gemini' in model_lower:
+            provider = 'google'
+        else:
+            provider = 'openai_compat'
+
+        if HAS_LANGCHAIN:
+            super().__init__(
+                model=model,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                max_retries=max_retries,
+                timeout=timeout,
+                provider=provider,
+                extra_kwargs=kwargs
+            )
+        else:
+            super().__init__()
+            self.model = model
+            self.base_url = resolved_base_url
+            self.api_key = resolved_api_key
+            self.max_retries = max_retries
+            self.timeout = timeout
+            self.provider = provider
+            self.extra_kwargs = kwargs
+
+        self._bound_tools = []
+        self._tools_prompt = ''
+
+    @property
+    def InputType(self) -> Any:
+        return Any
+
+    @property
+    def OutputType(self) -> Any:
+        return Any
+
+    def invoke(self, messages: Any, config: Any = None) -> Any:
+        system_prompt, user_prompt = self._parse_messages(messages)
+
+        if self._tools_prompt:
+            system_prompt = system_prompt + self._tools_prompt
+
+        thinking_content = ''
+
+        if self.provider == 'anthropic':
+            result = self._call_anthropic(system_prompt, user_prompt)
+            if isinstance(result, tuple):
+                text, thinking_content = result
+            else:
+                text = result
+        elif self.provider == 'google':
+            text = self._call_gemini(f"{system_prompt}\n\n{user_prompt}")
+        else:
+            text = self._call_openai_compat(system_prompt, user_prompt)
+
+        tool_calls = []
+        if self._bound_tools:
+            tool_calls = _parse_tool_calls(text)
+
+        if tool_calls and HAS_LANGCHAIN and LCMessage:
+            msg = LCMessage(content='', tool_calls=tool_calls)
+            return msg
+        elif tool_calls:
+            return FakeAIMessage(content='', tool_calls=tool_calls)
+
+        if HAS_LANGCHAIN and LCMessage:
+            msg = LCMessage(content=text)
+            msg.thinking_content = thinking_content
+            return msg
+        else:
+            return FakeAIMessage(content=text, tool_calls=[], thinking_content=thinking_content)
+
+    def bind_tools(self, tools: List[Any]) -> 'NativeLLMAdapter':
+        bound = NativeLLMAdapter(
+            model=self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            max_retries=self.max_retries,
+            timeout=self.timeout,
+            **self.extra_kwargs
+        )
+        bound.provider = self.provider
+        bound._bound_tools = list(tools)
+        bound._tools_prompt = _build_tools_prompt(tools)
+        return bound
+
+    def bind(self, **kwargs):
+        return self
+
+    def with_config(self, **kwargs):
+        return self
+
+    def _parse_messages(self, messages: Any) -> tuple[str, str]:
+        if isinstance(messages, str):
+            return '', messages
+
+        system_parts = []
+        user_parts = []
+
+        if not isinstance(messages, (list, tuple)):
+            return '', str(messages)
+
+        for msg in messages:
+            if isinstance(msg, tuple) and len(msg) == 2:
+                role, content = msg
+                if role in ('system',):
+                    system_parts.append(content)
+                    continue
+                elif role in ('human', 'user'):
+                    user_parts.append(content)
+                    continue
+                elif role in ('ai', 'assistant'):
+                    user_parts.append(f"[Assistant]: {content}")
+                    continue
+                else:
+                    user_parts.append(content)
+                    continue
+
+            if hasattr(msg, 'type') and hasattr(msg, 'content'):
+                if msg.type == 'system':
+                    system_parts.append(msg.content)
+                    continue
+                elif msg.type == 'human':
+                    user_parts.append(msg.content)
+                    continue
+                elif msg.type == 'ai':
+                    if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                        tc_str = json.dumps(msg.tool_calls, ensure_ascii=False)
+                        user_parts.append(f"[Assistant tool calls]: {tc_str}")
+                        continue
+                    if msg.content:
+                        user_parts.append(f"[Assistant]: {msg.content}")
+                    continue
+                elif msg.type == 'tool':
+                    tool_name = getattr(msg, 'name', 'unknown_tool')
+                    user_parts.append(f"[Tool Result - {tool_name}]: {msg.content}")
+                    continue
+                else:
+                    if hasattr(msg, 'content'):
+                        user_parts.append(str(msg.content))
+                    else:
+                        user_parts.append(str(msg))
+                    continue
+
+            if isinstance(msg, dict):
+                role = msg.get('role', 'user')
+                content = msg.get('content', '')
+                if role == 'system':
+                    system_parts.append(content)
+                    continue
+                elif role == 'tool':
+                    tool_name = msg.get('name', 'unknown_tool')
+                    user_parts.append(f"[Tool Result - {tool_name}]: {content}")
+                    continue
+                else:
+                    user_parts.append(content)
+                    continue
+
+            user_parts.append(str(msg))
+
+        return '\n'.join(system_parts), '\n'.join(user_parts)
+
+    def _call_anthropic(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=self.api_key, base_url=self.base_url, default_headers=FAKE_HEADERS)
+
+        kwargs = {
+            'model': self.model,
+            'max_tokens': 16000,
+            'timeout': self.timeout
+        }
+
+        if system_prompt:
+            kwargs['system'] = system_prompt
+
+        kwargs['messages'] = [{'role': 'user', 'content': user_prompt}]
+
+        if 'thinking' in self.model.lower():
+            kwargs['temperature'] = 1
+            kwargs['max_tokens'] = 128000
+
+        for attempt in range(self.max_retries):
+            try:
+                response = client.messages.create(**kwargs)
+                text_blocks = [b.text for b in response.content if b.type == 'text']
+                thinking_blocks = [b.thinking for b in response.content if b.type == 'thinking']
+
+                text = text_blocks[0] if text_blocks else ''
+                thinking = '\n\n'.join(thinking_blocks) if thinking_blocks else ''
+
+                if thinking:
+                    logger.info(f"🧠 [Anthropic] 捕获 thinking 推理链: {len(thinking)} 字符")
+
+                return text, thinking
+            except Exception as e:
+                err_str = str(e).lower()
+                wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
+
+                if '401' in err_str or '403' in err_str or 'balance' in err_str:
+                    logger.warning(f"⚠️ [Anthropic] 账号风控(401/403)，等待 {wait:.1f}s 让反代切换账号（{attempt + 1}/{self.max_retries}）")
+                elif '429' in err_str or '503' in err_str or 'resource_exhausted' in err_str:
+                    logger.warning(f"⏳ [Anthropic] 触发限流，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+                elif 'timeout' in err_str or 'deadline' in err_str:
+                    logger.warning(f"⏳ [Anthropic] 超时，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+                else:
+                    logger.warning(f"⚠️ [Anthropic] 异常: {e}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+
+                time.sleep(wait)
+
+        logger.error(f"❌ [Anthropic] {self.max_retries} 次重试全部失败")
+        return '', ''
+
+    def _call_gemini(self, prompt: str) -> str:
+        # Why: Gemini 2.5 Flash 走原生直连通道 + OS VPN 梯子
+        if '2.5' in self.model:
+            import requests
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "tools": [{"googleSearch": {}}],
+                "generationConfig": {
+                    "temperature": 0.5,
+                    "maxOutputTokens": 16000
+                }
+            }
+
+            for attempt in range(self.max_retries):
+                try:
+                    resp = requests.post(url, json=payload, headers={'Content-Type': 'application/json'}, timeout=self.timeout)
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                    if data.get('candidates') and len(data['candidates']) > 0:
+                        candidate = data['candidates'][0]
+                        if 'content' in candidate and 'parts' in candidate['content']:
+                            return candidate['content']['parts'][0].get('text', '')
+                    return ''
+                except Exception as e:
+                    wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
+                    logger.warning(f"⚠️ [Gemini 2.5 Native] 异常: {e}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+                    time.sleep(wait)
+            logger.error(f"❌ [Gemini 2.5 Native] {self.max_retries} 次重试全部失败")
+            return ''
+
+        # 对于 Gemini 3.1 Pro，走原有的反代逻辑 (127.0.0.1:8045)
+        import google.generativeai as genai
+
+        # 兼容 Antigravity 反代特征，使用旧版 SDK 的 api_endpoint
+        genai.configure(
+            api_key=self.api_key,
+            transport='rest',
+            client_options={'api_endpoint': self.base_url}
+        )
+
+        model = genai.GenerativeModel(self.model)
+
+        for attempt in range(self.max_retries):
+            try:
+                # 3.1 Pro 走反代不强制挂载原生搜索，防止反代节点不支持报错
+                response = model.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.5,
+                        max_output_tokens=16000
+                    )
+                )
+                return response.text if response.text else ''
+            except Exception as e:
+                err_str = str(e).lower()
+                wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
+
+                if '401' in err_str or '403' in err_str or 'balance' in err_str:
+                    logger.warning(f"⚠️ [Gemini 3.1 反代] 账号风控(401/403)，等待 {wait:.1f}s 让反代切换账号（{attempt + 1}/{self.max_retries}）")
+                elif '429' in err_str or '503' in err_str or 'resource_exhausted' in err_str:
+                    logger.warning(f"⏳ [Gemini 3.1 反代] 触发限流，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+                elif 'timeout' in err_str or 'deadline' in err_str:
+                    logger.warning(f"⏳ [Gemini 3.1 反代] 超时，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+                else:
+                    logger.warning(f"⚠️ [Gemini 3.1 反代] 异常: {e}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+
+                time.sleep(wait)
+
+        logger.error(f"❌ [Gemini 3.1 反代] {self.max_retries} 次重试全部失败")
+        return ''
+
+    def _call_grok_native(self, system_prompt: str, user_prompt: str) -> str:
+        import requests
+
+        url = "https://api.x.ai/v1/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        input_messages = []
+        if system_prompt:
+            input_messages.append({"role": "system", "content": system_prompt})
+        input_messages.append({"role": "user", "content": user_prompt})
+
+        payload = {
+            "model": self.model,
+            "input": input_messages,
+            "tools": [{"type": "x_search"}]
+        }
+
+        for attempt in range(self.max_retries):
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+                resp.raise_for_status()
+                data = resp.json()
+
+                # 尝试从 Responses API 解析最终回答内容
+                text = ""
+                # 如果模型决定先执行搜索，Responses API 通常会自动完成后台隐式调用并在最终 content 输出，或需要自己追溯
+                if "output" in data:
+                    # 遍历 output 取文本，跳过 tool_call （除非需要手动处理）
+                    for block in data["output"]:
+                        if isinstance(block, dict) and "text" in block:
+                            text += block["text"] + "\n"
+                        elif isinstance(block, str):
+                            text += block + "\n"
+                return text.strip()
+            except Exception as e:
+                wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
+                logger.warning(f"⚠️ [Grok Native] 请求异常: {e}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+                time.sleep(wait)
+        logger.error(f"❌ [Grok Native] {self.max_retries} 次重试全部失败")
+        return ""
+
+    def _call_openai_compat(self, system_prompt: str, user_prompt: str) -> str:
+        # 如果是 Grok，挂载特种 Responses API 来支持原生 X_search
+        if 'grok' in self.model.lower():
+            return self._call_grok_native(system_prompt, user_prompt)
+
+        from openai import OpenAI
+
+        base_url = self.base_url + '/v1' if not self.base_url.endswith('/v1') else self.base_url
+        client = OpenAI(api_key=self.api_key, base_url=base_url)
+
+        messages = []
+        if system_prompt:
+            messages.append({'role': 'system', 'content': system_prompt})
+        messages.append({'role': 'user', 'content': user_prompt})
+
+        for attempt in range(self.max_retries):
+            try:
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=16000,
+                    timeout=self.timeout
+                )
+                return response.choices[0].message.content or ''
+            except Exception as e:
+                err_str = str(e).lower()
+                wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
+
+                if '401' in err_str or '403' in err_str or 'balance' in err_str:
+                    logger.warning(f"⚠️ [OpenAI兼容] 账号风控(401/403)，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+                elif '429' in err_str or '503' in err_str or 'resource_exhausted' in err_str:
+                    logger.warning(f"⏳ [OpenAI兼容] 触发限流，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+                elif 'timeout' in err_str or 'deadline' in err_str:
+                    logger.warning(f"⏳ [OpenAI兼容] 超时，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+                else:
+                    logger.warning(f"⚠️ [OpenAI兼容] 异常: {e}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+
+                time.sleep(wait)
+
+        logger.error(f"❌ [OpenAI兼容] {self.max_retries} 次重试全部失败")
+        return ''
+
+    def __repr__(self):
+        return f"NativeLLMAdapter(model={self.model}, provider={self.provider})"

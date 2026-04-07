@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+*.log
+*.bak
+.vscode/
+.idea/
+_test_*
+test_l3_data.py

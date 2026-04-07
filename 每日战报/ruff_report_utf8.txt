@@ -1,0 +1,22 @@
+﻿checkpoint.py:15:1: E402 Module level import not at top of file
+checkpoint.py:16:1: E402 Module level import not at top of file
+checkpoint.py:17:1: E402 Module level import not at top of file
+native_llm_adapter.py:382:16: F401 [*] `settings` imported but unused
+native_llm_adapter.py:458:16: F401 [*] `settings` imported but unused
+orchestrator.py:145:17: F823 Local variable `json` referenced before assignment
+p8_technical.py:5:8: F401 [*] `configparser` imported but unused
+p8_technical.py:21:36: E701 Multiple statements on one line (colon)
+p8_technical.py:34:34: E701 Multiple statements on one line (colon)
+p8_technical.py:61:24: E701 Multiple statements on one line (colon)
+p8_technical.py:77:29: E701 Multiple statements on one line (colon)
+p8_technical.py:86:21: E701 Multiple statements on one line (colon)
+p8_technical.py:91:29: E701 Multiple statements on one line (colon)
+p8_technical.py:104:18: E701 Multiple statements on one line (colon)
+p8_technical.py:106:18: E701 Multiple statements on one line (colon)
+p8_technical.py:114:37: E701 Multiple statements on one line (colon)
+p8_technical.py:155:5: F841 Local variable `full_date` is assigned to but never used
+p8_technical.py:205:25: E701 Multiple statements on one line (colon)
+p8_technical.py:239:16: E741 Ambiguous variable name: `l`
+search_engine.py:21:112: F401 [*] `settings.TAVILY_API_KEY` imported but unused
+Found 20 errors.
+[*] 4 fixable with the `--fix` option (1 hidden fix can be enabled with the `--unsafe-fixes` option).

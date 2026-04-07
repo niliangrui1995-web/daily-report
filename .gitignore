@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 运行时数据
+*.db
+*.log
+*.tmp
+
+# 环境变量
+.env
+.env.*
+
+# 虚拟环境
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+Thumbs.db
+.DS_Store
+
+# 归档历史（已从 git 移除跟踪）
+_archive/
+
+# 每日输出（运行时生成，不入版本控制）
+每日热点输出/

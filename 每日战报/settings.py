@@ -1,0 +1,109 @@
+__doc__ = '统一配置中心 — 环境变量加载 + 全局常量 + 适配器单例。\n\n【⚠️核心维护规则 / Agent 指令】\n1. 所有 API Key（Anthropic/Gemini/Grok/Tavily/SMTP）必须且只能从 `.env` 环境变量读取，严禁硬编码到代码里。\n2. `_auto_detect_local_proxy()` 的端口探活逻辑是防翻墙死锁的保命机制——它在 0.2s 内依次拨测常见代理端口。修改端口列表或超时值时必须确保 NO_PROXY 包含 `127.0.0.1,localhost`，防止本地反代 8045 被自己的代理误拦截形成死循环。\n3. `_LazyAdapter` 惰性加载模式是为了避免 `settings.py` 在模块顶层就实例化 NativeLLMAdapter 导致循环 import 死锁。严禁改成 `pro_adapter = NativeLLMAdapter(...)` 的立即初始化形式。\n'
+
+import os
+import logging
+import urllib3
+import warnings
+from datetime import datetime
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / '.env')
+except ImportError:
+    pass
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings('ignore', category=urllib3.exceptions.InsecureRequestWarning)
+
+os.environ['NO_PROXY'] = '127.0.0.1,localhost,::1'
+SYSTEM_PROXY = None
+for k in ('HTTP_PROXY', 'HTTPS_PROXY'):
+    if k in os.environ:
+        if not SYSTEM_PROXY:
+            SYSTEM_PROXY = os.environ[k]
+        if '127.0.0.1' in os.environ[k] or 'localhost' in os.environ[k]:
+            del os.environ[k]
+
+ANTIGRAVITY_BASE_URL = os.environ.get('ANTIGRAVITY_BASE_URL', 'http://127.0.0.1:8045')
+ANTIGRAVITY_API_KEY = os.environ.get('ANTIGRAVITY_API_KEY', '')
+if not ANTIGRAVITY_API_KEY:
+    logging.warning('⚠️ ANTIGRAVITY_API_KEY 未配置！请检查 .env 文件。Pro/Opus 模型调用将鉴权失败。')
+
+GEMINI_SEARCH_DIRECT_URL = 'https://generativelanguage.googleapis.com'
+GEMINI_SEARCH_CF_URL = os.environ.get('GEMINI_SEARCH_BASE_URL', 'https://api.niliangrui.cloud')
+_search_keys_env = os.environ.get('GEMINI_SEARCH_API_KEYS', '')
+_search_single_key = os.environ.get('GEMINI_SEARCH_API_KEY', '')
+if _search_keys_env:
+    SEARCH_API_KEY_POOL = [k.strip() for k in _search_keys_env.split(',') if k.strip()]
+elif _search_single_key:
+    SEARCH_API_KEY_POOL = [_search_single_key]
+else:
+    SEARCH_API_KEY_POOL = []
+
+if not SEARCH_API_KEY_POOL:
+    logging.warning('⚠️ GEMINI_SEARCH_API_KEYS 未配置！请检查 .env 文件。联网搜索功能将不可用。')
+
+GEMINI_SEARCH_MODEL = 'gemini-2.5-flash'
+GEMINI_PRO_MODEL = 'gemini-3.1-pro-high'
+OPUS_MODEL = 'claude-opus-4-6-thinking'
+
+TAVILY_API_KEY = os.environ.get('TAVILY_API_KEY', '')
+GROK_API_KEY = os.environ.get('GROK_API_KEY', '')
+
+EMAIL_ADDRESS = os.environ.get('EMAIL_ADDRESS', '')
+EMAIL_PASSWORD = os.environ.get('EMAIL_PASSWORD', '')
+RECEIVER_EMAIL = os.environ.get('RECEIVER_EMAIL', '')
+
+FAKE_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'}
+
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '每日热点输出')
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def get_today_output_dir() -> str:
+    today_str = datetime.now().strftime('%Y%m%d')
+    day_dir = os.path.join(OUTPUT_DIR, today_str)
+    os.makedirs(day_dir, exist_ok=True)
+    return day_dir
+
+_prompt_cache: dict[str, str] = {}
+
+def load_prompt(name: str) -> str:
+    if name not in _prompt_cache:
+        prompt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts')
+        try:
+            with open(os.path.join(prompt_dir, name), 'r', encoding='utf-8') as f:
+                _prompt_cache[name] = f.read()
+        except Exception as e:
+            logging.error(f'⚠️ [配置系统] 加载 Prompt 模板失败: {name}, Error: {e}')
+            _prompt_cache[name] = ''
+    return _prompt_cache[name]
+
+_pro_adapter = None
+_opus_adapter = None
+
+def _get_pro_adapter():
+    global _pro_adapter
+    if _pro_adapter is None:
+        from native_llm_adapter import NativeLLMAdapter
+        _pro_adapter = NativeLLMAdapter(model=GEMINI_PRO_MODEL, base_url=ANTIGRAVITY_BASE_URL, api_key=ANTIGRAVITY_API_KEY, max_retries=5)
+    return _pro_adapter
+
+def _get_opus_adapter():
+    global _opus_adapter
+    if _opus_adapter is None:
+        from native_llm_adapter import NativeLLMAdapter
+        _opus_adapter = NativeLLMAdapter(model=OPUS_MODEL, base_url=ANTIGRAVITY_BASE_URL, api_key=ANTIGRAVITY_API_KEY, timeout=600.0, max_retries=5)
+    return _opus_adapter
+
+class _LazyAdapter:
+    '''属性代理，兼容 `from settings import pro_adapter` 的直接使用方式。'''
+    def __init__(self, getter):
+        self._getter = getter
+    def __getattr__(self, name):
+        return getattr(self._getter(), name)
+    def __repr__(self):
+        return repr(self._getter())
+
+pro_adapter = _LazyAdapter(_get_pro_adapter)
+opus_adapter = _LazyAdapter(_get_opus_adapter)

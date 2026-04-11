@@ -13,7 +13,6 @@ import os
 import sys
 import time
 import logging
-import re
 import concurrent.futures
 import threading
 import contextlib
@@ -38,7 +37,7 @@ from p3_agent import collect_p3_parallel_only
 from p4_vanguard import fetch_vanguard_prices
 from audit_engine import gemini_pro_audit, p7a_deep_research_audit
 from p6_mapper import format_evidence, generate_report
-from p7_deep_research import run_deep_research
+from p7_deep_research import build_research_plan, run_deep_research
 from p8_technical import (
     extract_stocks_from_report,
     extract_stock_tracks,
@@ -136,6 +135,18 @@ def orchestrator_main():
     p7a_audited = ""  # Why: P7a 审计后的精炼版深研，替代 p7_deep 送入 P9
     p75_supplement = ""
     price_data = ""
+    research_plan = {
+        "goal": "",
+        "triggers": [],
+        "deep_topics": [],
+        "supplement_queries": [],
+        "should_run_p7": False,
+        "should_run_p75": False,
+        "max_rounds": 0,
+        "round_backtracks": [],
+        "skipped_recent_topics": [],
+    }
+    p7_plan_path = ""
 
     logging.info("=" * 60)
     logging.info(
@@ -364,9 +375,21 @@ def orchestrator_main():
             price_data = _read_text_checkpoint(ckpt["files"]["p8"], "P8 技术面数据")
 
     # ==================== P7 & P7.5: 深度研究与搜索补充 ====================
-    search_queries = re.findall(r"^\s*SEARCH:\s*(.+)$", p6_mapping, re.MULTILINE)
-    need_run_p7 = True
-    need_run_p75 = True
+    if p6_mapping:
+        research_plan = build_research_plan(
+            p6_mapping,
+            p4_data=p4_data,
+            p5_evidence=p5_evidence,
+        )
+        try:
+            p7_plan_path = write_json_artifact("P7_研究计划", research_plan)
+        except Exception as e:
+            logging.error(f"[P7] research plan write failed: {e}")
+            p7_plan_path = ""
+
+    search_queries = list(research_plan.get("supplement_queries") or [])
+    need_run_p7 = bool(research_plan.get("should_run_p7"))
+    need_run_p75 = bool(research_plan.get("should_run_p75"))
 
     # Why: p8_resume 语义 = P7 已完成，恢复时应优先复用历史结果，避免重复高成本调用
     if resume_from in ("p8_resume", "p9_resume"):
@@ -380,10 +403,19 @@ def orchestrator_main():
             f"P7.5={'复用' if not need_run_p75 else '补跑'}"
         )
 
+    p7_result = {
+        "status": "not_requested",
+        "topics_planned": 0,
+        "topics_completed": 0,
+        "rounds_run": 0,
+        "successful_rounds": 0,
+        "text": "",
+    }
+
     if need_run_p7 or need_run_p75:
         with log_heartbeat("P7 深研与 P7.5 搜索"):
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                p7_fut = pool.submit(run_deep_research, p6_mapping) if need_run_p7 else None
+                p7_fut = pool.submit(run_deep_research, research_plan) if need_run_p7 else None
 
                 sup_results = []
                 if need_run_p75 and search_queries:
@@ -399,9 +431,29 @@ def orchestrator_main():
 
                 if p7_fut is not None:
                     try:
-                        p7_deep = p7_fut.result(timeout=600)
+                        p7_result = p7_fut.result(timeout=600)
+                        p7_deep = p7_result.get("text", "")
                     except concurrent.futures.TimeoutError:
                         logging.warning("[P7] 深度研究超时")
+                        p7_result = {
+                            "status": "failed_timeout",
+                            "topics_planned": len(research_plan.get("deep_topics") or []),
+                            "topics_completed": 0,
+                            "rounds_run": 0,
+                            "successful_rounds": 0,
+                            "text": "",
+                        }
+                        p7_deep = ""
+                    except Exception as e:
+                        logging.error(f"[P7] 娣卞害鐮旂┒寮傚父: {e}")
+                        p7_result = {
+                            "status": "failed_exception",
+                            "topics_planned": len(research_plan.get("deep_topics") or []),
+                            "topics_completed": 0,
+                            "rounds_run": 0,
+                            "successful_rounds": 0,
+                            "text": "",
+                        }
                         p7_deep = ""
 
                 if need_run_p75:
@@ -439,13 +491,15 @@ def orchestrator_main():
             p7_body = (
                 "# P7 深度研究结果\n\n"
                 f"> 生成时间: {datetime.now().isoformat()}\n\n"
+                f"> goal: {research_plan.get('goal', '')}\n"
+                f"> triggers: {', '.join(research_plan.get('triggers', [])) or 'none'}\n\n"
                 f"{p7_deep}"
             )
             p7_path = write_text_artifact("P7_深度研究", p7_body)
             update_run_manifest(
                 "p7",
                 status="completed",
-                files={"md": p7_path},
+                files={"md": p7_path, "plan": p7_plan_path} if p7_plan_path else {"md": p7_path},
                 metrics={"output_chars": len(p7_deep), "topics": p7_deep.count("## 深度研究：")},
             )
         except Exception as e:

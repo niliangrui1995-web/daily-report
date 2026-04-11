@@ -1,33 +1,34 @@
-"""
-搜索引擎 — SearchKeyRotator + ChannelCircuitBreaker + gemini_search。
+"""Search engine utilities with key rotation, channel breaker, and Tavily fallback."""
 
-从 daily_report.py 拆分，包含：
-- 线程安全的 API Key 轮换器
-- 会话级通道熔断器（直连 Google → CF Worker → Tavily 三级降级）
-- gemini_search() 联网搜索函数
+from __future__ import annotations
 
-【⚠️核心维护规则 / Agent 指令】
-1. 搜索轮询器是极其精密的并发状态机，修改 SearchKeyRotator 轮询或 ChannelCircuitBreaker 熔断时，必须绝对遵守 `threading.Lock()` 加锁规矩，防止多线程死锁。
-2. 严禁改动 `gemini_search` 身上的 `@sleep_and_retry` 和 `@limits(calls=1, period=1)` 装饰器限流频率，这是保证免费 API 不被拔管的最后物理护城河。
-3. 获取网页时必须留有优雅降级通道，严禁去掉“直连Google → CF Worker镜像 → Tavily”这种三梯队递减的防弹衣。
-"""
-
-import time
 import logging
-import threading
 import random
+import threading
+import time
+from datetime import datetime
+
 import requests
 from ratelimit import limits, sleep_and_retry
 
-from settings import SEARCH_API_KEY_POOL, GEMINI_SEARCH_DIRECT_URL, GEMINI_SEARCH_CF_URL, GEMINI_SEARCH_MODEL, TAVILY_API_KEY
 from scraper_utils import enrich_search_urls
+from settings import (
+    GEMINI_SEARCH_CF_URL,
+    GEMINI_SEARCH_DIRECT_URL,
+    GEMINI_SEARCH_MODEL,
+    SEARCH_API_KEY_POOL,
+    TAVILY_API_KEY,
+)
+from utils import parse_backtrack_hours
+
 
 class SearchKeyRotator:
-    """线程安全的搜索 API Key 轮换器"""
+    """Thread-safe Gemini search key rotator."""
+
     def __init__(self, keys: list[str], base_url: str):
         self._keys = keys
         self._index = 0
-        self._exhausted = set()
+        self._exhausted: set[int] = set()
         self._lock = threading.Lock()
         self._base_url = base_url
 
@@ -39,10 +40,11 @@ class SearchKeyRotator:
     def available(self) -> int:
         return self.total - len(self._exhausted)
 
-    def get_client(self):
+    def get_client(self) -> tuple[str | None, str | None, int, str]:
         with self._lock:
-            if len(self._exhausted) >= len(self._keys):
-                return None, None, -1, 'N/A'
+            if not self._keys or len(self._exhausted) >= len(self._keys):
+                return None, None, -1, "N/A"
+
             while self._index in self._exhausted:
                 self._index = (self._index + 1) % len(self._keys)
 
@@ -53,6 +55,8 @@ class SearchKeyRotator:
 
     def mark_exhausted(self, key_index: int):
         with self._lock:
+            if key_index < 0 or key_index >= len(self._keys):
+                return
             self._exhausted.add(key_index)
             remaining = self.total - len(self._exhausted)
             key_last4 = self._keys[key_index][-4:]
@@ -61,20 +65,20 @@ class SearchKeyRotator:
                 while self._index in self._exhausted:
                     self._index = (self._index + 1) % len(self._keys)
                 next_last4 = self._keys[self._index][-4:]
-                logging.warning(f'🔄 搜索 Key ...{key_last4} 额度耗尽，切换到 ...{next_last4}（剩余 {remaining}/{self.total}）')
+                logging.warning(
+                    f"[search] key ...{key_last4} exhausted; switch to ...{next_last4} ({remaining}/{self.total})"
+                )
             else:
-                logging.error(f'❌ 所有 {self.total} 个搜索 Key 额度已用完！')
+                logging.error(f"[search] all {self.total} keys exhausted")
+
 
 class ChannelCircuitBreaker:
-    """会话级通道熔断器：半开冷却恢复机制（自动探流）
+    """Per-channel circuit breaker with cooldown probing."""
 
-    Why: 与 SearchKeyRotator 一样需要 threading.Lock() 保护并发安全，
-         否则多线程同时 record_failure 时计数会丢失，熔断器永远不触发。
-    """
     def __init__(self, threshold: int = 2, cooldown_sec: int = 300):
-        self._failures = {}
-        self._tripped = set()
-        self._tripped_time = {}
+        self._failures: dict[str, int] = {}
+        self._tripped: set[str] = set()
+        self._tripped_time: dict[str, float] = {}
         self._threshold = threshold
         self._cooldown = cooldown_sec
         self._lock = threading.Lock()
@@ -85,240 +89,257 @@ class ChannelCircuitBreaker:
             if self._failures[channel_name] >= self._threshold:
                 self._tripped.add(channel_name)
                 self._tripped_time[channel_name] = time.time()
-                logging.warning(f'⚡ 熔断器触发：{channel_name} 连续失败 {self._threshold} 次，进入冷却 ({self._cooldown}s)')
+                logging.warning(
+                    f"[search] circuit breaker tripped for {channel_name} after {self._threshold} failures"
+                )
 
     def record_success(self, channel_name: str):
         with self._lock:
             self._failures[channel_name] = 0
             self._tripped.discard(channel_name)
-            if channel_name in self._tripped_time:
-                del self._tripped_time[channel_name]
+            self._tripped_time.pop(channel_name, None)
 
     def is_tripped(self, channel_name: str) -> bool:
         with self._lock:
-            if channel_name in self._tripped:
-                elapsed = time.time() - self._tripped_time.get(channel_name, 0)
-                if elapsed > self._cooldown:
-                    logging.info(f'🛡️ 熔断器半开：{channel_name} 冷却期 ({self._cooldown}s) 结束，放行探流一次')
-                    self._tripped.discard(channel_name)
-                    return False
-                return True
-            return False
+            if channel_name not in self._tripped:
+                return False
+            elapsed = time.time() - self._tripped_time.get(channel_name, 0)
+            if elapsed > self._cooldown:
+                self._tripped.discard(channel_name)
+                self._tripped_time.pop(channel_name, None)
+                logging.info(f"[search] cooldown finished for {channel_name}; probe once")
+                return False
+            return True
+
 
 search_rotator_direct = SearchKeyRotator(SEARCH_API_KEY_POOL, GEMINI_SEARCH_DIRECT_URL)
 search_rotator_cf = SearchKeyRotator(SEARCH_API_KEY_POOL, GEMINI_SEARCH_CF_URL)
 channel_breaker = ChannelCircuitBreaker(threshold=2)
 _http_session = requests.Session()
-
-# Why: search_key_rotator 是历史遗留的死代码（双通道重构后未清理），已删除
 GEMINI_CONCURRENCY = max(search_rotator_direct.total, 1)
 
 
-def _tavily_fallback(query: str, category: str = 'raw_search', return_dict: bool = False):
-    """Tavily 搜索降级兜底 — 双通道 Gemini 全挂时的最后防线。
+def _build_search_prompt(category: str, query: str, backtrack: str) -> str:
+    hours = parse_backtrack_hours(backtrack, default=24)
+    if hours <= 72:
+        window_policy = (
+            f"Search window: focus on the last {hours} hours. "
+            "Discard older items unless they are required to explain the direct cause."
+        )
+    else:
+        window_policy = (
+            f"Search window: prioritize the last 72 hours, but allow up to the last {hours} hours "
+            "for background, precedent, and named-entity context."
+        )
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return (
+        f"Current Beijing time: {now_str}\n\n"
+        "You are an AI industry-chain researcher. Search the topic below and return only grounded facts.\n"
+        f"Topic: {query}\n"
+        f"Category: {category}\n"
+        f"Search window: {backtrack}\n"
+        f"{window_policy}\n"
+        "Output format: 1. [Entity] factual statement [Source: URL | date]\n"
+        "If nothing is found, say \"not found\". Do not fabricate."
+    )
 
-    Why: 原先在 raw_gemini_search() 和 gemini_search() 中各复制了一份几乎相同的
-         Tavily 降级代码（约 30 行重复），违反 DRY 原则。提取为公共函数统一维护。
-    """
+
+def _tavily_fallback(query: str, category: str = "raw_search", return_dict: bool = False):
     if not TAVILY_API_KEY:
-        return {} if return_dict else ''
+        return {} if return_dict else ""
     try:
-        logging.info(f'  [{category}] ↘️ 降级到 Tavily 搜索引擎...')
-        tavily_resp = requests.post(
-            'https://api.tavily.com/search',
+        logging.info(f"[{category}] fallback to Tavily")
+        response = requests.post(
+            "https://api.tavily.com/search",
             json={
-                'api_key': TAVILY_API_KEY,
-                'query': query[:400],
-                'search_depth': 'advanced',
-                'max_results': 5,
-                'include_answer': True,
+                "api_key": TAVILY_API_KEY,
+                "query": query[:400],
+                "search_depth": "advanced",
+                "max_results": 5,
+                "include_answer": True,
             },
             timeout=30,
         )
-        tavily_resp.raise_for_status()
-        tavily_data = tavily_resp.json()
-        answer = tavily_data.get('answer', '')
-        results_list = tavily_data.get('results', [])
-        parts = []
+        response.raise_for_status()
+        data = response.json()
+        answer = data.get("answer", "")
+        results = data.get("results", [])
+        parts: list[str] = []
+        sources: list[dict[str, str]] = []
         if answer:
-            parts.append(f'[Tavily Fallback] {answer}')
-        sources = []
-        for r in results_list[:5]:
-            title = r.get('title', '')
-            content = r.get('content', '')
-            url = r.get('url', '')
-            parts.append(f'- {title}: {content[:300]} 【{url}】')
+            parts.append(f"[Tavily Fallback] {answer}")
+        for item in results[:5]:
+            title = item.get("title", "")
+            content = item.get("content", "")
+            url = item.get("url", "")
+            parts.append(f"- {title}: {content[:300]} [{url}]")
             if url:
-                sources.append({'url': url, 'title': title})
-        if parts:
-            channel_breaker.record_success('Tavily')
-            logging.info(f'  [{category}] ✅ Tavily 降级成功，返回 {len(parts)} 条结果')
-            text = '\n'.join(parts)
-            if return_dict:
-                return {'text': text, 'grounding_sources': sources}
-            return text
-    except Exception as e:
-        logging.warning(f'  [{category}] Tavily 降级也失败: {e}')
-    return {} if return_dict else ''
+                sources.append({"url": url, "title": title})
+        if not parts:
+            return {} if return_dict else ""
+        channel_breaker.record_success("tavily")
+        text = "\n".join(parts)
+        if return_dict:
+            return {"text": text, "grounding_sources": sources}
+        return text
+    except Exception as exc:
+        logging.warning(f"[{category}] Tavily fallback failed: {exc}")
+        return {} if return_dict else ""
 
-logging.info(f'[搜索 Key 池] 已加载 {search_rotator_direct.total} 个 Key（双通道：直连 Google + CF Worker + 熔断器）')
+
+def _post_search_request(
+    *,
+    base_url: str,
+    key: str,
+    prompt: str,
+    temperature: float,
+) -> requests.Response:
+    url = f"{base_url}/v1beta/models/{GEMINI_SEARCH_MODEL}:generateContent?key={key}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"googleSearch": {}}],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": 8192,
+        },
+    }
+    return _http_session.post(
+        url,
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        timeout=180,
+    )
+
 
 def raw_gemini_search(prompt: str, max_retries: int = 3) -> str:
-    channels = [
-        ('直连Google', search_rotator_direct),
-        ('CF-Worker', search_rotator_cf)
-    ]
+    channels = [("direct", search_rotator_direct), ("cf_worker", search_rotator_cf)]
 
     for channel_name, rotator in channels:
         if channel_breaker.is_tripped(channel_name):
-            logging.debug(f'  [raw_search] [{channel_name}] 已熔断，跳过')
+            logging.debug(f"[raw_search] skip tripped channel {channel_name}")
             continue
 
-        for _attempt_key in range(rotator.total):
+        for _ in range(rotator.total):
             base_url, key, key_idx, key_last4 = rotator.get_client()
-            if base_url is None:
-                logging.error(f'  [raw_search] [{channel_name}] 所有搜索 Key 额度已用尽')
+            if base_url is None or key is None:
+                logging.error(f"[raw_search] no available key on {channel_name}")
                 break
 
             for attempt in range(max_retries):
                 try:
-                    url = f'{base_url}/v1beta/models/{GEMINI_SEARCH_MODEL}:generateContent?key={key}'
-                    payload = {
-                        'contents': [{'parts': [{'text': prompt}]}],
-                        'tools': [{'googleSearch': {}}],
-                        'generationConfig': {
-                            'temperature': 0.7,
-                            'maxOutputTokens': 8192
-                        }
-                    }
-                    response = _http_session.post(url, json=payload, headers={'Content-Type': 'application/json'}, timeout=180)
-
+                    response = _post_search_request(
+                        base_url=base_url,
+                        key=key,
+                        prompt=prompt,
+                        temperature=0.7,
+                    )
                     if response.status_code in (429, 403):
-                        logging.warning(f'  [raw_search] [{channel_name}] Key ...{key_last4} 触发限流({response.status_code})，标记耗尽')
+                        logging.warning(f"[raw_search] key ...{key_last4} limited on {channel_name}")
                         rotator.mark_exhausted(key_idx)
                         break
 
                     response.raise_for_status()
                     data = response.json()
-                    text = ''
-
-                    if data.get('candidates') and len(data['candidates']) > 0:
-                        candidate = data['candidates'][0]
-                        if 'content' in candidate and 'parts' in candidate['content']:
-                            text = candidate['content']['parts'][0].get('text', '')
-
+                    candidates = data.get("candidates") or []
+                    if not candidates:
+                        continue
+                    text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                     if text.strip():
                         channel_breaker.record_success(channel_name)
                         return text
-
-                    logging.warning(f'  [raw_search] [{channel_name}] Gemini 返回空内容，重试 ({attempt + 1}/{max_retries})')
+                    logging.warning(f"[raw_search] empty Gemini response on {channel_name}")
                     time.sleep(3)
-
                 except requests.exceptions.ConnectTimeout:
                     channel_breaker.record_failure(channel_name)
-                    logging.warning(f'  [raw_search] [{channel_name}] 连接超时，熔断器计数 +1')
+                    logging.warning(f"[raw_search] connect timeout on {channel_name}")
                     break
                 except Exception as exc:
                     err_str = str(exc).lower()
-                    if '429' in err_str or '403' in err_str or 'quota' in err_str:
-                        logging.warning(f'  [raw_search] [{channel_name}] Key ...{key_last4} 额度耗尽，标记并切换')
+                    if "429" in err_str or "403" in err_str or "quota" in err_str:
+                        logging.warning(f"[raw_search] quota exhausted for key ...{key_last4}")
                         rotator.mark_exhausted(key_idx)
                         break
-
-                    # Why: 指数退避 3→6→12s，比固定 3s 更有效应对突发 503 风暴
-                    wait = 3 * (2 ** attempt) + random.uniform(0, 2)
-                    logging.warning(f'  [raw_search] [{channel_name}] 搜索异常: {exc}，{wait:.0f}s 后重试 ({attempt + 1}/{max_retries})')
+                    wait = 3 * (2**attempt) + random.uniform(0, 2)
+                    logging.warning(
+                        f"[raw_search] exception on {channel_name}: {exc}; retry in {wait:.0f}s ({attempt + 1}/{max_retries})"
+                    )
                     time.sleep(wait)
 
-    # Why: Gemini 双通道全部失败后降级到 Tavily 搜索引擎
-    result = _tavily_fallback(prompt, category='raw_search', return_dict=False)
+    result = _tavily_fallback(prompt, category="raw_search", return_dict=False)
     if result:
         return result
 
-    logging.error('❌ [raw_search] 所有通道和 Key 均失败（含 Tavily 降级），返回空结果')
-    return ''
+    logging.error("[raw_search] all search routes failed")
+    return ""
+
 
 @sleep_and_retry
 @limits(calls=1, period=1)
-def gemini_search(category: str, query: str, backtrack: str = '24h', max_retries: int = 3) -> dict:
-    from datetime import datetime
-    now_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
-    prompt = f'⚠️ 当前北京时间：{now_str}\n\n你是 AI 产业链深度研究员。请对以下主题进行深入搜索。\n搜索方向：{query}\n赛道：{category}\n格式：序号. [实体] 客观事实内容 【信源|URL|日期】\n搜不到的如实说"未搜索到"。严禁编造。'
-
-    channels = [
-        ('直连Google', search_rotator_direct),
-        ('CF-Worker', search_rotator_cf)
-    ]
+def gemini_search(category: str, query: str, backtrack: str = "24h", max_retries: int = 3) -> dict:
+    prompt = _build_search_prompt(category, query, backtrack)
+    channels = [("direct", search_rotator_direct), ("cf_worker", search_rotator_cf)]
 
     for channel_name, rotator in channels:
         if channel_breaker.is_tripped(channel_name):
-            logging.debug(f'  [{category}] [{channel_name}] 已熔断，跳过')
+            logging.debug(f"[{category}] skip tripped channel {channel_name}")
             continue
 
-        for _attempt_key in range(rotator.total):
+        for _ in range(rotator.total):
             base_url, key, key_idx, key_last4 = rotator.get_client()
-            if base_url is None:
-                logging.error(f'  [{category}] [{channel_name}] 所有搜索 Key 额度已用尽')
+            if base_url is None or key is None:
+                logging.error(f"[{category}] no available key on {channel_name}")
                 break
 
             for attempt in range(max_retries):
                 try:
-                    url = f'{base_url}/v1beta/models/{GEMINI_SEARCH_MODEL}:generateContent?key={key}'
-                    payload = {
-                        'contents': [{'parts': [{'text': prompt}]}],
-                        'tools': [{'googleSearch': {}}],
-                        'generationConfig': {
-                            'temperature': 1.0,
-                            'maxOutputTokens': 8192
-                        }
-                    }
-                    r = _http_session.post(url, json=payload, headers={'Content-Type': 'application/json'}, timeout=180)
-
-                    if r.status_code in (429, 403):
-                        logging.warning(f'  [{category}] [{channel_name}] Key ...{key_last4} 限流({r.status_code})，跳过')
+                    response = _post_search_request(
+                        base_url=base_url,
+                        key=key,
+                        prompt=prompt,
+                        temperature=1.0,
+                    )
+                    if response.status_code in (429, 403):
+                        logging.warning(f"[{category}] key ...{key_last4} limited on {channel_name}")
                         rotator.mark_exhausted(key_idx)
                         break
 
-                    r.raise_for_status()
-                    data = r.json()
-
-                    if not data.get('candidates') or not data['candidates']:
+                    response.raise_for_status()
+                    data = response.json()
+                    candidates = data.get("candidates") or []
+                    if not candidates:
                         return {}
 
-                    candidate = data['candidates'][0]
-                    text = candidate.get('content', {}).get('parts', [{}])[0].get('text', '')
-                    grounding = candidate.get('groundingMetadata', {}).get('groundingChunks', [])
+                    candidate = candidates[0]
+                    text = candidate.get("content", {}).get("parts", [{}])[0].get("text", "")
+                    grounding = candidate.get("groundingMetadata", {}).get("groundingChunks", [])
 
                     sources = []
-                    for g in grounding:
-                        web = g.get('web', {})
-                        if web and web.get('uri'):
-                            sources.append({'url': web.get('uri'), 'title': web.get('title', '')})
+                    for chunk in grounding:
+                        web = chunk.get("web", {})
+                        if web and web.get("uri"):
+                            sources.append({"url": web.get("uri"), "title": web.get("title", "")})
 
                     channel_breaker.record_success(channel_name)
-                    result = {'text': text, 'grounding_sources': sources}
-                    return enrich_search_urls(result)
-
+                    return enrich_search_urls({"text": text, "grounding_sources": sources})
                 except requests.exceptions.ConnectTimeout:
                     channel_breaker.record_failure(channel_name)
-                    logging.warning(f'  [{category}] [{channel_name}] 连接超时，熔断器计数 +1')
+                    logging.warning(f"[{category}] connect timeout on {channel_name}")
                     break
                 except Exception as exc:
                     err_str = str(exc).lower()
-                    if '429' in err_str or '403' in err_str or 'quota' in err_str:
-                        logging.warning(f'  [{category}] [{channel_name}] Key ...{key_last4} 额度耗尽，标记不重试')
+                    if "429" in err_str or "403" in err_str or "quota" in err_str:
+                        logging.warning(f"[{category}] quota exhausted for key ...{key_last4}")
                         rotator.mark_exhausted(key_idx)
                         break
-
-                    # Why: 指数退避 3→6→12s，比固定 3s 更有效应对突发 503 风暴
-                    wait = 3 * (2 ** attempt) + random.uniform(0, 2)
-                    logging.warning(f'  [{category}] [{channel_name}] 异常: {exc}，{wait:.0f}s 后重试 ({attempt + 1}/{max_retries})')
+                    wait = 3 * (2**attempt) + random.uniform(0, 2)
+                    logging.warning(
+                        f"[{category}] exception on {channel_name}: {exc}; retry in {wait:.0f}s ({attempt + 1}/{max_retries})"
+                    )
                     time.sleep(wait)
 
-    # Why: Gemini 双通道全部失败后降级到 Tavily
     result = _tavily_fallback(query, category=category, return_dict=True)
     if result:
         return enrich_search_urls(result)
 
-    logging.error(f'❌ [{category}] 所有搜索途径均失败（含 Tavily 降级）')
+    logging.error(f"[{category}] all search routes failed")
     return {}

@@ -51,7 +51,8 @@
 
 - **`p2_x_intel.py` (P2：X平台先遣哨兵)** 🌟 `巨头爆料专线`
   - **价值**：直连 Grok 原始接口，在全球最大的硅谷内部"八卦阵" (Twitter)
-    里按预设字典抓取第一手的泄密情报。自带指数退避限流睡眠及死磕机制。
+    里按预设字典抓取第一手的泄密情报。当前输出会先被整理为
+    `claim / source / confidence / source_url` 结构，再送入 P6/P9。
 
 - **`p1_rss.py` (P1：RSS/网媒并发爬网机)**  
   - **价值**：通过近三十个官方、财报源、行业媒体获取宏观及科技业公开信息。
@@ -63,7 +64,7 @@
   - **价值**：纯 AI 搜索引擎，不用任何传统爬虫。利用 Gemini 2.5 Flash 的
     Google Search Grounding 能力执行三个锦囊任务：锦囊一空袭 P1 深挖失败的高价值
     文章，锦囊二扫雷 GitHub/HackerNews 等极客圈非共识信号，锦囊三侦测全球
-    10 个半导体核心产区的地方新闻异动。输出 .md + .json 双文件。
+    10 个半导体核心产区的地方新闻异动。输出已经统一为结构化 Markdown + JSON 双文件。
 
 - **`config.py` (搜刮器静态参数配置)**
   - **价值**：存放大盘监控清单、浏览器反爬请求头和 RSS 备用节点库。
@@ -100,22 +101,70 @@
 
 - **`p6_mapper.py` (P6：A股映射大脑 - Claude Opus)**
   - **价值**：核心发力点。Opus 的 Thinking 会在这里将昨夜的科技巨头消息
-    和客观股价捏合并严谨映射到咱们大 A 的可炒作题材上。**v4.3 升级点**：彻底解耦为纯映射引擎，JSON 安全序列能力提升。
+    和客观股价捏合并严谨映射到咱们大 A 的可炒作题材上。当前已与 `P7` 共用最近
+    5 天主题去重护栏，不再各自维护一套历史主题扫描逻辑。
 
 - **`p7_deep_research.py` (P7：深度研究大脑 - Gemini Flash + Pro)**
   - **价值**：接续 P6 输出的深研指令，按主题进行 3 轮自动衍生和补网搜索，
-    最终生成带关联溯源的深度研报，解决快餐信息的浅薄。
-    **v4.7 升级点**：P7 原始数据不再直接送入 P9，而是经 P7a 审计层去重汇总后再送出。
+    最终生成带关联溯源的深度研报，解决快餐信息的浅薄。当前已升级为统一研究计划
+    中枢，负责 P7/P7.5 触发判断、近 5 天主题去重、自适应轮数和停止条件。
 
-- **`p8_technical.py` (P8：打板风流与短线挖掘 - Claude Opus)**
-  - **价值**：结合个股突破量价逻辑、题材强度做纯 A 股视角的投机盘感分析，
-    筛选出基本面支撑、阻力最小的怪物。**v4.6 升级点**：重构大模型输出特征标签提取，实现与 P6 提示词输出标签（🔥⚡💀）100% 精确匹配，根除兜底参数错配导致解析脱轨。
+- **`p8_technical.py` (P8：本地技术面装配层)**
+  - **价值**：基于本地通达信 `.day` 数据，为 P6 标的补齐 250 日位置、均线、RS、
+    布林、ATR、周线趋势等客观技术特征。当前已拆分为 `p8_extractors.py /
+    p8_indicators.py / p8_storage.py / p8_technical.py` 四块。
 
 - **`p9_reporter.py` (P9：终极文胆与分发者)**
-  - **价值**：统帅全案，把 P6 产业链因果和 P8 诊断收拢。**v4.6 升级点**：在召唤 Opus 前暴力清洗 P5/P6/P7 内部日志及废话结构，清洗正则由松散配置转为严密校验格式；最大化单次推理输入的“纯净信噪比”。撰写成带有 Emoji 的 Markdown 交响乐战报。
+  - **价值**：统帅全案，把 P6 产业链因果和 P8 诊断收拢。当前已拆分为
+    `p9_rendering.py / p9_email.py / p9_reporter.py`，其中 `p9_reporter.py`
+    只负责 LLM 调用、JSON 解析、产物落盘和邮件调度。
 
 ---
 
 > **系统性哲学**：VCP Hunter 的本质，就是用工程学去锁死大模型的随机性，
 > 用物理级强并行的抓取去解决数据的时间差，最后将判断的权力交给最强模型。
 > 你修改 `industry_dict.py` 等字典模块，就是在撬动机器大军攻向新高地。
+## 2026-04-12 架构同步说明
+
+这份架构文档按当前代码现状补充 4 项优化的实际进度：
+
+1. `P2/P3 -> P6/P9` 的“结构化 claim + source + confidence”门禁已落地。
+   - `intel_structuring.py` 负责将 P2 的 `<x_leaks>` 和 P3 三锦囊结果归一为结构化条目。
+   - `p2_x_intel.py` / `p3_agent.py` 现在都会产出结构化 Markdown，并同步落盘 `.json` 供下游追溯。
+
+2. `P6/P7/P7.5` 的规划与去重逻辑已统一。
+   - `p7_deep_research.py` 对外提供共享的最近 5 天主题护栏。
+   - `p6_mapper.py` 不再私有维护另一套历史主题扫描逻辑。
+
+3. `P1/P3/P4/P7.5` 真实收益指标已落地。
+   - `contribution_metrics.py` 会输出 `Layer_ROI_*.json/.md`。
+   - `orchestrator.py` 在 P9 结束后自动补跑 ROI 复盘，并把 `roi_score / roi_recommendation` 回填到 `run_manifest.json`。
+
+4. `P8/P9` 模块拆分已完成。
+   - `P8` 拆为 `p8_extractors.py / p8_indicators.py / p8_storage.py / p8_technical.py`
+   - `P9` 拆为 `p9_rendering.py / p9_email.py / p9_reporter.py`
+
+### 新增模块
+
+- `contribution_metrics.py`
+  - 负责抽取 `P1/P3/P4/P7.5` 的有效信息单元
+  - 计算跨层独有贡献、P6/P9 采纳率、单位成本
+  - 输出 `Layer_ROI_*.json` 与 `Layer_ROI_*.md`
+
+- `intel_structuring.py`
+  - 将 P2/P3 结果归一到 `claim / source / confidence / source_url`
+  - 让 P6/P9 吃到结构化情报而不是松散自由文本
+
+- `p8_extractors.py / p8_indicators.py / p8_storage.py`
+  - 将 P8 的通达信读取、技术指标计算、双轨落盘拆开
+  - `p8_technical.py` 只保留装配与业务编排
+
+- `p9_rendering.py / p9_email.py`
+  - 将 P9 的 Markdown 渲染和邮件构建/发送从主流程中拆出
+  - `p9_reporter.py` 只保留 LLM 调用、JSON 解析、产物落盘与调度
+
+### 新增运行产物
+
+- `Layer_ROI_*.json`
+- `Layer_ROI_*.md`
+- `run_manifest.json` 中的每层 ROI 指标字段

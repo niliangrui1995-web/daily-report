@@ -16,17 +16,16 @@ P6 Opus A 股映射 — 产业链情报→A股标的映射。
 """
 
 import json
-import os
 import re
 import time
 import logging
-from datetime import datetime, timedelta
-import glob
+from datetime import datetime
 
 from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
-from settings import opus_adapter, OPUS_MODEL, OUTPUT_DIR, require_prompt
+from settings import opus_adapter, OPUS_MODEL, require_prompt
 from industry_dict import OLIGARCH_DICT
 from utils import extract_json_from_llm_response
+from p7_deep_research import build_recent_topic_guardrail
 
 HALLUCINATION_MAP = {
     '佰维存储': '688525',
@@ -89,43 +88,9 @@ def format_evidence(results: list[dict]) -> str:
         lines.append(t)
         lines.append("----------------------------------------")
     return '\n'.join(lines)
-
-
-def _get_recent_deep_topics(days: int = 5) -> list[str]:
-    cutoff = datetime.now() - timedelta(days=days)
-    pattern = os.path.join(OUTPUT_DIR, '**', 'P7_深度研究_*.md')
-    recent_topics = []
-    
-    for fpath in sorted(glob.glob(pattern, recursive=True), reverse=True):
-        try:
-            fname = os.path.basename(fpath)
-            m = re.search(r'(\d{12,14})', fname)
-            if not m:
-                continue
-                
-            date_part = m.group(1)[:12]
-            file_date = datetime.strptime(date_part, '%Y%m%d%H%M')
-            if file_date < cutoff:
-                break
-                
-            with open(fpath, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if line.startswith('## 深度研究：'):
-                        topic = line.replace('## 深度研究：', '').strip()
-                        if topic:
-                            recent_topics.append(f"- {topic} ({file_date.strftime('%m/%d')})")
-        except Exception as e:
-            logging.debug(f'Ignored continue exception: {e}')
-            continue
-            
-    if recent_topics:
-        logging.info(f'[P6.5 去重] 最近 {days} 天已研究 {len(recent_topics)} 个主题')
-    return '\n'.join(recent_topics)
-
-
 def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
     logging.info(f'[P6 映射] 引擎: {OPUS_MODEL}')
-    recent_history = _get_recent_deep_topics(days=5)
+    recent_history = build_recent_topic_guardrail(days=5)
     dedup_section = ''
     if recent_history:
         dedup_section = f'\n⛔ 以下主题近 5 天已深度研究过，严禁重复选择（除非有全新的重大数据/事件，而非旧闻换皮）：\n{recent_history}\n违反去重规则等同于输出失败。\n'

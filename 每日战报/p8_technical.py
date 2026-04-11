@@ -17,229 +17,35 @@ P8 技术面分析层 — 从本地通达信 K 线数据计算技术指标。
 """
 
 import os
-import re
-import struct
 import logging
 
 from datetime import datetime
 
-from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
+from p8_extractors import (
+    extract_stock_elasticity,
+    extract_stock_tracks,
+    extract_stocks_from_report,
+    find_tdx_vipdoc as _find_tdx_vipdoc,
+    read_day_file_simple,
+    resolve_tdx_market_and_path as _resolve_tdx_market_and_path,
+)
+from p8_indicators import (
+    calc_atr_pct as _calc_atr_pct,
+    calc_boll_width as _calc_boll_width,
+    calc_kdj,
+    calc_macd,
+    calc_period_change as _calc_period_change,
+    calc_rsi,
+    calc_weekly_summary as _calc_weekly_summary,
+)
+from p8_storage import persist_p8_outputs as _persist_p8_outputs
 
-_TDX_VIPDOC_CANDIDATES = [
-    'D:\\HT\\vipdoc',
-    'D:\\vcp_qt\\vipdoc',
-    'C:\\new_tdx\\vipdoc',
-    'D:\\new_tdx\\vipdoc',
-    'C:\\HT\\vipdoc'
+__all__ = [
+    'extract_stocks_from_report',
+    'extract_stock_tracks',
+    'extract_stock_elasticity',
+    'p8_search_stock_prices',
 ]
-
-def _find_tdx_vipdoc():
-    for candidate in _TDX_VIPDOC_CANDIDATES:
-        if os.path.isdir(candidate):
-            return candidate
-    return None
-
-
-def _resolve_tdx_market_and_path(vipdoc: str, code: str):
-    """按股票代码推断通达信市场目录，并做文件存在性回退探测。"""
-    candidates = []
-
-    if code.startswith(('6', '9', '5')):
-        candidates.append(('sh', f'sh{code}.day'))
-    elif code.startswith(('8', '4')):
-        # Why: 北交所代码优先走 bj；兼容部分历史数据落在 sz/sh 目录的情况
-        candidates.extend([
-            ('bj', f'bj{code}.day'),
-            ('sz', f'sz{code}.day'),
-            ('sh', f'sh{code}.day'),
-        ])
-    else:
-        candidates.extend([
-            ('sz', f'sz{code}.day'),
-            ('sh', f'sh{code}.day'),
-        ])
-
-    # 去重并按顺序探测
-    deduped = []
-    seen = set()
-    for market, fname in candidates:
-        key = (market, fname)
-        if key not in seen:
-            deduped.append((market, fname))
-            seen.add(key)
-
-    for market, fname in deduped:
-        path = os.path.join(vipdoc, market, 'lday', fname)
-        if os.path.exists(path):
-            return market, path
-
-    # 回退到首候选路径（用于后续统一缺失处理）
-    fallback_market, fallback_name = deduped[0]
-    fallback_path = os.path.join(vipdoc, fallback_market, 'lday', fallback_name)
-    return fallback_market, fallback_path
-
-def extract_stocks_from_report(report: str):
-    patterns = [
-        r'([\u4e00-\u9fa5]{2,6})[（\(]\s*(\d{6})\s*[）\)]',
-        r'([\u4e00-\u9fa5]{2,6})\s+(\d{6})',
-        r'\|\s*([\u4e00-\u9fa5]{2,6})\s*\|\s*(\d{6})\s*\|'
-    ]
-    stocks = {}
-    for pattern in patterns:
-        for match in re.finditer(pattern, report):
-            name, code = match.group(1), match.group(2)
-            if code not in stocks:
-                stocks[code] = name
-    result = [(name, code) for code, name in stocks.items()]
-    return result
-
-def extract_stock_tracks(report: str):
-    track_map = {}
-    current_track = ""
-    for line in report.split('\n'):
-        track_match = re.match(r'###\s*赛道[:：]\s*(.+)', line)
-        if track_match:
-            current_track = track_match.group(1).strip()
-            continue
-        if current_track:
-            stock_match = re.search(r'[\u4e00-\u9fa5]{2,6}[（\(]\s*(\d{6})\s*[）\)]', line)
-            if stock_match:
-                track_map[stock_match.group(1)] = current_track
-    return track_map
-
-def extract_stock_elasticity(report: str):
-    elasticity_map = {}
-    for line in report.split('\n'):
-        stock_match = re.search(r'[（\(](\d{6})[）\)]\s*\|\s*(🔥高弹性|⚡中弹性|💀纯概念)', line)
-        if stock_match:
-            elasticity_map[stock_match.group(1)] = stock_match.group(2)
-    return elasticity_map
-
-def calc_macd(closes):
-    if len(closes) < 35:
-        return 0, "数据不足"
-    dif_series = []
-    e12 = closes[0]
-    e26 = closes[0]
-    for c in closes:
-        e12 = e12 * 11/13 + c * 2/13
-        e26 = e26 * 25/27 + c * 2/27
-        dif_series.append(e12 - e26)
-    dea = dif_series[0]
-    for d in dif_series[1:]:
-        dea = dea * 8/10 + d * 2/10
-    macd = (dif_series[-1] - dea) * 2
-    status = '金叉上方' if macd > 0 and dif_series[-1] > dea else ('死叉下方' if macd < 0 and dif_series[-1] < dea else ('由负转正' if macd > 0 else '由正转负'))
-    return macd, status
-
-def calc_rsi(closes, period=14):
-    if len(closes) <= period:
-        return 50
-    gains = []
-    losses = []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(0, diff))
-        losses.append(max(0, -diff))
-    avg_gain = sum(gains[-period:])/period
-    avg_loss = sum(losses[-period:])/period
-    if avg_loss == 0:
-        return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def calc_kdj(highs, lows, closes, period=9):
-    if len(closes) <= period:
-        return 50
-    k, d = 50, 50
-    for i in range(period-1, len(closes)):
-        h9 = max(highs[i-period+1:i+1])
-        l9 = min(lows[i-period+1:i+1])
-        c = closes[i]
-        rsv = (c - l9)/(h9 - l9)*100 if h9 > l9 else 50
-        k = 2/3*k + 1/3*rsv
-        d = 2/3*d + 1/3*k
-    j = 3*k - 2*d
-    return j
-
-
-def _calc_period_change(closes, lookback: int) -> float:
-    if not closes:
-        return 0.0
-    base = closes[-lookback] if len(closes) >= lookback else closes[0]
-    return (closes[-1] - base) / base * 100 if base > 0 else 0.0
-
-
-def _calc_boll_width(closes, period: int = 20) -> float:
-    if len(closes) < period:
-        return 0.0
-    ma = sum(closes[-period:]) / period
-    std = (sum((c - ma) ** 2 for c in closes[-period:]) / period) ** 0.5
-    return (4 * std) / ma * 100 if ma > 0 else 0.0
-
-
-def _calc_atr_pct(highs, lows, closes, period: int = 14) -> float:
-    if len(closes) <= period:
-        return 0.0
-    atr_sum = 0.0
-    for i in range(1, period + 1):
-        high_val = highs[-i]
-        low_val = lows[-i]
-        prev_close = closes[-i - 1]
-        atr_sum += max(high_val - low_val, abs(high_val - prev_close), abs(low_val - prev_close))
-    latest_close = closes[-1]
-    return (atr_sum / period) / latest_close * 100 if latest_close > 0 else 0.0
-
-
-def _calc_weekly_summary(closes):
-    weekly_c = closes[::5]
-    if len(weekly_c) < 20:
-        return {
-            'w_stat': '未知',
-            'wmacd': 0.0,
-            'wmacd_stat': '未知',
-            'trend': '数据不足',
-        }
-
-    wm20 = sum(weekly_c[-20:]) / 20
-    w_stat = '站上' if weekly_c[-1] > wm20 else '跌破'
-    wmacd, wmacd_stat = calc_macd(weekly_c)
-    if wmacd > 0 and weekly_c[-1] > wm20:
-        trend = '上行'
-    elif wmacd < 0 and weekly_c[-1] < wm20:
-        trend = '下行'
-    else:
-        trend = '横盘震荡'
-    return {
-        'w_stat': w_stat,
-        'wmacd': wmacd,
-        'wmacd_stat': wmacd_stat,
-        'trend': trend,
-    }
-
-
-def _persist_p8_outputs(markdown_text: str, json_data: dict, *, status: str, metrics: dict) -> str:
-    md_path = ''
-    json_path = ''
-
-    try:
-        md_path = write_text_artifact('P8_技术面', markdown_text)
-    except Exception as e:
-        logging.error(f'[P8] Markdown 写入失败: {e}')
-
-    try:
-        json_path = write_json_artifact('P8_技术面', json_data)
-    except Exception as e:
-        logging.error(f'[P8] JSON 写入失败: {e}')
-
-    files = {}
-    if md_path:
-        files['md'] = md_path
-    if json_path:
-        files['json'] = json_path
-
-    update_run_manifest('p8', status=status, files=files or None, metrics=metrics)
-    return markdown_text
 
 def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
     if not stocks:
@@ -267,28 +73,6 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
             status='skipped_no_vipdoc',
             metrics={'stocks_requested': len(stocks), 'stocks_with_data': 0},
         )
-
-    def read_day_file_simple(filepath):
-        records = []
-        try:
-            with open(filepath, 'rb') as f:
-                data = f.read()
-            for chunk in struct.iter_unpack('<IIIIIfII', data):
-                date_int, o, h, low, c, _amount_f, vol, _ = chunk
-                date_str = str(date_int)
-                if len(date_str) == 8:
-                    records.append({
-                        'date': date_str,
-                        'open': o / 100.0,
-                        'high': h / 100.0,
-                        'low': low / 100.0,
-                        'close': c / 100.0,
-                        'vol': vol
-                    })
-            return records
-        except Exception as e:
-            logging.error(f"[P8] 读取本地 K 线数据失败 ({filepath}): {e}")
-            return []
 
     market_index_lines = ["## 同期大盘参考\n\n"]
     _index_returns = {}

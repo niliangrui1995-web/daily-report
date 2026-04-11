@@ -27,6 +27,7 @@ def fetch_vanguard_prices() -> str:
     import shutil
     import tempfile
     import certifi
+    start_time = time.time()
 
     temp_cert_dir = os.path.join(tempfile.gettempdir(), 'vcp_certs')
     os.makedirs(temp_cert_dir, exist_ok=True)
@@ -140,7 +141,11 @@ def fetch_vanguard_prices() -> str:
             'p4',
             status='completed',
             files={'md': fname} if fname else None,
-            metrics={'tickers': len(VANGUARD_TICKERS), 'report_chars': len(report)},
+            metrics={
+                'tickers': len(VANGUARD_TICKERS),
+                'report_chars': len(report),
+                'duration_seconds': round(time.time() - start_time, 1),
+            },
         )
         return report
     finally:

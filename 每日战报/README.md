@@ -5,6 +5,17 @@
 
 ---
 
+## ✅ 2026-04-12 同步状态
+
+当前代码与文档已经同步到以下状态：
+
+- `P2/P3` 不再以松散文本直通下游，而是先整理成 `claim + source + confidence` 结构，再进入 `P6/P9`
+- `P6/P7/P7.5` 已共用同一套近 5 天主题去重与研究规划逻辑，避免双份策略漂移
+- `P1/P3/P4/P7.5` 已接入真实收益评估，主流程结束后会生成 `Layer_ROI_*.json/.md`
+- `P8/P9` 已完成模块拆分，`p8_technical.py` / `p9_reporter.py` 只保留主流程装配职责
+
+---
+
 ## 📐 系统架构
 
 ```text
@@ -17,20 +28,21 @@ P1 Phase 2 - Scrapling 正文深挖
     ↓ 失败链接收集进「阵亡名单」→ 交给 P3 锦囊一破防
 P2 X平台情报 (Grok API) ──────────────── 与 P1 并行启动
     ↓ Grok 原生 X(Twitter) 实时扫描，15 赛道关键词矩阵
-    ↓ ⚠️ 不经审计，直接拼接到 P5 输出后一起送 P6 + P9
+    ↓ 输出先整理为 Claim / Source / Confidence 结构化情报，再直送 P6 + P9
 P3 机动搜索 (Gemini 2.5 Flash Search) ── 与 P1 并行启动
     ↓ 锦囊一：动态阵亡名单空袭（P1 深挖失败的高价值链接二次补缺）
     ↓ 锦囊二：极客圈非共识扫雷（GitHub/HackerNews/独立博客/VC公告）
     ↓ 锦囊三：产业链异动地震仪（全球 10 个核心半导体产区地方新闻）
-    ↓ ⚠️ 不经审计，直接拼入 P6 证据链 + P9 独立第 7 层
+    ↓ 输出先整理为 Claim / Source / Confidence 结构化情报，再拼入 P6 证据链 + P9 独立层
 P4 海外盘面 (yfinance) ──────────────── 与 P1 并行启动
     ↓ 美股昨夜收盘行情 → 客观资金投票验证锚点
 P5 审计清洗 (Gemini 3.1 Pro High)
     ↓ 时效验证 + 可信度打分 + 产业链关联度筛选 + 去主观噪声
 P6 A 股映射 (Claude Opus 4.6 Thinking)
     ↓ 产业链事件 → A 股标的 + 弹性评级
-    ├── P7 深度研究 (1-3 主题 × 3 轮迭代搜索) ─┐ (高并发双轨搜索)
-    └── P7.5 补充搜索 (Opus 下达 SEARCH 密令) ─┴→ 等待所有搜索双双完成
+    ├── 统一研究计划（与 P7 共用最近 5 天主题去重）
+    ├── P7 深度研究（按触发条件自适应 1-3 主题 × 1-3 轮搜索） ─┐
+    └── P7.5 补充搜索（Opus 下达 SEARCH 密令） ─────────────────┴→ 统一规划后执行
         ↓ (按顺序串行启动严格的脱水盲审)
         ├── P7a 深度研究审计 (Gemini 3.1 Pro High) ── 将 40K P7源数据去重提取，JSON+MD双轨落盘
         └── P7.5 补充审计 (Gemini 3.1 Pro High) ──    对 P7.5生肉盲审排雷，JSON+MD双轨落盘
@@ -39,6 +51,8 @@ P8 股价分析 (本地通达信 K 线数据) ── 承接前线搜索和清洗
 P9 终极战报 (Claude Opus 4.6 Thinking)
     ↓ 九层数据综合 → 标的狙击表 + 操作建议
     ↓ (P5 + P2 + P3 + P4 + P6 + P7a + P7.5 + P8 股价 + 海外行情)
+Layer ROI 贡献复盘
+    ↓ 对 P1 / P3 / P4 / P7.5 做独有贡献、采纳率、单位成本复盘
 📧 邮件推送
 ```
 
@@ -61,14 +75,21 @@ P9 终极战报 (Claude Opus 4.6 Thinking)
 │   ├── p1_rss.py                # P1 Phase1+2：RSS 发现 + Scrapling 正文深挖
 │   ├── p1_web.py                # P1 网页列表页发现 + 正文深挖
 │   ├── p2_x_intel.py            # 📱 P2 X(Twitter) 产业链情报采集（Grok API）
-│   ├── p3_agent.py              # 🚀 P3 机动搜索（Gemini 联网三锦囊）
+│   ├── p3_agent.py              # 🚀 P3 机动搜索（Gemini 联网三锦囊 + 结构化输出）
 │   ├── p4_vanguard.py           # 📈 P4 海外产业链收盘行情（yfinance）
 │   ├── p6_mapper.py             # P6 Opus A 股纯映射引擎
-│   ├── p7_deep_research.py      # P7 Gemini 深度扩展研究
+│   ├── p7_deep_research.py      # P7/P7.5 统一研究计划 + 深度扩展研究
 │   ├── run_config.py            # 运行时环境配置与时效控制
-│   ├── p8_technical.py          # P8 通达信 K 线 + 14 项技术指标
-│   ├── p9_reporter.py           # P9 战报生成 + 邮件推送
-│   ├── checkpoint.py            # 断点自适应检测（7 种状态，含 P3 恢复）
+│   ├── intel_structuring.py     # P2/P3 结构化 claim/source/confidence 归一化
+│   ├── contribution_metrics.py  # P1/P3/P4/P7.5 真实收益评估与 Layer ROI 输出
+│   ├── p8_extractors.py         # P8 标的提取、通达信目录探测与 .day 读取
+│   ├── p8_indicators.py         # P8 技术指标计算
+│   ├── p8_storage.py            # P8 双轨产物落盘
+│   ├── p8_technical.py          # P8 技术面主流程装配
+│   ├── p9_rendering.py          # P9 Markdown 战报渲染
+│   ├── p9_email.py              # P9 邮件 HTML 构建与 SMTP 发送
+│   ├── p9_reporter.py           # P9 战报生成主流程装配
+│   ├── checkpoint.py            # 断点自适应检测（manifest + 目录扫描双保险）
 │   ├── trading_calendar.py      # A 股交易日历（节假日 + 调休）
 │   ├── industry_dict.py         # 产业链 15 赛道字典 + 海外标的池
 │   ├── native_llm_adapter.py    # 多模型适配器（Claude/Gemini/OpenAI 统一接口）
@@ -86,8 +107,11 @@ P9 终极战报 (Claude Opus 4.6 Thinking)
 │   │   ├── audit.txt            # P5/P7.5 常规脱水盲审
 │   │   ├── p9_report.txt        # P9 最终战报模板
 │   │   └── ...                  # 其它各阶段提示词
-│   └── tests/                   # 单元测试（36 个离线测试用例）
-│       └── test_core.py         # 核心逻辑测试
+│   └── tests/                   # 单元测试（当前 67 个离线测试用例）
+│       ├── test_core.py         # 核心逻辑测试
+│       ├── test_p7_workflow.py  # P7 研究计划 / 自适应停止 / 时间窗
+│       ├── test_contribution_metrics.py # Layer ROI 贡献复盘
+│       └── test_workflow_refactors.py   # P2/P3 结构化 + P9 渲染 + 共享去重
 ├── 实时看板_v2/                 # 实时看板（独立子系统，不互引）
 ├── 每日热点输出/                # 每日战报输出目录
 │   └── {YYYYMMDD}/             # 按日期分目录
@@ -419,3 +443,21 @@ VCP Hunter 将复杂的 AI 与半导体生态抽象为 15 个核心网格（即 
 | v3.2 | 2026-03-27 | 熔断器 + KDJ 修复 + P8 崩溃恢复 + Twitter RSSHub |
 | v3.1 | 2026-03-27 | 搜索三级降级 + RSS 直采永久切换 + 16 赛道扩充 |
 | v3.0 | 2026-03-26 | P1 RSS 直采模式 + NativeLLMAdapter |
+> 2026-04-12 文档同步说明
+>
+> 当前 4 项重点优化的真实状态如下：
+>
+> | 优化项 | 状态 | 说明 |
+> | --- | --- | --- |
+> | P2/P3 结构化 claim + source + confidence 再进 P6/P9 | 未完成 | 当前 `p2_x_intel.py`、`p3_agent.py` 仍以文本为主进入下游 |
+> | 统一 P6/P7/P7.5 规划与去重逻辑 | 部分完成 | `p7_deep_research.py` 已统一 P7/P7.5 研究计划与最近 5 天去重，但 `p6_mapper.py` 仍保留一套历史去重逻辑 |
+> | 给 P1/P3/P4/P7.5 加真实收益指标 | 已完成 | 已新增 `contribution_metrics.py`，运行结束后会产出 `Layer_ROI_*.json/.md` 并回填 `run_manifest.json` |
+> | 拆分 P8/P9 大模块 | 未完成 | `p8_technical.py` 与 `p9_reporter.py` 仍未拆模块 |
+>
+> 新增 ROI 指标：
+>
+> - `unique_units`：该层独有的有效信息单元
+> - `adopted_units`：被 P6 或 P9 实际采纳的信息单元
+> - `cost_seconds`：该层本轮耗时
+> - `roi_score`：按独有贡献、下游采纳、成本效率综合打分
+> - `roi_recommendation`：`keep / keep_but_shrink / gate_by_event / merge_or_gate / candidate_to_prune`

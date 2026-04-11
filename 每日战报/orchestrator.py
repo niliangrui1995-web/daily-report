@@ -19,11 +19,13 @@ import contextlib
 from datetime import datetime
 
 from artifact_store import (
+    load_run_manifest,
     set_run_timestamp,
     update_run_manifest,
     write_json_artifact,
     write_text_artifact,
 )
+from contribution_metrics import build_layer_roi_report, render_layer_roi_markdown
 from settings import OUTPUT_DIR
 from trading_calendar import is_trading_day
 from checkpoint import detect_checkpoint
@@ -33,7 +35,7 @@ from run_config import get_run_config
 from p1_rss import collect_from_rss
 from p1_web import collect_from_web
 from p2_x_intel import collect_from_x
-from p3_agent import collect_p3_parallel_only
+from p3_agent import collect_p3_parallel_only, render_p3_output, run_jinnang_1
 from p4_vanguard import fetch_vanguard_prices
 from audit_engine import gemini_pro_audit, p7a_deep_research_audit
 from p6_mapper import format_evidence, generate_report
@@ -120,6 +122,24 @@ def _read_text_checkpoint(path: str, label: str) -> str:
     return ""
 
 
+def _read_json_checkpoint(path: str, label: str):
+    """Read JSON checkpoint data with defensive logging."""
+    if not path:
+        return None
+    try:
+        import json
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        logging.info(f"  -> recovered {label}")
+        return data
+    except FileNotFoundError:
+        logging.warning(f"  -> {label} file missing during resume")
+    except Exception as e:
+        logging.warning(f"  -> {label} resume failed: {e}")
+    return None
+
+
 def orchestrator_main():
     """主流程编排"""
     total_start = time.time()
@@ -127,8 +147,11 @@ def orchestrator_main():
 
     # 全局变量初始化
     p5_evidence = ""
+    p1_results = []
+    p1_stats = {}
     p2_data = ""
     p3_data = ""
+    p3_stats = {}
     p4_data = ""
     p6_mapping = ""
     p7_deep = ""
@@ -147,6 +170,10 @@ def orchestrator_main():
         "skipped_recent_topics": [],
     }
     p7_plan_path = ""
+    p1_duration = 0.0
+    p4_duration = 0.0
+    p75_duration = 0.0
+    p75_raw_text = ""
 
     logging.info("=" * 60)
     logging.info(
@@ -192,6 +219,9 @@ def orchestrator_main():
     if resume_from == "none":
         logging.info("📡 [P1-P3] 并行采集：RSS + Web + X + Agent")
         p1_results = []
+        rss_stats = {}
+        web_stats = {}
+        p1_collect_start = time.time()
         p1_failed_urls = []  # Why: 收集 P1 阵亡 URL，供锦囊一补漏
         # Why: RSS/Web/X/Agent 四路并行，开 4 个 worker 避免第四路等待
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -208,7 +238,7 @@ def orchestrator_main():
             except Exception as e:
                 logging.warning(f"RSS采集异常: {e}")
             try:
-                web_results, _ = web_fut.result()
+                web_results, web_stats = web_fut.result()
                 p1_results.extend(web_results)
             except Exception as e:
                 logging.warning(f"Web采集异常: {e}")
@@ -217,24 +247,35 @@ def orchestrator_main():
             except Exception as e:
                 logging.warning(f"X情报采集异常: {e}")
             try:
-                p3_data, _ = agent_fut.result()
+                p3_data, p3_stats = agent_fut.result()
             except Exception as e:
                 logging.warning(f"Grok Agent异常: {e}")
 
         # Why: P1 结束后用阵亡 URL 触发锦囊一"爬虫攻坚补漏"
+        p1_duration = time.time() - p1_collect_start
+        p1_stats = {
+            "rss_success_sources": len(rss_stats.get("success", [])),
+            "web_success_sources": len(web_stats.get("success", [])),
+            "rss_failed_sources": len(rss_stats.get("failed", [])),
+            "web_failed_sources": len(web_stats.get("failed", [])),
+            "enrich_ok": int(rss_stats.get("enrich_ok", 0)) + int(web_stats.get("enrich_ok", 0)),
+            "enrich_fail": int(rss_stats.get("enrich_fail", 0)) + int(web_stats.get("enrich_fail", 0)),
+        }
+        p1_stats["failed_urls"] = len(p1_failed_urls)
         if p1_failed_urls:
             logging.info(f"🎯 [P3 锦囊一] 收到 {len(p1_failed_urls)} 个 P1 阵亡 URL，启动空袭补漏...")
             try:
-                from p3_agent import run_jinnang_1, format_p3_section
                 jinnang_1_results = run_jinnang_1(p1_failed_urls)
                 if jinnang_1_results:
-                    # Why: 将锦囊一的结果精准替换掉原 p3_data 中的空区，保持排版一致性，避免头部重复
-                    jinnang_1_text = format_p3_section('[锦囊一·爬虫攻坚补漏]', jinnang_1_results)
-                    empty_placeholder = format_p3_section('[锦囊一·爬虫攻坚补漏]', [])
-                    if p3_data and empty_placeholder in p3_data:
-                        p3_data = p3_data.replace(empty_placeholder, jinnang_1_text)
-                    else:
-                        p3_data = (p3_data + "\n\n" + jinnang_1_text) if p3_data else jinnang_1_text
+                    raw_results = p3_stats.get("raw_results") if isinstance(p3_stats, dict) else {}
+                    if not isinstance(raw_results, dict):
+                        raw_results = {}
+                    raw_results["jinnang_1"] = jinnang_1_results
+                    p3_stats["raw_results"] = raw_results
+                    p3_stats["jinnang_1_count"] = len(jinnang_1_results)
+                    p3_data, p3_structured_items = render_p3_output(raw_results)
+                    p3_stats["structured_items"] = len(p3_structured_items)
+                    p3_stats["content_length"] = len(p3_data)
                     logging.info(f"✅ [P3 锦囊一] 抢救回 {len(jinnang_1_results)} 条情报，已无缝拼入 P3 数据")
             except Exception as e:
                 logging.warning(f"⚠️ [P3 锦囊一] 补漏失败: {e}")
@@ -253,7 +294,13 @@ def orchestrator_main():
                 "p1",
                 status="completed",
                 files={"json": p1_json_path, "md": p1_md_path},
-                metrics={"records": len(p1_results), "failed_urls": len(p1_failed_urls), "evidence_chars": len(evidence_raw)},
+                metrics={
+                    "records": len(p1_results),
+                    "failed_urls": len(p1_failed_urls),
+                    "evidence_chars": len(evidence_raw),
+                    "duration_seconds": round(p1_duration, 1),
+                    **p1_stats,
+                },
             )
         except Exception as e:
             logging.error(f"[P1] 原始数据保存失败: {e}")
@@ -263,17 +310,45 @@ def orchestrator_main():
         if p3_data:
             try:
                 p3_path = write_text_artifact("P3_机动情报", p3_data)
+                p3_json_path = ""
+                raw_results = p3_stats.get("raw_results") if isinstance(p3_stats, dict) else {}
+                p3_structured_items = []
+                if isinstance(raw_results, dict):
+                    _, p3_structured_items = render_p3_output(raw_results)
+                if raw_results or p3_structured_items:
+                    p3_json_path = write_json_artifact(
+                        "P3_机动情报",
+                        {
+                            "generated_at": datetime.now().isoformat(),
+                            "items": p3_structured_items,
+                            "raw_results": raw_results,
+                        },
+                    )
+                p3_files = {"md": p3_path}
+                if p3_json_path:
+                    p3_files["json"] = p3_json_path
                 update_run_manifest(
                     "p3",
                     status="completed",
-                    files={"md": p3_path},
-                    metrics={"content_chars": len(p3_data)},
+                    files=p3_files,
+                    metrics={
+                        "content_chars": len(p3_data),
+                        "duration_seconds": p3_stats.get("duration_seconds", 0),
+                        "jinnang_1_count": p3_stats.get("jinnang_1_count", 0),
+                        "jinnang_2_count": p3_stats.get("jinnang_2_count", 0),
+                        "jinnang_3_count": p3_stats.get("jinnang_3_count", 0),
+                        "structured_items": p3_stats.get("structured_items", 0),
+                    },
                 )
             except Exception as e:
                 logging.error(f"[P3] 情报保存失败: {e}")
 
     elif resume_from == "p1":
         logging.info("🔄 [断点恢复] 从本地恢复 P1原始数据及相关情报，跳过网络采集...")
+        if "p1" in ckpt["files"]:
+            recovered_results = _read_json_checkpoint(ckpt["files"]["p1"], "P1 raw results")
+            if isinstance(recovered_results, list):
+                p1_results = recovered_results
         if "p1_md" in ckpt["files"]:
             try:
                 with open(ckpt["files"]["p1_md"], "r", encoding="utf-8") as f:
@@ -311,12 +386,16 @@ def orchestrator_main():
             except Exception as e:
                 logging.warning(f"⚠️ P4 数据恢复失败，重新获取: {e}")
                 try:
+                    p4_started = time.time()
                     p4_data = fetch_vanguard_prices()
+                    p4_duration = time.time() - p4_started
                 except Exception as ex:
                     logging.error(f"[P4] 重新获取海外行情失败: {ex}")
         else:
             try:
+                p4_started = time.time()
                 p4_data = fetch_vanguard_prices()
+                p4_duration = time.time() - p4_started
             except Exception as e:
                 logging.error(f"[P4] 获取海外行情失败: {e}")
 
@@ -411,6 +490,7 @@ def orchestrator_main():
         "successful_rounds": 0,
         "text": "",
     }
+    p75_started = None
 
     if need_run_p7 or need_run_p75:
         with log_heartbeat("P7 深研与 P7.5 搜索"):
@@ -418,8 +498,11 @@ def orchestrator_main():
                 p7_fut = pool.submit(run_deep_research, research_plan) if need_run_p7 else None
 
                 sup_results = []
+                capped_queries = []
+                p75_started = None
                 if need_run_p75 and search_queries:
                     capped_queries = search_queries[:5]
+                    p75_started = time.time()
                     logging.info(f"[P7.5] 触发 {len(capped_queries)} 个补充搜索指令（串行执行，避免线程池套全局限速）")
                     for q in capped_queries:
                         try:
@@ -459,6 +542,7 @@ def orchestrator_main():
                 if need_run_p75:
                     if sup_results:
                         raw_p75 = "\n".join(sup_results)
+                        p75_raw_text = raw_p75
 
                         try:
                             raw_fname = write_text_artifact("P7.5_补充搜索原始数据", raw_p75)
@@ -486,6 +570,9 @@ def orchestrator_main():
                         )
 
     # 保存 P7 深研原始数据 (注: P7.5 已经在 audit_engine 里自动落盘双轨 json/md)
+    if p75_started is not None:
+        p75_duration = time.time() - p75_started
+
     if p7_deep:
         try:
             p7_body = (
@@ -560,6 +647,97 @@ def orchestrator_main():
             report_ts = ""
 
     send_report_email(final_report, report_ts)
+
+    try:
+        if not p1_results and "p1" in ckpt.get("files", {}):
+            recovered_results = _read_json_checkpoint(ckpt["files"]["p1"], "P1 raw results")
+            if isinstance(recovered_results, list):
+                p1_results = recovered_results
+
+        manifest_snapshot = load_run_manifest()
+
+        def _manifest_metric(stage: str, key: str, default: float = 0.0) -> float:
+            try:
+                value = (
+                    manifest_snapshot.get("stages", {})
+                    .get(stage, {})
+                    .get("metrics", {})
+                    .get(key, default)
+                )
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        roi_payload = build_layer_roi_report(
+            p1_results=p1_results,
+            p3_raw_results=p3_stats.get("raw_results") if isinstance(p3_stats, dict) else None,
+            p3_text=p3_data,
+            p4_text=p4_data,
+            p75_text=p75_supplement or p75_raw_text,
+            p75_queries=search_queries[:5],
+            p6_mapping=p6_mapping,
+            final_report=final_report,
+            timings={
+                "p1": p1_duration or _manifest_metric("p1", "duration_seconds"),
+                "p3": float(p3_stats.get("duration_seconds", 0) or _manifest_metric("p3", "duration_seconds")),
+                "p4": p4_duration or _manifest_metric("p4", "duration_seconds"),
+                "p75": p75_duration or _manifest_metric("p75", "duration_seconds"),
+            },
+            extras={
+                "p1": {
+                    "records": len(p1_results),
+                    "failed_urls": p1_stats.get("failed_urls", 0) if isinstance(p1_stats, dict) else 0,
+                    "rss_success_sources": p1_stats.get("rss_success_sources", 0) if isinstance(p1_stats, dict) else 0,
+                    "web_success_sources": p1_stats.get("web_success_sources", 0) if isinstance(p1_stats, dict) else 0,
+                },
+                "p3": {
+                    "jinnang_2_count": p3_stats.get("jinnang_2_count", 0) if isinstance(p3_stats, dict) else 0,
+                    "jinnang_3_count": p3_stats.get("jinnang_3_count", 0) if isinstance(p3_stats, dict) else 0,
+                },
+                "p4": {
+                    "signal_lines": p4_data.count("%") if p4_data else 0,
+                },
+                "p75": {
+                    "query_count": len(search_queries[:5]),
+                    "raw_chars": len(p75_raw_text or ""),
+                    "audited_chars": len(p75_supplement or ""),
+                },
+            },
+        )
+        roi_json_path = write_json_artifact("Layer_ROI", roi_payload)
+        roi_md_path = write_text_artifact("Layer_ROI", render_layer_roi_markdown(roi_payload))
+        update_run_manifest(
+            "roi",
+            status="completed",
+            files={"json": roi_json_path, "md": roi_md_path},
+            metrics={"layers_evaluated": len(roi_payload.get("layers", {}))},
+        )
+
+        manifest_after_roi = load_run_manifest()
+        for stage_name, payload in roi_payload.get("layers", {}).items():
+            stage_status = (
+                manifest_after_roi.get("stages", {})
+                .get(stage_name, {})
+                .get("status", "completed")
+            )
+            update_run_manifest(
+                stage_name,
+                status=stage_status,
+                metrics={
+                    "roi_units": payload.get("units", 0),
+                    "roi_unique_units": payload.get("unique_units", 0),
+                    "roi_unique_ratio": payload.get("unique_ratio", 0.0),
+                    "roi_adopted_units": payload.get("adopted_units", 0),
+                    "roi_adoption_ratio": payload.get("adoption_ratio", 0.0),
+                    "roi_p6_hits": payload.get("p6_hits", 0),
+                    "roi_p9_hits": payload.get("p9_hits", 0),
+                    "roi_score": payload.get("score", 0.0),
+                    "roi_recommendation": payload.get("recommendation", "unknown"),
+                },
+            )
+    except Exception as e:
+        logging.error(f"[ROI] layer contribution report failed: {e}")
+        update_run_manifest("roi", status="failed_exception", metrics={"error": str(e)})
 
     total_elapsed = time.time() - total_start
     update_run_manifest(

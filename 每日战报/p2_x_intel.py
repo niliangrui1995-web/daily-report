@@ -27,7 +27,8 @@ import requests
 from datetime import datetime
 import re
 
-from artifact_store import update_run_manifest, write_text_artifact
+from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
+from intel_structuring import parse_p2_structured_items, render_p2_structured_markdown
 from utils import parse_backtrack_hours
 from settings import require_prompt, GROK_API_KEY
 from industry_dict import OLIGARCH_DICT, SUPER_GIANTS
@@ -234,39 +235,63 @@ def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, d
         update_run_manifest('p2', status='failed_empty', metrics=stats)
         return '', stats
 
+    structured_items = parse_p2_structured_items(content)
     elapsed = time.time() - overall_start_time
     stats['status'] = 'success'
     stats['duration_seconds'] = round(elapsed, 1)
     stats['content_length'] = len(content)
+    stats['structured_items'] = len(structured_items)
 
     logging.info(f'✅ [P2] X 平台情报分批采集完成: 共 {len(chunks)} 批, 总计 {len(content)} 字, 总耗时 {elapsed:.1f}s')
 
     formatted = f'============================================================\n以下数据来自 X(Twitter) 平台实时分批采集（Grok {GROK_MODEL}）\n信息来源: X平台产业链insider/leaker/分析师/官方账号\n采集时间: {datetime.now().strftime("%Y-%m-%d %H:%M")}\n⚠️ 注意: X平台信息未经 P5 审计，可信度参差不齐，需结合其他数据源交叉验证\n============================================================\n\n{content}'
 
-    output_path = _save_p2_output(formatted, stats)
+    if structured_items:
+        formatted = render_p2_structured_markdown(
+            structured_items,
+            model=GROK_MODEL,
+            collected_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        )
+
+    output_path, json_path = _save_p2_artifacts(formatted, structured_items, stats)
     update_run_manifest(
         'p2',
         status='completed',
-        files={'md': output_path} if output_path else None,
+        files={k: v for k, v in {'md': output_path, 'json': json_path}.items() if v} or None,
         metrics=stats,
     )
     return formatted, stats
 
 
-def _save_p2_output(content: str, stats: dict) -> str:
+def _save_p2_artifacts(content: str, structured_items: list[dict], stats: dict) -> tuple[str, str]:
+    filename = ''
+    json_filename = ''
     try:
         md_body = (
-            '# P2 X(Twitter) 产业链情报\n\n'
+            '# P2 X(Twitter) 结构化情报\n\n'
             f'> 采集时间: {datetime.now().isoformat()}\n'
             f"> 模型: {stats.get('model', GROK_MODEL)}\n"
             f"> 耗时: {stats.get('duration_seconds', 0)}s\n"
-            f"> 内容长度: {stats.get('content_length', 0)} 字\n\n"
+            f"> 原始长度: {stats.get('content_length', 0)} 字\n"
+            f"> 结构化条目: {stats.get('structured_items', 0)}\n\n"
             f'{content}'
         )
         filename = write_text_artifact('P2_X平台情报', md_body)
-
-        logging.info(f'[P2] 原始数据已保存: {filename}')
-        return filename
     except Exception as e:
-        logging.warning(f'[P2] 保存失败: {e}')
-        return ''
+        logging.warning(f'[P2] Markdown 保存失败: {e}')
+
+    try:
+        json_filename = write_json_artifact(
+            'P2_X平台情报',
+            {
+                'generated_at': datetime.now().isoformat(),
+                'model': stats.get('model', GROK_MODEL),
+                'items': structured_items,
+            },
+        )
+    except Exception as e:
+        logging.warning(f'[P2] JSON 保存失败: {e}')
+
+    if filename:
+        logging.info(f'[P2] 结构化情报已保存: {filename}')
+    return filename, json_filename

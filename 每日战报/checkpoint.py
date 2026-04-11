@@ -39,6 +39,17 @@ def _load_files_from_manifest(ckpt: dict, manifest: dict) -> None:
     for stage_name, file_key in alias_map.items():
         payload = stages.get(stage_name, {})
         files = payload.get('files', {})
+        if stage_name == 'p1':
+            json_file = _pick_existing_file(files.get('json', ''))
+            md_file = _pick_existing_file(files.get('md', ''))
+            if json_file:
+                ckpt['files'][file_key] = json_file
+            elif md_file:
+                ckpt['files'][file_key] = md_file
+            if md_file:
+                ckpt['files']['p1_md'] = md_file
+            continue
+
         preferred = files.get('md') or files.get('json') or ''
         existing = _pick_existing_file(preferred)
         if existing:

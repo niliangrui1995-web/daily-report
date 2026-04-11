@@ -289,6 +289,16 @@ def _recent_deep_topic_history(days: int = 5) -> list[dict[str, str]]:
     return history
 
 
+def build_recent_topic_guardrail(days: int = 5, *, limit: int = 12) -> str:
+    history = _recent_deep_topic_history(days=days)
+    if not history:
+        return ""
+
+    lines = [f"- {item['topic']} ({item['date'][5:]})" for item in history[:limit]]
+    logging.info(f"[P7] recent-topic guardrail loaded {len(lines)} item(s) for {days}d window")
+    return "\n".join(lines)
+
+
 def _is_recent_duplicate(topic: str, recent_history: list[dict[str, str]]) -> bool:
     for item in recent_history:
         if _topic_similarity(topic, item.get("topic", "")) >= 0.8:

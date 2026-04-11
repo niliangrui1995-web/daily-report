@@ -24,6 +24,7 @@ import logging
 import time
 from datetime import datetime
 
+from intel_structuring import normalize_p3_structured_items, render_p3_structured_markdown
 from settings import SEARCH_API_KEY_POOL, load_prompt
 from utils import extract_json_from_llm_response, parse_backtrack_hours
 from search_engine import raw_gemini_search
@@ -135,36 +136,14 @@ def run_jinnang_3(hours: int = 24) -> list[dict]:
     return results
 
 
-def format_p3_section(label: str, results: list[dict]) -> str:
-    if not results:
-        return f'\n{label}\n（本锦囊无有效情报产出）\n'
-
-    lines = [f'\n{label}']
-    for i, item in enumerate(results, 1):
-        title = item.get('title', '未知标题')
-        source_url = item.get('source_url', '')
-        source_name = item.get('source_name', '未知来源')
-        track = item.get('track', '综合')
-        summary = item.get('summary', '')
-        lines.append(f"{i}. [{track}] {title}\n   摘要：{summary}\n   来源：{source_name} | {source_url}")
-
-    return '\n'.join(lines)
-
-
-def format_p3_output(jinnang_1_results: list[dict], jinnang_2_results: list[dict], jinnang_3_results: list[dict]) -> str:
-    sections = []
-    sections.append('============================================================')
-    sections.append('[P3 机动情报 - Gemini 联网搜索]')
-    sections.append(f'采集时间: {datetime.now().strftime("%Y-%m-%d %H:%M")}')
-    sections.append('（以下情报来自 Gemini 2.5 联网搜索，覆盖传统爬虫的盲区）')
-    sections.append('============================================================')
-
-    sections.append(format_p3_section('[锦囊一·爬虫攻坚补漏]', jinnang_1_results))
-    sections.append(format_p3_section('[锦囊二·非共识黑马发现]', jinnang_2_results))
-    sections.append(format_p3_section('[锦囊三·产业链异动预警]', jinnang_3_results))
-
-    sections.append('============================================================')
-    return '\n'.join(sections)
+def render_p3_output(raw_results: dict[str, list[dict]] | None, *, collected_at: str | None = None) -> tuple[str, list[dict]]:
+    structured_items = normalize_p3_structured_items(raw_results)
+    if not structured_items:
+        return '', []
+    return (
+        render_p3_structured_markdown(structured_items, collected_at=collected_at),
+        structured_items,
+    )
 
 
 def collect_p3_parallel_only(backtrack: str = '24h') -> tuple[str, dict]:
@@ -172,10 +151,12 @@ def collect_p3_parallel_only(backtrack: str = '24h') -> tuple[str, dict]:
     stats = {
         'source': 'P3 Gemini Search (parallel: jinnang 2+3)',
         'status': 'pending',
+        'jinnang_1_count': 0,
         'jinnang_2_count': 0,
         'jinnang_3_count': 0,
         'duration_seconds': 0,
-        'content_length': 0
+        'content_length': 0,
+        'structured_items': 0,
     }
 
     if not SEARCH_API_KEY_POOL:
@@ -220,19 +201,22 @@ def collect_p3_parallel_only(backtrack: str = '24h') -> tuple[str, dict]:
     elapsed = time.time() - start_time
     stats['duration_seconds'] = round(elapsed, 1)
 
+    raw_results = {
+        'jinnang_1': [],
+        'jinnang_2': jinnang_2_results,
+        'jinnang_3': jinnang_3_results,
+    }
     total = stats['jinnang_2_count'] + stats['jinnang_3_count']
     if total == 0:
         stats['status'] = 'empty'
+        stats['raw_results'] = raw_results
         return '', stats
 
-    formatted = format_p3_output([], jinnang_2_results, jinnang_3_results)
+    formatted, structured_items = render_p3_output(raw_results)
     stats['status'] = 'success'
     stats['content_length'] = len(formatted)
-
-    stats['raw_results'] = {
-        'jinnang_2': jinnang_2_results,
-        'jinnang_3': jinnang_3_results
-    }
+    stats['structured_items'] = len(structured_items)
+    stats['raw_results'] = raw_results
 
     logging.info(f"✅ [P3 并行] 锦囊二 {stats['jinnang_2_count']} + 锦囊三 {stats['jinnang_3_count']} = 共 {total} 条, 耗时 {elapsed:.1f}s")
 

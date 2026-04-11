@@ -15,23 +15,22 @@ from __future__ import annotations
 import logging
 import time
 import random
-from datetime import timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, ALL_COMPLETED
 from urllib.parse import urljoin
 
 import requests
 import warnings
 import urllib3
+from scraper_utils import enrich_article_url, is_article_url as _is_article_url
+
 
 from config import (
     WEB_SCRAPE_SOURCES as V2_WEB_SOURCES,
     FAKE_UA,
-    SUMMARY_LEN,
-    SOURCE_CONTENT_SELECTORS,
-    GENERIC_CONTENT_SELECTORS,
-    URL_BLACKLIST,
-    CONTENT_NOISE_KEYWORDS
 )
+from utils import parse_backtrack_hours
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -57,63 +56,134 @@ HEADERS = {
 
 SOURCE_TIMEOUT = 20
 
-def _is_article_url(url: str) -> bool:
-    url_lower = url.lower()
-    for pattern in URL_BLACKLIST:
-        if pattern in url_lower:
-            return False
-    return True
+_WEB_DATE_PATTERNS = [
+    re.compile(
+        r'(?P<dt>\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?(?:\s?(?:Z|UTC|GMT|[+-]\d{2}:?\d{2}))?)',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'(?P<dt>(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s?(?:AM|PM|UTC|GMT)?)?)',
+        re.IGNORECASE,
+    ),
+]
 
-def _enrich_article_content(url: str, source_name: str) -> str:
-    if not _parser_available or not url:
+_DATE_ONLY_RE = re.compile(r'^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$')
+_URL_DATE_RE = re.compile(r'(?P<y>20\d{2})[/-](?P<m>\d{1,2})[/-](?P<d>\d{1,2})')
+
+
+def _normalize_web_datetime(raw_text: str) -> str:
+    """将网页上的时间文本归一化为北京时间格式。"""
+    if not raw_text:
         return ''
-        
+
+    clean = re.sub(r'\s+', ' ', raw_text.strip())
+    clean = clean.replace('Published', '').replace('Updated', '').replace('posted', '')
+    clean = clean.replace('|', ' ').replace('•', ' ').strip(' :-')
+    if not clean:
+        return ''
+
+    dt = None
+    is_date_only = False
+    parse_attempts = [clean]
+
+    normalized = clean.replace('/', '-').replace('.', '-')
+    if normalized != clean:
+        parse_attempts.append(normalized)
+
+    if _DATE_ONLY_RE.match(normalized):
+        is_date_only = True
+        parse_attempts.extend([f'{normalized} 23:59:59', f'{normalized}T23:59:59'])
+
+    for candidate in parse_attempts:
+        c = candidate.strip()
+        if not c:
+            continue
+        iso_candidate = c.replace('Z', '+00:00')
+        iso_candidate = re.sub(r'\bUTC\b', '+00:00', iso_candidate, flags=re.IGNORECASE)
+        iso_candidate = re.sub(r'\bGMT\b', '+00:00', iso_candidate, flags=re.IGNORECASE)
+        try:
+            dt = datetime.fromisoformat(iso_candidate)
+            break
+        except ValueError:
+            pass
+
+        for fmt in (
+            '%Y-%m-%d %H:%M:%S',
+            '%Y-%m-%d %H:%M',
+            '%Y-%m-%dT%H:%M:%S',
+            '%Y-%m-%dT%H:%M',
+            '%b %d, %Y %I:%M %p',
+            '%b %d, %Y %H:%M',
+            '%b %d, %Y',
+            '%B %d, %Y %I:%M %p',
+            '%B %d, %Y %H:%M',
+            '%B %d, %Y',
+        ):
+            try:
+                dt = datetime.strptime(c, fmt)
+                break
+            except ValueError:
+                continue
+        if dt is not None:
+            break
+
+    if dt is None:
+        return ''
+
+    if dt.tzinfo is None:
+        # Why: 网页列表页时间通常无时区，保守按北京时间看待，避免误杀刚发布新闻
+        dt = dt.replace(tzinfo=BEIJING_TZ)
+    else:
+        dt = dt.astimezone(BEIJING_TZ)
+
+    if is_date_only:
+        dt = dt.replace(hour=23, minute=59, second=59)
+
+    return dt.strftime('%Y-%m-%dT%H:%M:%S (北京时间)')
+
+
+def _extract_web_published_at(page_html: str, raw_link: str, link: str, title: str) -> str:
+    """从列表页上下文或 URL 中尽量提取发布时间。"""
+    search_targets = []
+    for value in (raw_link, link, title):
+        if value and value not in search_targets:
+            search_targets.append(value)
+
+    for target in search_targets:
+        idx = page_html.find(target)
+        if idx < 0:
+            continue
+        context = page_html[max(0, idx - 800): idx + 800]
+        for pattern in _WEB_DATE_PATTERNS:
+            match = pattern.search(context)
+            if match:
+                normalized = _normalize_web_datetime(match.group('dt'))
+                if normalized:
+                    return normalized
+
+    for candidate in (raw_link, link):
+        if not candidate:
+            continue
+        match = _URL_DATE_RE.search(candidate)
+        if match:
+            normalized = _normalize_web_datetime(f"{match.group('y')}-{match.group('m')}-{match.group('d')}")
+            if normalized:
+                return normalized
+
+    return ''
+
+
+def _is_within_window(published_at: str | None, hours: int) -> bool:
+    if not published_at:
+        return True
     try:
-        time.sleep(random.uniform(0.2, 0.5))
-        fetch_url = url
-        if 'digitimes' in source_name.lower():
-            fetch_url = f'https://webcache.googleusercontent.com/search?q=cache:{url}'
-            
-        resp = requests.get(fetch_url, headers=HEADERS, timeout=15, verify=False)
-        if resp.status_code >= 400:
-            if fetch_url != url:
-                resp = requests.get(url, headers=HEADERS, timeout=15, verify=False)
-                if resp.status_code >= 400:
-                    return ''
-            else:
-                return ''
-                
-        page = Selector(resp.text)
-        selectors = SOURCE_CONTENT_SELECTORS.get(source_name, []) + GENERIC_CONTENT_SELECTORS
-        for sel in selectors:
-            try:
-                paras = page.css(sel)
-                texts = []
-                for p in paras:
-                    t = p.text.strip() if p.text else ''
-                    if len(t) > 30 and not any(kw in t.lower() for kw in CONTENT_NOISE_KEYWORDS):
-                        texts.append(t)
-                if texts and len(' '.join(texts)) > 50:
-                    return ' '.join(texts)[:SUMMARY_LEN]
-            except Exception as e:
-                logging.warning(f"[P1 Web] 选择器 {sel} 解析异常: {e}")
-                continue
-                
-        for meta_sel in ("meta[name='description']", "meta[property='og:description']"):
-            try:
-                metas = page.css(meta_sel)
-                if metas:
-                    c = metas[0].attrib.get('content', '').strip()
-                    if c and len(c) > 30:
-                        return c[:SUMMARY_LEN]
-            except Exception as e:
-                logging.warning(f"[P1 Web] Meta 选择器解析异常: {e}")
-                continue
-                
-        return ''
+        clean = published_at.replace('(北京时间)', '').replace('T', ' ').strip()
+        dt = datetime.strptime(clean[:19], '%Y-%m-%d %H:%M:%S').replace(tzinfo=BEIJING_TZ)
+        cutoff = datetime.now(BEIJING_TZ) - timedelta(hours=hours)
+        return dt >= cutoff
     except Exception as e:
-        logging.warning(f"[P1 Web] {url} 正文深度抓取失败: {e}")
-        return ''
+        logging.debug(f'Ignored return True exception: {e}')
+        return True
 
 def _scrape_one_source(source_cfg: dict) -> list[dict]:
     url = source_cfg['url']
@@ -181,32 +251,37 @@ def _scrape_one_source(source_cfg: dict) -> list[dict]:
             
         raw_link = el.attrib.get(link_attr, '') if hasattr(el, 'attrib') else ''
         link = urljoin(url, raw_link) if raw_link else ''
+        published_at = _extract_web_published_at(resp.text, raw_link, link, title)
         
         entries.append({
             'title': title,
             'content': '',
             'url': link,
-            'published_at': '',
+            'published_at': published_at,
             'source': name
         })
     return entries
 
-def _entries_to_p1_result(entries: list[dict], category: str, source_name: str) -> dict | None:
-    if not entries:
+def _entries_to_p1_result(entries: list[dict], category: str, source_name: str, hours: int) -> dict | None:
+    filtered = [e for e in entries if _is_within_window(e.get('published_at'), hours)]
+    if not filtered:
         return None
         
     lines = []
     grounding_sources = []
     
-    for i, entry in enumerate(entries, 1):
+    for i, entry in enumerate(filtered, 1):
         title = entry.get('title', '').strip()
         content = entry.get('content', '').strip()
         url = entry.get('url', '')
         source = entry.get('source', source_name)
+        published_at = entry.get('published_at', '')
         
         text_line = f'{i}. [{source}] {title}'
         if content and content != title:
             text_line += f' — {content[:300]}'
+        if published_at:
+            text_line += f' [{published_at}]'
             
         text_line += f' 【{source}|{url}|】'
         lines.append(text_line)
@@ -221,10 +296,12 @@ def _entries_to_p1_result(entries: list[dict], category: str, source_name: str) 
         'category': category,
         'query': f'[网页采集] {source_name}',
         'text': '\n'.join(lines),
-        'grounding_sources': grounding_sources[:10]
+        'grounding_sources': grounding_sources[:10],
+        '_filtered_entries': filtered,
     }
 
 def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
+    hours = parse_backtrack_hours(backtrack)
     stats = {'total': 0, 'success': [], 'empty': [], 'failed': []}
     
     if not _parser_available:
@@ -239,7 +316,7 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
     stats['total'] = len(V2_WEB_SOURCES)
     
     logging.info('============================================================')
-    logging.info(f'[P1 Web 采集] requests + Scrapling Parser（{len(V2_WEB_SOURCES)} 个源）')
+    logging.info(f'[P1 Web 采集] requests + Scrapling Parser（{len(V2_WEB_SOURCES)} 个源，回溯 {backtrack}）')
     logging.info('============================================================')
     
     def _run_task(source_cfg: dict) -> tuple[dict | None, str, str]:
@@ -252,21 +329,26 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
             if not entries:
                 return None, 'empty', '选择器未匹配或页面不可达'
                 
-            result = _entries_to_p1_result(entries, category, name)
+            result = _entries_to_p1_result(entries, category, name, hours)
             if result is None:
-                return None, 'empty', f'{len(entries)} 条但转换失败'
+                return None, 'empty', f'{len(entries)} 条但均超出 {hours}h 时间窗'
+            # Why: 保留原始条目供 Phase 2 深挖后回写主文本，最后返回前会清理内部字段
+            result['_entries'] = result.get('_filtered_entries', [])
+            result['_source_name'] = name
+            result['_category'] = category
             return result, 'ok', ''
         except Exception as exc:
             return None, 'error', str(exc)
             
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(_run_task, src): src for src in V2_WEB_SOURCES}
-        
-        for future in as_completed(futures, timeout=180):
+        done, not_done = wait(futures.keys(), timeout=180, return_when=ALL_COMPLETED)
+
+        for future in done:
             source_cfg = futures[future]
             source_name = source_cfg.get('name', 'unknown')
             try:
-                result, status, reason = future.result(timeout=30)
+                result, status, reason = future.result()
                 if status == 'ok' and result:
                     n_items = len(result['grounding_sources'])
                     all_results.append(result)
@@ -281,6 +363,14 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
             except Exception as exc:
                 stats['failed'].append((source_name, str(exc)))
                 logging.warning(f'  ❌ {source_name}: {exc}')
+
+        for future in not_done:
+            source_cfg = futures[future]
+            source_name = source_cfg.get('name', 'unknown')
+            future.cancel()
+            reason = '采集任务超时（180s），已保留其他已完成结果'
+            stats['failed'].append((source_name, reason))
+            logging.warning(f'  ⏱️ {source_name}: {reason}')
                 
     logging.info(f'\n[P1 Web Phase 1 完毕] {len(stats["success"])}/{stats["total"]} 源成功 | 发现: {sum(n for _, n in stats["success"])} 篇')
     
@@ -290,18 +380,18 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
         work_items = []
         
         for result in all_results:
-            source_name = result['query'].replace('[网页采集] ', '')
-            for gs in result.get('grounding_sources', []):
-                url = gs.get('url', '')
+            source_name = result.get('_source_name', result['query'].replace('[网页采集] ', ''))
+            for entry in result.get('_entries', []):
+                url = entry.get('url', '')
                 if url and _is_article_url(url):
-                    work_items.append((gs, url, source_name))
+                    work_items.append((entry, url, source_name))
                     
         if work_items:
             random.shuffle(work_items)
             
             def _process_one_web_item(item):
-                gs, url, source_name = item
-                return gs, _enrich_article_content(url, source_name)
+                entry, url, source_name = item
+                return entry, enrich_article_url(url, source_name)
                 
             total_items = len(work_items)
             processed = 0
@@ -311,9 +401,10 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
                 
                 for future in as_completed(futures):
                     try:
-                        gs_ref, content = future.result()
+                        entry_ref, content = future.result()
                         if content:
-                            gs_ref['content_summary'] = content
+                            # Why: 深挖内容直接回填 entry['content']，确保进入 _entries_to_p1_result 主文本
+                            entry_ref['content'] = content
                             enrich_ok += 1
                         else:
                             enrich_fail += 1
@@ -327,6 +418,25 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
             logging.info(f'[P1 Web Phase 2] 正文深挖完毕: ✅ {enrich_ok} / ❌ {enrich_fail}')
             stats['enrich_ok'] = enrich_ok
             stats['enrich_fail'] = enrich_fail
+
+            # Why: 深挖后重建文本，将 entry.content 真正写入 P1 输出
+            rebuilt_results = []
+            for result in all_results:
+                source_name = result.get('_source_name', result.get('query', '').replace('[网页采集] ', ''))
+                category = result.get('_category', result.get('category', '网页采集'))
+                entries = result.get('_entries', [])
+
+                refreshed = _entries_to_p1_result(entries, category, source_name, hours) if entries else None
+                if refreshed:
+                    rebuilt_results.append(refreshed)
+            all_results = rebuilt_results
+
+    # 清理内部字段，避免外部调用方感知中间态结构
+    for result in all_results:
+        result.pop('_entries', None)
+        result.pop('_source_name', None)
+        result.pop('_category', None)
+        result.pop('_filtered_entries', None)
             
     return all_results, stats
 

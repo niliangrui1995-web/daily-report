@@ -1,30 +1,43 @@
 """
-P5 / P7.5 审计层 — Gemini 3.1 Pro High 独立审计引擎。
+P5 / P7a / P7.5 审计层 — Gemini 3.1 Pro High 独立审计引擎。
 
-从 daily_report.py 拆分。负责对 P1 原始数据和 P7.5 补充搜索结果进行
-可信度打分、时效性验证、数据清洗。
+从 daily_report.py 拆分。负责对 P1 原始数据、P7 深度研究和 P7.5 补充搜索结果进行
+可信度打分、时效性验证、去重汇总与数据清洗。
 
 【⚠️核心维护规则 / Agent 指令】
 1. 严禁擅自绕过或修改时效性窗口（24h/72h）的强制拦截逻辑，过期旧闻必须直接被判死刑剔除。
 2. 剥离和解析大模型返回的 JSON 结果时，必须强制保留现有的正则宽容解析（容忍前后出现 md 标记或乱码）与 try-catch 兜底，绝不能假定大模型每次都会吐出完美合规的 JSON。
 3. P5 与 P7.5 的 JSON 结果落盘阶段，必须严格按照层级变量隔离文件名前缀，严禁互相覆盖污染数据轴。
 4. 调用 Gemini Pro 时使用 `ThreadPoolExecutor(max_workers=1)` + `timeout=480s` 做超时保护，是从生产事故（Gemini 首次调用偶发无限挂起 10 分钟）中沉淀的机制。严禁"觉得用线程池包一层太重"而改成直接调用——那样会在某些边际条件下把整条流水线卡死。
+5. P7a 是 P7 深度研究 → P9 战报之间的「数据压缩器」，产出纯 Markdown（非 JSON），
+   直接替代 P7 原始数据传递给 P9，避免 P9 输入中 P7 占比过大稀释注意力。
 """
 
 import concurrent.futures
 import json
 import logging
-import os
 import time
 from datetime import datetime
 
-from settings import pro_adapter, load_prompt
+from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
+from settings import pro_adapter, require_prompt
 from industry_dict import ALL_OLIGARCHS_FLAT
 from utils import extract_json_from_llm_response
 
 def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24h') -> str:
     layer_name = 'P5' if audit_type == 'p5' else 'P7.5'
+    stage_key = 'p5' if audit_type == 'p5' else 'p75'
+    file_prefix = 'P7.5_补充审计' if layer_name == 'P7.5' else 'P5_审计'
     logging.info(f'[{layer_name} 审计] 启动 Gemini Pro 独立审计（{len(raw_data)} 字输入）')
+
+    if not raw_data or not raw_data.strip():
+        logging.warning(f'[{layer_name} 审计] 输入为空，跳过审计')
+        update_run_manifest(
+            stage_key,
+            status='skipped_empty_input',
+            metrics={'input_chars': len(raw_data)},
+        )
+        return ''
 
     today_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
     vanguard_list = ', '.join(ALL_OLIGARCHS_FLAT)
@@ -53,7 +66,17 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
     task_two = '任务二' if audit_type == 'p5' else '任务一'
     task_three = '任务三' if audit_type == 'p5' else '任务二'
 
-    prompt_template = load_prompt('audit.txt')
+    try:
+        prompt_template = require_prompt('audit.txt')
+    except FileNotFoundError as e:
+        logging.error(f'🚨 [{layer_name} 审计] 关键 Prompt 缺失: {e}')
+        update_run_manifest(
+            stage_key,
+            status='failed_missing_prompt',
+            metrics={'input_chars': len(raw_data), 'error': str(e)},
+        )
+        return ''
+
     prompt = prompt_template.format(
         layer_name=layer_name,
         header_text=header_text,
@@ -73,9 +96,19 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
             resp = _future.result(timeout=_AUDIT_TIMEOUT_SECONDS)
     except concurrent.futures.TimeoutError:
         logging.error(f'🚨 [{layer_name} 审计] Gemini Pro 响应超时（{_AUDIT_TIMEOUT_SECONDS}s），降级跳过审计')
+        update_run_manifest(
+            stage_key,
+            status='failed_timeout',
+            metrics={'input_chars': len(raw_data), 'timeout_seconds': _AUDIT_TIMEOUT_SECONDS},
+        )
         return ''
     except Exception as e:
         logging.error(f'🚨 [{layer_name} 审计] 调用异常: {e}')
+        update_run_manifest(
+            stage_key,
+            status='failed_invoke',
+            metrics={'input_chars': len(raw_data), 'error': str(e)},
+        )
         return ''
 
     elapsed = time.time() - t0
@@ -83,21 +116,17 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
 
     if not raw_content:
         logging.warning(f'[{layer_name} 审计] Pro 返回空结果')
+        update_run_manifest(
+            stage_key,
+            status='failed_empty_output',
+            metrics={'input_chars': len(raw_data), 'elapsed_seconds': round(elapsed, 1)},
+        )
         return ''
 
     try:
         data = extract_json_from_llm_response(raw_content, expect_type='dict')
-
-        try:
-            from settings import get_today_output_dir
-            now_str = datetime.now().strftime('%Y%m%d%H%M')
-            file_prefix = 'P7.5_补充审计' if layer_name == 'P7.5' else 'P5_审计'
-            json_fname = os.path.join(get_today_output_dir(), f'{file_prefix}_{now_str}.json')
-            with open(json_fname, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            logging.info(f'💾 [{layer_name} 审计] 完美架构JSON数据已强制分离落盘: {json_fname}')
-        except Exception as e:
-            logging.warning(f'⚠️ [{layer_name} 审计] JSON落盘失败: {e}')
+        json_path = write_json_artifact(file_prefix, data)
+        logging.info(f'💾 [{layer_name} 审计] 完美架构 JSON 数据已落盘: {json_path}')
 
         clean_lines = []
         summary = data.get('summary', {})
@@ -139,16 +168,196 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
         deleted_log = '\n'.join(deleted_lines).strip()
         full_text = clean_text + '\n\n' + deleted_log
 
-        try:
-            md_fname = os.path.join(get_today_output_dir(), f'{file_prefix}_{now_str}.md')
-            with open(md_fname, 'w', encoding='utf-8') as f:
-                f.write(full_text)
-        except Exception as e:
-            logging.error(f'[{layer_name}] 写入 md 文件失败: {e}')
+        md_path = write_text_artifact(file_prefix, full_text)
+        update_run_manifest(
+            stage_key,
+            status='completed',
+            files={'md': md_path, 'json': json_path},
+            metrics={
+                'input_chars': len(raw_data),
+                'output_chars': len(clean_text),
+                'elapsed_seconds': round(elapsed, 1),
+            },
+        )
 
         logging.info(f'✅ [{layer_name} 审计] 成功解析 JSON 并逆向渲染为 MarkDown ({elapsed:.1f}s)')
         return clean_text
 
     except json.JSONDecodeError as e:
         logging.error(f'❌ [{layer_name} 审计] JSON解析失败: {e}\n大模型幻觉原文: {raw_content[:200]}')
+        update_run_manifest(
+            stage_key,
+            status='fallback_raw_llm',
+            metrics={
+                'input_chars': len(raw_data),
+                'raw_output_chars': len(raw_content),
+                'elapsed_seconds': round(elapsed, 1),
+                'error': str(e),
+            },
+        )
         return raw_content
+
+
+def p7a_deep_research_audit(raw_deep_research: str) -> str:
+    """P7a 深度研究审计 — 对 P7 原始搜索数据做去重、降噪、结构化汇总。
+
+    Why: P7 原始输出通常 40K+ 字，跨 3 轮搜索存在大量重复信息和搜索噪声。
+         如果直接送入 P9，会占据 Opus 近一半的注意力窗口，稀释战报质量。
+         P7a 用 Gemini 3.1 Pro 做一次审计汇总，将信息密度提升 3~5 倍，
+         输出 8~12K 字的精炼 Markdown 报告替代原始数据送入 P9。
+
+    Args:
+        raw_deep_research: P7 run_deep_research() 返回的原始 Markdown 全文
+
+    Returns:
+        str: 审计汇总后的 Markdown 报告（纯文本，不含 JSON）
+    """
+    if not raw_deep_research or len(raw_deep_research.strip()) < 200:
+        logging.warning('[P7a 审计] P7 深研数据不足 200 字，跳过审计直接透传')
+        update_run_manifest(
+            'p7a',
+            status='skipped_short_input',
+            metrics={'input_chars': len(raw_deep_research or '')},
+        )
+        return raw_deep_research or ''
+
+    logging.info(f'[P7a 审计] 启动 Gemini Pro 深度研究审计（{len(raw_deep_research)} 字输入）')
+
+    today_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
+    vanguard_list = ', '.join(ALL_OLIGARCHS_FLAT)
+
+    try:
+        prompt_template = require_prompt('p7a_audit.txt')
+    except FileNotFoundError as e:
+        logging.error(f'🚨 [P7a 审计] 关键 Prompt 缺失: {e}')
+        update_run_manifest(
+            'p7a',
+            status='failed_missing_prompt',
+            metrics={'input_chars': len(raw_deep_research), 'error': str(e)},
+        )
+        return raw_deep_research
+
+    prompt = prompt_template.format(
+        today_str=today_str,
+        vanguard_list=vanguard_list,
+        raw_deep_research=raw_deep_research,
+    )
+
+    t0 = time.time()
+    _P7A_TIMEOUT_SECONDS = 480
+
+    try:
+        # Why: 复用与 P5/P7.5 相同的 ThreadPoolExecutor + timeout 保护模式，
+        #       防止 Gemini 首次调用偶发无限挂起
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+            _future = _pool.submit(pro_adapter.invoke, prompt)
+            resp = _future.result(timeout=_P7A_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
+        logging.error(f'🚨 [P7a 审计] Gemini Pro 响应超时（{_P7A_TIMEOUT_SECONDS}s），降级透传原始数据')
+        update_run_manifest(
+            'p7a',
+            status='failed_timeout',
+            metrics={'input_chars': len(raw_deep_research), 'timeout_seconds': _P7A_TIMEOUT_SECONDS},
+        )
+        return raw_deep_research
+    except Exception as e:
+        logging.error(f'🚨 [P7a 审计] 调用异常: {e}，降级透传原始数据')
+        update_run_manifest(
+            'p7a',
+            status='failed_invoke',
+            metrics={'input_chars': len(raw_deep_research), 'error': str(e)},
+        )
+        return raw_deep_research
+
+    elapsed = time.time() - t0
+    raw_content = resp.content if resp.content else ''
+
+    if not raw_content or len(raw_content.strip()) < 100:
+        logging.warning('[P7a 审计] Pro 返回空结果或过短，降级透传原始数据')
+        update_run_manifest(
+            'p7a',
+            status='failed_empty_output',
+            metrics={'input_chars': len(raw_deep_research), 'elapsed_seconds': round(elapsed, 1)},
+        )
+        return raw_deep_research
+
+    # Why: P7a prompt 要求按 `===MARKDOWN===` 分隔符输出 JSON + Markdown 双轨数据
+    #       解析这个分隔符，分别落盘 .json 和 .md 文件
+    file_prefix = 'P7a_深研审计'
+
+    json_data = None
+    markdown_text = raw_content  # 默认整体作为 Markdown（降级兜底）
+
+    if '===MARKDOWN===' in raw_content:
+        parts = raw_content.split('===MARKDOWN===', 1)
+        json_part = parts[0].strip()
+        markdown_part = parts[1].strip() if len(parts) > 1 else ''
+
+        # Why: JSON 部分可能被模型包在 ```json``` 代码块里，需要剥离
+        json_part = json_part.strip('`').strip()
+        if json_part.startswith('json'):
+            json_part = json_part[4:].strip()
+
+        try:
+            json_data = extract_json_from_llm_response(json_part, expect_type='dict')
+            logging.info('[P7a 审计] 成功解析 JSON 结构化数据')
+        except Exception as e:
+            logging.warning(f'⚠️ [P7a 审计] JSON 解析失败（不影响 Markdown 输出）: {e}')
+            # Why: JSON 解析失败时仍尝试手动构建基本结构
+            json_data = {
+                'meta': {
+                    'input_chars': len(raw_deep_research),
+                    'output_chars': len(markdown_part) if markdown_part else len(raw_content),
+                    'parse_error': str(e),
+                },
+                'raw_json_attempt': json_part[:2000],
+            }
+
+        if markdown_part:
+            markdown_text = markdown_part
+    else:
+        logging.warning('[P7a 审计] 响应中未找到 ===MARKDOWN=== 分隔符，整体作为 Markdown 处理')
+
+    json_path = ''
+    if json_data:
+        try:
+            json_path = write_json_artifact(file_prefix, json_data)
+            logging.info(f'💾 [P7a 审计] JSON 数据已落盘: {json_path}')
+        except Exception as e:
+            logging.warning(f'⚠️ [P7a 审计] JSON 落盘失败: {e}')
+
+    md_body = (
+        '# P7a 深度研究审计报告\n\n'
+        f'> 生成时间: {datetime.now().isoformat()}\n'
+        f'> 原始数据: {len(raw_deep_research)} 字 → 审计后: {len(markdown_text)} 字\n\n'
+        f'{markdown_text}'
+    )
+    try:
+        md_path = write_text_artifact(file_prefix, md_body)
+        logging.info(f'💾 [P7a 审计] Markdown 报告已落盘: {md_path}')
+    except Exception as e:
+        logging.warning(f'⚠️ [P7a 审计] Markdown 落盘失败: {e}')
+        md_path = ''
+
+    compression_ratio = len(raw_deep_research) / max(len(markdown_text), 1)
+    manifest_files = {}
+    if md_path:
+        manifest_files['md'] = md_path
+    if json_path:
+        manifest_files['json'] = json_path
+    update_run_manifest(
+        'p7a',
+        status='completed',
+        files=manifest_files or None,
+        metrics={
+            'input_chars': len(raw_deep_research),
+            'output_chars': len(markdown_text),
+            'compression_ratio': round(compression_ratio, 2),
+            'elapsed_seconds': round(elapsed, 1),
+            'topics_count': len(json_data.get('topics', [])) if isinstance(json_data, dict) else 0,
+        },
+    )
+    logging.info(f'✅ [P7a 审计] 完成 ({elapsed:.1f}s) | {len(raw_deep_research)} → {len(markdown_text)} 字 | 压缩比 {compression_ratio:.1f}x')
+
+    # Why: 返回的是 Markdown 纯文本，这是真正送给 P9 的内容
+    return markdown_text

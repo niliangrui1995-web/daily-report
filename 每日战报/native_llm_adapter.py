@@ -10,6 +10,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+# Why: FAKE_HEADERS 统一在 config.py 定义，避免分散维护
+from config import FAKE_HEADERS
+
 try:
     from pydantic import ConfigDict
 except ImportError:
@@ -25,17 +28,6 @@ except ImportError:
     HAS_LANGCHAIN = False
 
 logger = logging.getLogger(__name__)
-
-FAKE_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-}
-
-@dataclass
-class FakeToolCall:
-    """模拟 LangChain 的 ToolCall"""
-    name: str
-    args: Dict[str, Any]
-    id: str
 
 @dataclass
 class FakeAIMessage:
@@ -140,7 +132,10 @@ class NativeLLMAdapter(RunnableSerializable):
     max_retries: int = 3
     timeout: float = 300.0
     provider: str = 'openai_compat'
-    extra_kwargs: Dict[str, Any] = None
+    # Why: 统一用空字典默认值，防止 bind_tools() 中 **self.extra_kwargs 解包崩溃
+    #       原先 `field(default_factory=dict) if not HAS_LANGCHAIN else None` 在
+    #       HAS_LANGCHAIN=True 时 extra_kwargs 默认为 None，类型与 Dict 声明矛盾
+    extra_kwargs: Dict[str, Any] = {}
     _bound_tools: List[Any] = None
     _tools_prompt: str = ''
 
@@ -245,7 +240,7 @@ class NativeLLMAdapter(RunnableSerializable):
             api_key=self.api_key,
             max_retries=self.max_retries,
             timeout=self.timeout,
-            **self.extra_kwargs
+            **(self.extra_kwargs or {})
         )
         bound.provider = self.provider
         bound._bound_tools = list(tools)
@@ -329,8 +324,11 @@ class NativeLLMAdapter(RunnableSerializable):
         return '\n'.join(system_parts), '\n'.join(user_parts)
 
     def _call_anthropic(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
-        from anthropic import Anthropic
-        client = Anthropic(api_key=self.api_key, base_url=self.base_url, default_headers=FAKE_HEADERS)
+        if getattr(self, '_anthropic_client', None) is None:
+            from anthropic import Anthropic
+            client = Anthropic(api_key=self.api_key, base_url=self.base_url, default_headers=FAKE_HEADERS)
+            object.__setattr__(self, '_anthropic_client', client)
+        client = getattr(self, '_anthropic_client')
 
         kwargs = {
             'model': self.model,
@@ -379,76 +377,62 @@ class NativeLLMAdapter(RunnableSerializable):
         return '', ''
 
     def _call_gemini(self, prompt: str) -> str:
-        # Why: Gemini 2.5 Flash 走原生直连通道 + OS VPN 梯子
-        if '2.5' in self.model:
-            import requests
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "tools": [{"googleSearch": {}}],
-                "generationConfig": {
-                    "temperature": 0.5,
-                    "maxOutputTokens": 16000
-                }
-            }
+        # 统一使用最新 google.genai 架构（同时处理 2.5 直连与 3.1 反代）
+        if getattr(self, '_gemini_client', None) is None:
+            from google import genai
+            from google.genai import types
+            
+            if '2.5' in self.model:
+                # 2.5 走官方默认 URL，原生直连通道 + 环境代理
+                client = genai.Client(api_key=self.api_key)
+            else:
+                # 3.1 Pro 走反代逻辑 (通过 http_options.base_url 挂载)
+                client = genai.Client(
+                    api_key=self.api_key,
+                    http_options=types.HttpOptions(base_url=self.base_url)
+                )
+            object.__setattr__(self, '_gemini_client', client)
+        
+        client = getattr(self, '_gemini_client')
 
-            for attempt in range(self.max_retries):
-                try:
-                    resp = requests.post(url, json=payload, headers={'Content-Type': 'application/json'}, timeout=self.timeout)
-                    resp.raise_for_status()
-                    data = resp.json()
-
-                    if data.get('candidates') and len(data['candidates']) > 0:
-                        candidate = data['candidates'][0]
-                        if 'content' in candidate and 'parts' in candidate['content']:
-                            return candidate['content']['parts'][0].get('text', '')
-                    return ''
-                except Exception as e:
-                    wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
-                    logger.warning(f"⚠️ [Gemini 2.5 Native] 异常: {e}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-                    time.sleep(wait)
-            logger.error(f"❌ [Gemini 2.5 Native] {self.max_retries} 次重试全部失败")
-            return ''
-
-        # 对于 Gemini 3.1 Pro，走原有的反代逻辑 (127.0.0.1:8045)
-        import google.generativeai as genai
-
-        # 兼容 Antigravity 反代特征，使用旧版 SDK 的 api_endpoint
-        genai.configure(
-            api_key=self.api_key,
-            transport='rest',
-            client_options={'api_endpoint': self.base_url}
-        )
-
-        model = genai.GenerativeModel(self.model)
+        # Why: import 提出循环外，避免每次重试都做模块查找（虽然 Python 有缓存，但无必要）
+        from google.genai import types
 
         for attempt in range(self.max_retries):
             try:
-                # 3.1 Pro 走反代不强制挂载原生搜索，防止反代节点不支持报错
-                response = model.generate_content(
-                    prompt,
-                    generation_config=genai.types.GenerationConfig(
+                kwargs = {
+                    "model": self.model,
+                    "contents": prompt,
+                    "config": types.GenerateContentConfig(
                         temperature=0.5,
                         max_output_tokens=16000
                     )
-                )
+                }
+                
+                # Gemini 2.5 强制挂载原生搜索
+                if '2.5' in self.model:
+                    kwargs["config"].tools = [types.Tool(google_search=types.GoogleSearch())]
+                
+                response = client.models.generate_content(**kwargs)
                 return response.text if response.text else ''
             except Exception as e:
                 err_str = str(e).lower()
+                if 'connection' in err_str or 'ssl' in err_str or 'proxy' in err_str:
+                    logger.error(f"❌ [Gemini SDK] 严重网络连接错误，需检查代理设置: {e}")
                 wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
-
+                
                 if '401' in err_str or '403' in err_str or 'balance' in err_str:
-                    logger.warning(f"⚠️ [Gemini 3.1 反代] 账号风控(401/403)，等待 {wait:.1f}s 让反代切换账号（{attempt + 1}/{self.max_retries}）")
+                    logger.warning(f"⚠️ [Gemini SDK] 账号风控(401/403)，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
                 elif '429' in err_str or '503' in err_str or 'resource_exhausted' in err_str:
-                    logger.warning(f"⏳ [Gemini 3.1 反代] 触发限流，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+                    logger.warning(f"⏳ [Gemini SDK] 触发限流，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
                 elif 'timeout' in err_str or 'deadline' in err_str:
-                    logger.warning(f"⏳ [Gemini 3.1 反代] 超时，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+                    logger.warning(f"⏳ [Gemini SDK] 超时，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
                 else:
-                    logger.warning(f"⚠️ [Gemini 3.1 反代] 异常: {e}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-
+                    logger.warning(f"⚠️ [Gemini SDK] 异常: {e}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+                
                 time.sleep(wait)
 
-        logger.error(f"❌ [Gemini 3.1 反代] {self.max_retries} 次重试全部失败")
+        logger.error(f"❌ [Gemini SDK] {self.max_retries} 次重试全部失败")
         return ''
 
     def _call_grok_native(self, system_prompt: str, user_prompt: str) -> str:
@@ -499,10 +483,13 @@ class NativeLLMAdapter(RunnableSerializable):
         if 'grok' in self.model.lower():
             return self._call_grok_native(system_prompt, user_prompt)
 
-        from openai import OpenAI
-
-        base_url = self.base_url + '/v1' if not self.base_url.endswith('/v1') else self.base_url
-        client = OpenAI(api_key=self.api_key, base_url=base_url)
+        # Why: 惰性缓存 OpenAI Client，与 _call_anthropic/_call_gemini 保持一致，避免每次调用都新建连接
+        if getattr(self, '_openai_client', None) is None:
+            from openai import OpenAI
+            base_url = self.base_url + '/v1' if not self.base_url.endswith('/v1') else self.base_url
+            client = OpenAI(api_key=self.api_key, base_url=base_url)
+            object.__setattr__(self, '_openai_client', client)
+        client = getattr(self, '_openai_client')
 
         messages = []
         if system_prompt:

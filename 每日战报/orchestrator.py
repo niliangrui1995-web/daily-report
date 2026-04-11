@@ -13,14 +13,19 @@ import os
 import sys
 import time
 import logging
-import json
 import re
 import concurrent.futures
 import threading
 import contextlib
 from datetime import datetime
 
-from settings import OUTPUT_DIR, get_today_output_dir
+from artifact_store import (
+    set_run_timestamp,
+    update_run_manifest,
+    write_json_artifact,
+    write_text_artifact,
+)
+from settings import OUTPUT_DIR
 from trading_calendar import is_trading_day
 from checkpoint import detect_checkpoint
 from run_config import get_run_config
@@ -31,7 +36,7 @@ from p1_web import collect_from_web
 from p2_x_intel import collect_from_x
 from p3_agent import collect_p3_parallel_only
 from p4_vanguard import fetch_vanguard_prices
-from audit_engine import gemini_pro_audit
+from audit_engine import gemini_pro_audit, p7a_deep_research_audit
 from p6_mapper import format_evidence, generate_report
 from p7_deep_research import run_deep_research
 from p8_technical import (
@@ -41,7 +46,18 @@ from p8_technical import (
     p8_search_stock_prices,
 )
 from p9_reporter import p9_risk_analysis, send_report_email
-from search_engine import gemini_search, GEMINI_CONCURRENCY
+from search_engine import gemini_search
+
+
+def _configure_stdio() -> None:
+    """避免 Windows 控制台默认编码导致 emoji/中文日志写出失败。"""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 
 @contextlib.contextmanager
@@ -64,6 +80,47 @@ def log_heartbeat(task_name: str, interval: int = 15):
         t.join(timeout=1.0)
 
 
+def _recover_p2_p3_from_checkpoint(ckpt: dict) -> tuple[str, str]:
+    """从断点文件恢复 P2/P3 数据。独立函数避免 P5/P6 恢复分支重复代码。"""
+    p2_data = ""
+    p3_data = ""
+    if "p2" in ckpt["files"]:
+        try:
+            with open(ckpt["files"]["p2"], "r", encoding="utf-8") as f:
+                p2_data = f.read()
+            logging.info("  ↳ 已恢复 P2 X平台情报")
+        except FileNotFoundError:
+            logging.warning("  ↳ P2 文件已被删除（竞态）")
+        except Exception as e:
+            logging.warning(f"  ↳ P2 数据恢复失败: {e}")
+    if "p3" in ckpt["files"]:
+        try:
+            with open(ckpt["files"]["p3"], "r", encoding="utf-8") as f:
+                p3_data = f.read()
+            logging.info("  ↳ 已恢复 P3 机动情报")
+        except FileNotFoundError:
+            logging.warning("  ↳ P3 文件已被删除（竞态）")
+        except Exception as e:
+            logging.warning(f"  ↳ P3 数据恢复失败: {e}")
+    return p2_data, p3_data
+
+
+def _read_text_checkpoint(path: str, label: str) -> str:
+    """读取断点文本文件，统一容错和日志。"""
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = f.read()
+        logging.info(f"  ↳ 已恢复 {label}")
+        return data
+    except FileNotFoundError:
+        logging.warning(f"  ↳ {label} 文件已被删除（竞态）")
+    except Exception as e:
+        logging.warning(f"  ↳ {label} 恢复失败: {e}")
+    return ""
+
+
 def orchestrator_main():
     """主流程编排"""
     total_start = time.time()
@@ -76,6 +133,7 @@ def orchestrator_main():
     p4_data = ""
     p6_mapping = ""
     p7_deep = ""
+    p7a_audited = ""  # Why: P7a 审计后的精炼版深研，替代 p7_deep 送入 P9
     p75_supplement = ""
     price_data = ""
 
@@ -86,26 +144,41 @@ def orchestrator_main():
     logging.info("=" * 60)
 
     # 强制与交易日判断
-    # Why: scheduled_launcher.py 传入 --force-run，必须与这里匹配
-    force_restart = "--force" in sys.argv or "--force-restart" in sys.argv or "--force-run" in sys.argv
-    if not force_restart and not is_trading_day(now.date()):
+    # Why: --force 同时打开两个开关（跳过交易日门禁 + 忽略断点重头跑），
+    #       如果只想强制运行但保留断点，应使用 --force-run
+    #       如果只想忽略断点但不跳过交易日检查，应使用 --force-restart
+    force_run = "--force" in sys.argv or "--force-run" in sys.argv
+    force_restart = "--force" in sys.argv or "--force-restart" in sys.argv
+    if not force_run and not is_trading_day(now.date()):
         logging.info("非交易日，休眠。如需强制执行请加 --force-run 参数。")
         return
 
     # 断点自适应检测
-    ckpt = {"stage": "none", "files": {}}
+    ckpt = {"stage": "none", "files": {}, "run_timestamp": ""}
     if not force_restart:
         ckpt = detect_checkpoint()
+        run_ts = set_run_timestamp(ckpt.get("run_timestamp") or None)
+    else:
+        run_ts = set_run_timestamp()
 
     resume_from = ckpt["stage"]
+    update_run_manifest(
+        "orchestrator",
+        status="started",
+        metrics={"resume_from": resume_from, "force_restart": force_restart, "force_run": force_run},
+        timestamp=run_ts,
+    )
     if resume_from == "p9_done":
         logging.info("✅ [断点检测] 今天的战报已生成，任务结束。")
         return
 
     # ==================== P1~P3: 并行感知层 ====================
+    evidence_raw = ""
+    backtrack = ""
     if resume_from in ("none", "p1"):
         backtrack = get_run_config(now)
 
+    if resume_from == "none":
         logging.info("📡 [P1-P3] 并行采集：RSS + Web + X + Agent")
         p1_results = []
         p1_failed_urls = []  # Why: 收集 P1 阵亡 URL，供锦囊一补漏
@@ -124,7 +197,7 @@ def orchestrator_main():
             except Exception as e:
                 logging.warning(f"RSS采集异常: {e}")
             try:
-                web_results, web_stats = web_fut.result()
+                web_results, _ = web_fut.result()
                 p1_results.extend(web_results)
             except Exception as e:
                 logging.warning(f"Web采集异常: {e}")
@@ -141,13 +214,17 @@ def orchestrator_main():
         if p1_failed_urls:
             logging.info(f"🎯 [P3 锦囊一] 收到 {len(p1_failed_urls)} 个 P1 阵亡 URL，启动空袭补漏...")
             try:
-                from p3_agent import run_jinnang_1, format_p3_output
+                from p3_agent import run_jinnang_1, format_p3_section
                 jinnang_1_results = run_jinnang_1(p1_failed_urls)
                 if jinnang_1_results:
-                    # Why: 将锦囊一的结果拼接到 p3_data 末尾
-                    jinnang_1_text = format_p3_output(jinnang_1_results, [], [])
-                    p3_data = (p3_data + "\n\n" + jinnang_1_text) if p3_data else jinnang_1_text
-                    logging.info(f"✅ [P3 锦囊一] 抢救回 {len(jinnang_1_results)} 条情报，已拼入 P3 数据")
+                    # Why: 将锦囊一的结果精准替换掉原 p3_data 中的空区，保持排版一致性，避免头部重复
+                    jinnang_1_text = format_p3_section('[锦囊一·爬虫攻坚补漏]', jinnang_1_results)
+                    empty_placeholder = format_p3_section('[锦囊一·爬虫攻坚补漏]', [])
+                    if p3_data and empty_placeholder in p3_data:
+                        p3_data = p3_data.replace(empty_placeholder, jinnang_1_text)
+                    else:
+                        p3_data = (p3_data + "\n\n" + jinnang_1_text) if p3_data else jinnang_1_text
+                    logging.info(f"✅ [P3 锦囊一] 抢救回 {len(jinnang_1_results)} 条情报，已无缝拼入 P3 数据")
             except Exception as e:
                 logging.warning(f"⚠️ [P3 锦囊一] 补漏失败: {e}")
 
@@ -157,203 +234,304 @@ def orchestrator_main():
         )
 
         # 保存 P1/P2/P3/P4 中间件（匹配老架构观测功能）
-        now_str = datetime.now().strftime('%Y%m%d%H%M')
-        out_dir = get_today_output_dir()
-
         # P1
         try:
-            with open(os.path.join(out_dir, f"P1_RSS原始数据_{now_str}.json"), "w", encoding="utf-8") as f:
-                json.dump(p1_results, f, ensure_ascii=False, indent=2)
-            with open(os.path.join(out_dir, f"P1_RSS原始数据_{now_str}.md"), "w", encoding="utf-8") as f:
-                f.write(evidence_raw)
+            p1_json_path = write_json_artifact("P1_RSS原始数据", p1_results)
+            p1_md_path = write_text_artifact("P1_RSS原始数据", evidence_raw)
+            update_run_manifest(
+                "p1",
+                status="completed",
+                files={"json": p1_json_path, "md": p1_md_path},
+                metrics={"records": len(p1_results), "failed_urls": len(p1_failed_urls), "evidence_chars": len(evidence_raw)},
+            )
         except Exception as e:
             logging.error(f"[P1] 原始数据保存失败: {e}")
 
-        # P2
-        if p2_data:
-            try:
-                with open(os.path.join(out_dir, f"P2_X平台情报_{now_str}.md"), "w", encoding="utf-8") as f:
-                    f.write(p2_data)
-            except Exception as e:
-                logging.error(f"[P2] 情报保存失败: {e}")
-
-        # P3
+        # Why: P2 已在 p2_x_intel.py._save_p2_output() 内部落盘，此处不再重复保存
+        # Why: P3 已在 orchestrator 外部格式化为纯文本，JSON({"data": text}) 毫无结构化价值，删除
         if p3_data:
             try:
-                with open(os.path.join(out_dir, f"P3_机动情报_{now_str}.md"), "w", encoding="utf-8") as f:
-                    f.write(p3_data)
-                with open(os.path.join(out_dir, f"P3_机动情报_{now_str}.json"), "w", encoding="utf-8") as f:
-                    # just basic save as requested format
-                    json.dump({"data": p3_data}, f, ensure_ascii=False, indent=2)
+                p3_path = write_text_artifact("P3_机动情报", p3_data)
+                update_run_manifest(
+                    "p3",
+                    status="completed",
+                    files={"md": p3_path},
+                    metrics={"content_chars": len(p3_data)},
+                )
             except Exception as e:
                 logging.error(f"[P3] 情报保存失败: {e}")
 
+    elif resume_from == "p1":
+        logging.info("🔄 [断点恢复] 从本地恢复 P1原始数据及相关情报，跳过网络采集...")
+        if "p1_md" in ckpt["files"]:
+            try:
+                with open(ckpt["files"]["p1_md"], "r", encoding="utf-8") as f:
+                    evidence_raw = f.read()
+            except Exception as e:
+                logging.warning(f"⚠️ P1 MD 恢复失败: {e}")
+                evidence_raw = ""
+        else:
+            evidence_raw = ""
+            
+        p2_data, p3_data = _recover_p2_p3_from_checkpoint(ckpt)
+
+    if resume_from in ("none", "p1"):
         # ==================== P5: 主观清洗审计 ====================
         with log_heartbeat("P5 情报审计"):
             p5_evidence = gemini_pro_audit(
-                evidence_raw, audit_type="l1.5", backtrack=backtrack
+                evidence_raw, audit_type="p5", backtrack=backtrack
             )
-
-        p5_fname_md = os.path.join(
-            get_today_output_dir(),
-            f"P5_审计_{datetime.now().strftime('%Y%m%d%H%M')}.md",
-        )
-        p5_fname_json = os.path.join(
-            get_today_output_dir(),
-            f"P5_审计_{datetime.now().strftime('%Y%m%d%H%M')}.json",
-        )
-        try:
-            with open(p5_fname_md, "w", encoding="utf-8") as f:
-                f.write(p5_evidence if p5_evidence else evidence_raw)
-            with open(p5_fname_json, "w", encoding="utf-8") as f:
-                json.dump({"audit_text": p5_evidence if p5_evidence else evidence_raw}, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logging.error(f"[P5] 文件保存失败: {e}")
+        # Why: P5 审计结果的 JSON/MD 落盘已在 audit_engine.py 内部完成，此处不再重复保存
 
     elif "p5" in ckpt["files"]:
         logging.info("🔄 [断点恢复] 从本地恢复 P5 审计结果...")
-        with open(ckpt["files"]["p5"], "r", encoding="utf-8") as f:
-            p5_evidence = f.read()
+        p5_evidence = _read_text_checkpoint(ckpt["files"]["p5"], "P5 审计结果")
         # Why: 断点恢复时 P2/P3 数据也必须加载，否则 P9 战报缺少 50% 情报维度
-        if "p2" in ckpt["files"]:
-            try:
-                with open(ckpt["files"]["p2"], "r", encoding="utf-8") as f:
-                    p2_data = f.read()
-                logging.info("  ↳ 已恢复 P2 X平台情报")
-            except Exception as e:
-                logging.warning(f"  ↳ P2 数据恢复失败: {e}")
-        if "p3" in ckpt["files"]:
-            try:
-                with open(ckpt["files"]["p3"], "r", encoding="utf-8") as f:
-                    p3_data = f.read()
-                logging.info("  ↳ 已恢复 P3 机动情报")
-            except Exception as e:
-                logging.warning(f"  ↳ P3 数据恢复失败: {e}")
+        p2_data, p3_data = _recover_p2_p3_from_checkpoint(ckpt)
 
     # ==================== P6: 核心映射与脉络推演 ====================
     if resume_from in ("none", "p1", "p5") and not p6_mapping:
         # Why: P4 在 p4_vanguard.py 内部已自动落盘，这里不重复保存
-        try:
-            p4_data = fetch_vanguard_prices()
-        except Exception as e:
-            logging.error(f"[P4] 获取海外行情失败: {e}")
+        if "p4" in ckpt["files"]:
+            logging.info("🔄 [断点恢复] 从本地恢复 P4 海外行情...")
+            try:
+                with open(ckpt["files"]["p4"], "r", encoding="utf-8") as f:
+                    p4_data = f.read()
+            except Exception as e:
+                logging.warning(f"⚠️ P4 数据恢复失败，重新获取: {e}")
+                try:
+                    p4_data = fetch_vanguard_prices()
+                except Exception as ex:
+                    logging.error(f"[P4] 重新获取海外行情失败: {ex}")
+        else:
+            try:
+                p4_data = fetch_vanguard_prices()
+            except Exception as e:
+                logging.error(f"[P4] 获取海外行情失败: {e}")
 
         combined_evidence = (
             p5_evidence + "\n" + p4_data + "\n" + p2_data + "\n" + p3_data
         )
 
+        # Why: P6 调 Opus 也有超时挂死风险，参照 P5 的 ThreadPoolExecutor 保护
+        _P6_TIMEOUT_SECONDS = 600
         with log_heartbeat("P6 核心脉络映射"):
-            p6_mapping = generate_report(combined_evidence)
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _p6_pool:
+                    _p6_fut = _p6_pool.submit(generate_report, combined_evidence)
+                    p6_mapping = _p6_fut.result(timeout=_P6_TIMEOUT_SECONDS)
+            except concurrent.futures.TimeoutError:
+                logging.error(f"🚨 [P6] Opus 映射超时（{_P6_TIMEOUT_SECONDS}s），降级返回空映射")
+                p6_mapping = ""
+            except Exception as e:
+                logging.error(f"🚨 [P6] Opus 映射异常: {e}")
+                p6_mapping = ""
 
-        # 这里已经有 P6 保存逻辑了 (不变)
-        p6_fname = os.path.join(
-            get_today_output_dir(),
-            f"P6_映射_{datetime.now().strftime('%Y%m%d%H%M')}.md",
-        )
-        p6_fname_json = os.path.join(
-            get_today_output_dir(),
-            f"P6_映射_{datetime.now().strftime('%Y%m%d%H%M')}.json",
-        )
+        # Why: P6 JSON 已在 p6_mapper.py generate_report() 内部落盘，此处只保存 MD 格式
         try:
-            with open(p6_fname, "w", encoding="utf-8") as f:
-                f.write(p6_mapping)
-            with open(p6_fname_json, "w", encoding="utf-8") as f:
-                json.dump({"mapping": p6_mapping}, f, ensure_ascii=False, indent=2)
+            p6_fname = write_text_artifact("P6_映射", p6_mapping)
+            update_run_manifest(
+                "p6",
+                status="completed",
+                files={"md": p6_fname},
+                metrics={"mapping_chars": len(p6_mapping)},
+            )
         except Exception as e:
             logging.error(f"[P6] 映射写入失败: {e}")
 
     elif "p6" in ckpt["files"]:
         logging.info("🔄 [断点恢复] 从本地恢复 P6 映射结果...")
-        with open(ckpt["files"]["p6"], "r", encoding="utf-8") as f:
-            p6_mapping = f.read()
+        p6_mapping = _read_text_checkpoint(ckpt["files"]["p6"], "P6 映射结果")
+        # Why: P6 恢复时也必须同步恢复 P4/P5/P2/P3 数据，否则 P9 战报缺少绝大部分基础情报
+        if "p5" in ckpt["files"]:
+            p5_evidence = _read_text_checkpoint(ckpt["files"]["p5"], "P5 审计数据")
+        
+        if "p4" in ckpt["files"]:
+            p4_data = _read_text_checkpoint(ckpt["files"]["p4"], "P4 海外行情")
+
+        p2_data, p3_data = _recover_p2_p3_from_checkpoint(ckpt)
+        
+        if "p7" in ckpt["files"]:
+            p7_deep = _read_text_checkpoint(ckpt["files"]["p7"], "P7 深度研究")
+                
+        if "p7a" in ckpt["files"]:
+            p7a_audited = _read_text_checkpoint(ckpt["files"]["p7a"], "P7a 深度研究审计")
+
+        if "p75" in ckpt["files"]:
+            p75_supplement = _read_text_checkpoint(ckpt["files"]["p75"], "P7.5 补充审计")
+
+        if resume_from == "p9_resume" and "p8" in ckpt["files"]:
+            price_data = _read_text_checkpoint(ckpt["files"]["p8"], "P8 技术面数据")
 
     # ==================== P7 & P7.5: 深度研究与搜索补充 ====================
     search_queries = re.findall(r"^\s*SEARCH:\s*(.+)$", p6_mapping, re.MULTILINE)
+    need_run_p7 = True
+    need_run_p75 = True
 
-    with log_heartbeat("P7 深研与 P7.5 搜索"):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            p7_fut = pool.submit(run_deep_research, p6_mapping)
+    # Why: p8_resume 语义 = P7 已完成，恢复时应优先复用历史结果，避免重复高成本调用
+    if resume_from in ("p8_resume", "p9_resume"):
+        if p7_deep.strip():
+            need_run_p7 = False
+        # Why: 若已存在 P7.5 文件则直接复用；若本次无 SEARCH 指令则也无需补跑 P7.5
+        if "p75" in ckpt.get("files", {}) or not search_queries:
+            need_run_p75 = False
+        logging.info(
+            f"🔄 [断点恢复] {resume_from} 命中：P7={'复用' if not need_run_p7 else '补跑'} | "
+            f"P7.5={'复用' if not need_run_p75 else '补跑'}"
+        )
 
-            sup_results = []
-            if search_queries:
-                logging.info(f"[P7.5] 触发 {len(search_queries)} 个补充搜索指令")
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=GEMINI_CONCURRENCY
-                ) as spool:
-                    futures = {
-                        spool.submit(gemini_search, "P7.5补充", q, "24h"): q
-                        for q in search_queries[:5] # 最多补5个
-                    }
-                    for future in concurrent.futures.as_completed(futures):
+    if need_run_p7 or need_run_p75:
+        with log_heartbeat("P7 深研与 P7.5 搜索"):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                p7_fut = pool.submit(run_deep_research, p6_mapping) if need_run_p7 else None
+
+                sup_results = []
+                if need_run_p75 and search_queries:
+                    capped_queries = search_queries[:5]
+                    logging.info(f"[P7.5] 触发 {len(capped_queries)} 个补充搜索指令（串行执行，避免线程池套全局限速）")
+                    for q in capped_queries:
                         try:
-                            res = future.result()
+                            res = gemini_search("P7.5补充", q, "24h")
                             if res and res.get("text"):
                                 sup_results.append(res["text"])
                         except Exception as e:
                             logging.error(f"[P7.5] 补充搜索失败: {e}")
 
-            try:
-                p7_deep = p7_fut.result(timeout=600)
-            except concurrent.futures.TimeoutError:
-                logging.warning("[P7] 深度研究超时")
-                p7_deep = ""
+                if p7_fut is not None:
+                    try:
+                        p7_deep = p7_fut.result(timeout=600)
+                    except concurrent.futures.TimeoutError:
+                        logging.warning("[P7] 深度研究超时")
+                        p7_deep = ""
 
-            if sup_results:
-                raw_p75 = "\n".join(sup_results)
-                with log_heartbeat("P7.5 搜索结果审计"):
-                    p75_supplement = gemini_pro_audit(raw_p75, audit_type="p7.5", backtrack="24h")
-            else:
-                p75_supplement = ""
+                if need_run_p75:
+                    if sup_results:
+                        raw_p75 = "\n".join(sup_results)
 
-    # 保存 P7 深研 (注: P7.5 已经在 audit_engine 里自动落盘双轨 json/md)
-    now_str = datetime.now().strftime('%Y%m%d%H%M')
+                        try:
+                            raw_fname = write_text_artifact("P7.5_补充搜索原始数据", raw_p75)
+                            logging.info(f"💾 [P7.5] 原始搜索结果已落盘: {raw_fname}")
+                            update_run_manifest(
+                                "p75",
+                                status="raw_ready",
+                                files={"raw": raw_fname},
+                                metrics={"queries": len(search_queries[:5]), "raw_chars": len(raw_p75)},
+                            )
+                        except Exception as e:
+                            logging.error(f"[P7.5] 补充搜索原始数据保存失败: {e}")
+
+                        with log_heartbeat("P7.5 搜索结果审计"):
+                            p75_supplement = gemini_pro_audit(raw_p75, audit_type="p7.5", backtrack="24h")
+                            if not p75_supplement:
+                                logging.warning("⚠️ [P7.5] 审计失败或返回为空，强制降级透传原始搜索数据")
+                                p75_supplement = raw_p75
+                    else:
+                        p75_supplement = ""
+                        update_run_manifest(
+                            "p75",
+                            status="skipped_no_results",
+                            metrics={"queries": len(search_queries[:5]), "raw_chars": 0},
+                        )
+
+    # 保存 P7 深研原始数据 (注: P7.5 已经在 audit_engine 里自动落盘双轨 json/md)
     if p7_deep:
         try:
-            with open(os.path.join(get_today_output_dir(), f"P7_深度研究_{now_str}.md"), "w", encoding="utf-8") as f:
-                f.write(p7_deep)
+            p7_body = (
+                "# P7 深度研究结果\n\n"
+                f"> 生成时间: {datetime.now().isoformat()}\n\n"
+                f"{p7_deep}"
+            )
+            p7_path = write_text_artifact("P7_深度研究", p7_body)
+            update_run_manifest(
+                "p7",
+                status="completed",
+                files={"md": p7_path},
+                metrics={"output_chars": len(p7_deep), "topics": p7_deep.count("## 深度研究：")},
+            )
         except Exception as e:
             logging.error(f"[P7] 深度研究文件写入失败: {e}")
 
+    # ==================== P7a: 深度研究审计（去重+汇总） ====================
+    # Why: P7 原始输出通常 40K+ 字，直接送入 P9 会占据近一半注意力窗口
+    #       P7a 用 Gemini 3.1 Pro 做跨轮次去重 + 噪声过滤 + 结构化汇总
+    #       输出 8~12K 字的精炼 Markdown 替代原始数据送入 P9
+    if p7a_audited:
+        logging.info("♻️ [P7a] 已由断点底层复用深度研究审计结果，智能跳过开销昂贵的二次大模型过滤")
+    elif p7_deep and len(p7_deep.strip()) > 200:
+        with log_heartbeat("P7a 深度研究审计"):
+            p7a_audited = p7a_deep_research_audit(p7_deep)
+    else:
+        p7a_audited = p7_deep
+
     # ==================== P8: 客观技术数据与资金测算 ====================
-    with log_heartbeat("P8 资金异动分析"):
-        stocks = extract_stocks_from_report(p6_mapping)
-        if stocks:
+    if resume_from == "p9_resume" and price_data.strip():
+        logging.info("♻️ [P8] 已从断点复用技术面数据，跳过重算")
+    else:
+        with log_heartbeat("P8 资金异动分析"):
+            stocks = extract_stocks_from_report(p6_mapping)
             tracks = extract_stock_tracks(p6_mapping)
             elasticity = extract_stock_elasticity(p6_mapping)
             price_data = p8_search_stock_prices(stocks, tracks, elasticity)
 
     # ==================== P9: 终极拼图战报 ====================
+    # Why: P9 调 Opus 是流水线最后一步，挂死 = 前面所有工作白费，必须加超时保护
+    #      P7 数据使用 P7a 审计后的精炼版本，避免原始数据（40K+字）稀释 Opus 注意力
+    _P9_TIMEOUT_SECONDS = 600
     with log_heartbeat("P9 终极聚合战报生成"):
         logging.info(
-            f"[P9 完整性] 八层数据就绪 (P5:{len(p5_evidence)}, P2:{len(p2_data)}, P3:{len(p3_data)}, P4:{len(p4_data)}, P7:{len(p7_deep)}, P6:{len(p6_mapping)}, P7.5:{len(p75_supplement)}, P8:{len(price_data)})"
+            f"[P9 完整性] 八层数据就绪 (P5:{len(p5_evidence)}, P2:{len(p2_data)}, P3:{len(p3_data)}, P4:{len(p4_data)}, P7a:{len(p7a_audited)}, P6:{len(p6_mapping)}, P7.5:{len(p75_supplement)}, P8:{len(price_data)})"
         )
-        final_report = p9_risk_analysis(
-            p5_evidence=p5_evidence,
-            p7_deep=p7_deep,
-            p75_supplement=p75_supplement,
-            p6_mapping=p6_mapping,
-            price_data=price_data,
-            p2_x_intel_data=p2_data,
-            p3_intel_data=p3_data,
-            p4_yfinance=p4_data,
-        )
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _p9_pool:
+                _p9_fut = _p9_pool.submit(
+                    p9_risk_analysis,
+                    p5_evidence=p5_evidence,
+                    p7_deep=p7a_audited,  # Why: 传 P7a 审计后的精炼数据，不是 P7 原始数据
+                    p75_supplement=p75_supplement,
+                    p6_mapping=p6_mapping,
+                    price_data=price_data,
+                    p2_x_intel_data=p2_data,
+                    p3_intel_data=p3_data,
+                    p4_yfinance=p4_data,
+                )
+                # Why: p9_risk_analysis 现在返回 (报告内容, 统一时间戳)
+                final_report, report_ts = _p9_fut.result(timeout=_P9_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            logging.error(f"🚨 [P9] Opus 战报生成超时（{_P9_TIMEOUT_SECONDS}s），降级为空战报")
+            final_report = ""
+            report_ts = ""
+        except Exception as e:
+            logging.error(f"🚨 [P9] Opus 战报异常: {e}")
+            final_report = ""
+            report_ts = ""
 
-    send_report_email(final_report)
+    send_report_email(final_report, report_ts)
 
     total_elapsed = time.time() - total_start
+    update_run_manifest(
+        "orchestrator",
+        status="completed",
+        metrics={"total_elapsed_seconds": round(total_elapsed, 1), "final_report_chars": len(final_report or "")},
+    )
     logging.info(
         f"🎯 VCP Hunter 运转完毕。总耗时: {int(total_elapsed // 60)}分{int(total_elapsed % 60)}秒 ({total_elapsed:.1f}s)"
     )
 
 
 if __name__ == "__main__":
+    _configure_stdio()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
     for lib in ["httpx", "httpcore", "google", "urllib3"]:
         logging.getLogger(lib).setLevel(logging.WARNING)
 
+    # Why: 改用 RotatingFileHandler 防止日志文件无限增长（单文件上限 10MB，保留 5 份历史）
+    from logging.handlers import RotatingFileHandler
+
     # 完整流程日志写入文件：包含 INFO 及以上自动保存
     pipeline_log_path = os.path.join(OUTPUT_DIR, "pipeline.log")
-    pipeline_handler = logging.FileHandler(pipeline_log_path, encoding="utf-8", mode="a")
+    pipeline_handler = RotatingFileHandler(
+        pipeline_log_path, maxBytes=10*1024*1024, backupCount=5, encoding="utf-8"
+    )
     pipeline_handler.setLevel(logging.INFO)
     pipeline_handler.setFormatter(
         logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -362,7 +540,9 @@ if __name__ == "__main__":
 
     # 错误日志单独分流
     error_log_path = os.path.join(OUTPUT_DIR, "error.log")
-    file_handler = logging.FileHandler(error_log_path, encoding="utf-8", mode="a")
+    file_handler = RotatingFileHandler(
+        error_log_path, maxBytes=5*1024*1024, backupCount=3, encoding="utf-8"
+    )
     file_handler.setLevel(logging.ERROR)
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")

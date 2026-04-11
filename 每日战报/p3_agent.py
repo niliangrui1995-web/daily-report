@@ -21,12 +21,11 @@ P3 机动搜索引擎 — Gemini 2.5 联网搜索三锦囊。
 import concurrent.futures
 import json
 import logging
-import os
 import time
 from datetime import datetime
 
-from settings import SEARCH_API_KEY_POOL, get_today_output_dir, load_prompt
-from utils import extract_json_from_llm_response
+from settings import SEARCH_API_KEY_POOL, load_prompt
+from utils import extract_json_from_llm_response, parse_backtrack_hours
 from search_engine import raw_gemini_search
 
 PRIORITY_KEYWORDS = [
@@ -47,7 +46,7 @@ def _parse_json_response(raw_text: str) -> list[dict]:
             return result
         return []
     except json.JSONDecodeError:
-        logging.warning('[P3] 无法从 Gemini 响应中解析出 JSON 数组')
+        logging.warning(f'[P3] 无法从 Gemini 响应中解析出 JSON 数组，头200字符: {raw_text[:200]}')
         return []
 
 
@@ -86,7 +85,8 @@ def run_jinnang_1(failed_urls: list[dict]) -> list[dict]:
     for i, target in enumerate(targets, 1):
         article_lines.append(f"{i}. 标题：{target.get('title', '未知')}\n   URL：{target.get('url', '未知')}\n   来源：{target.get('source', '未知')}")
 
-    prompt = template.format(failed_articles='\n'.join(article_lines))
+    now_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
+    prompt = template.format(failed_articles='\n'.join(article_lines), current_time=now_str)
 
     all_results = []
 
@@ -100,7 +100,8 @@ def run_jinnang_1(failed_urls: list[dict]) -> list[dict]:
             for i, target in enumerate(batch, 1):
                 batch_lines.append(f"{i}. 标题：{target.get('title', '未知')}\n   URL：{target.get('url', '未知')}\n   来源：{target.get('source', '未知')}")
 
-            batch_prompt = template.format(failed_articles='\n'.join(batch_lines))
+            now_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
+            batch_prompt = template.format(failed_articles='\n'.join(batch_lines), current_time=now_str)
             logging.info(f'  [锦囊一] 第 {batch_idx}/2 批空袭中...')
             raw_text = _call_gemini_search(batch_prompt)
             all_results.extend(_parse_json_response(raw_text))
@@ -115,7 +116,8 @@ def run_jinnang_1(failed_urls: list[dict]) -> list[dict]:
 def run_jinnang_2(hours: int = 24) -> list[dict]:
     logging.info('🔭 [P3 锦囊二] 启动极客圈非共识扫雷...')
     template = load_prompt('p3_jinnang2.txt')
-    prompt = template.format(hours=hours)
+    now_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
+    prompt = template.format(hours=hours, current_time=now_str)
     raw_text = _call_gemini_search(prompt)
     results = _parse_json_response(raw_text)
     logging.info(f'✅ [P3 锦囊二] 扫雷完成：发现 {len(results)} 条非共识信号')
@@ -125,11 +127,28 @@ def run_jinnang_2(hours: int = 24) -> list[dict]:
 def run_jinnang_3(hours: int = 24) -> list[dict]:
     logging.info('🌋 [P3 锦囊三] 启动产业链异动侦测...')
     template = load_prompt('p3_jinnang3.txt')
-    prompt = template.format(hours=hours)
+    now_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
+    prompt = template.format(hours=hours, current_time=now_str)
     raw_text = _call_gemini_search(prompt)
     results = _parse_json_response(raw_text)
     logging.info(f'✅ [P3 锦囊三] 侦测完成：捕获 {len(results)} 条异动信号')
     return results
+
+
+def format_p3_section(label: str, results: list[dict]) -> str:
+    if not results:
+        return f'\n{label}\n（本锦囊无有效情报产出）\n'
+
+    lines = [f'\n{label}']
+    for i, item in enumerate(results, 1):
+        title = item.get('title', '未知标题')
+        source_url = item.get('source_url', '')
+        source_name = item.get('source_name', '未知来源')
+        track = item.get('track', '综合')
+        summary = item.get('summary', '')
+        lines.append(f"{i}. [{track}] {title}\n   摘要：{summary}\n   来源：{source_name} | {source_url}")
+
+    return '\n'.join(lines)
 
 
 def format_p3_output(jinnang_1_results: list[dict], jinnang_2_results: list[dict], jinnang_3_results: list[dict]) -> str:
@@ -140,122 +159,12 @@ def format_p3_output(jinnang_1_results: list[dict], jinnang_2_results: list[dict
     sections.append('（以下情报来自 Gemini 2.5 联网搜索，覆盖传统爬虫的盲区）')
     sections.append('============================================================')
 
-    def _format_section(label: str, results: list[dict]) -> str:
-        if not results:
-            return f'\n{label}\n（本锦囊无有效情报产出）\n'
-
-        lines = [f'\n{label}']
-        for i, item in enumerate(results, 1):
-            title = item.get('title', '未知标题')
-            source_url = item.get('source_url', '')
-            source_name = item.get('source_name', '未知来源')
-            track = item.get('track', '综合')
-            summary = item.get('summary', '')
-            lines.append(f"{i}. [{track}] {title}\n   摘要：{summary}\n   来源：{source_name} | {source_url}")
-
-        return '\n'.join(lines)
-
-    sections.append(_format_section('[锦囊一·爬虫攻坚补漏]', jinnang_1_results))
-    sections.append(_format_section('[锦囊二·非共识黑马发现]', jinnang_2_results))
-    sections.append(_format_section('[锦囊三·产业链异动预警]', jinnang_3_results))
+    sections.append(format_p3_section('[锦囊一·爬虫攻坚补漏]', jinnang_1_results))
+    sections.append(format_p3_section('[锦囊二·非共识黑马发现]', jinnang_2_results))
+    sections.append(format_p3_section('[锦囊三·产业链异动预警]', jinnang_3_results))
 
     sections.append('============================================================')
     return '\n'.join(sections)
-
-
-def save_p3_output(formatted_text: str, stats: dict) -> None:
-    try:
-        now_str = datetime.now().strftime('%Y%m%d%H%M')
-        output_dir = get_today_output_dir()
-        md_filename = os.path.join(output_dir, f'P3_机动情报_{now_str}.md')
-
-        with open(md_filename, 'w', encoding='utf-8') as md_file:
-            md_file.write('# P3 机动情报（Gemini 联网搜索）\n\n')
-            md_file.write(f"> 采集时间: {datetime.now().isoformat()}\n")
-            md_file.write(f"> 锦囊一: {stats.get('jinnang_1_count', 0)} 条 | 锦囊二: {stats.get('jinnang_2_count', 0)} 条 | 锦囊三: {stats.get('jinnang_3_count', 0)} 条\n")
-            md_file.write(f"> 总耗时: {stats.get('duration_seconds', 0)}s\n\n")
-            md_file.write(formatted_text)
-
-        logging.info(f'[P3] Markdown 输出已保存: {md_filename}')
-
-        json_filename = os.path.join(output_dir, f'P3_机动情报_{now_str}.json')
-        with open(json_filename, 'w', encoding='utf-8') as json_file:
-            json.dump({
-                'time': datetime.now().isoformat(),
-                'source': 'P3_Gemini_Search',
-                'stats': stats,
-                'raw_results': stats.get('raw_results', {})
-            }, json_file, ensure_ascii=False, indent=2)
-
-        logging.info(f'[P3] JSON 输出已保存: {json_filename}')
-    except Exception as exc:
-        logging.warning(f'[P3] 保存输出文件失败: {exc}')
-
-
-def collect_from_p3(failed_urls: list[dict] = None, backtrack: str = '24h') -> tuple[str, dict]:
-    start_time = time.time()
-    stats = {
-        'source': 'P3 Gemini Search',
-        'status': 'pending',
-        'jinnang_1_count': 0,
-        'jinnang_2_count': 0,
-        'jinnang_3_count': 0,
-        'duration_seconds': 0,
-        'content_length': 0
-    }
-
-    if not SEARCH_API_KEY_POOL:
-        logging.warning('⚠️ [P3] GEMINI_SEARCH_API_KEYS 未配置，跳过机动搜索')
-        stats['status'] = 'skipped_no_key'
-        return '', stats
-
-    logging.info('🚀 [P3] 启动机动情报搜索引擎（三锦囊）')
-
-    if 'h' in backtrack:
-        hours = int(backtrack.replace('h', ''))
-    else:
-        hours = 24
-
-    jinnang_1_results = []
-    if failed_urls is not None:
-        jinnang_1_results = run_jinnang_1(failed_urls)
-        stats['jinnang_1_count'] = len(jinnang_1_results)
-
-        if jinnang_1_results:
-            time.sleep(3)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        future_2 = pool.submit(run_jinnang_2, hours)
-        future_3 = pool.submit(run_jinnang_3, hours)
-
-        jinnang_2_results = future_2.result(timeout=300)
-        jinnang_3_results = future_3.result(timeout=300)
-
-    stats['jinnang_2_count'] = len(jinnang_2_results)
-    stats['jinnang_3_count'] = len(jinnang_3_results)
-
-    total_count = stats['jinnang_1_count'] + stats['jinnang_2_count'] + stats['jinnang_3_count']
-    if total_count == 0:
-        logging.warning('⚠️ [P3] 三个锦囊全部空手而归，无情报产出')
-        stats['status'] = 'empty'
-        return '', stats
-
-    formatted_text = format_p3_output(jinnang_1_results, jinnang_2_results, jinnang_3_results)
-    elapsed = time.time() - start_time
-    stats['status'] = 'success'
-    stats['duration_seconds'] = round(elapsed, 1)
-    stats['content_length'] = len(formatted_text)
-
-    stats['raw_results'] = {
-        'jinnang_1': jinnang_1_results,
-        'jinnang_2': jinnang_2_results,
-        'jinnang_3': jinnang_3_results
-    }
-
-    logging.info(f"✅ [P3] 机动情报搜索完成: 锦囊一 {stats['jinnang_1_count']} + 锦囊二 {stats['jinnang_2_count']} + 锦囊三 {stats['jinnang_3_count']} = 共 {total_count} 条, {len(formatted_text)} 字, 耗时 {elapsed:.1f}s")
-
-    save_p3_output(formatted_text, stats)
-    return formatted_text, stats
 
 
 def collect_p3_parallel_only(backtrack: str = '24h') -> tuple[str, dict]:
@@ -276,17 +185,34 @@ def collect_p3_parallel_only(backtrack: str = '24h') -> tuple[str, dict]:
 
     logging.info('🚀 [P3] 启动并行锦囊（锦囊二 + 锦囊三）')
 
-    if 'h' in backtrack:
-        hours = int(backtrack.replace('h', ''))
-    else:
-        hours = 24
+    hours = parse_backtrack_hours(backtrack)
+
+    # Why: 必须在 try 之前初始化，否则两个 future 都抛异常时 UnboundLocalError 崩溃
+    jinnang_2_results = []
+    jinnang_3_results = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         future_2 = pool.submit(run_jinnang_2, hours)
         future_3 = pool.submit(run_jinnang_3, hours)
 
-        jinnang_2_results = future_2.result(timeout=300)
-        jinnang_3_results = future_3.result(timeout=300)
+        # Why: 各自独立 try-except，避免一个锦囊超时把另一个已成功的结果也一起丢弃
+        try:
+            jinnang_2_results = future_2.result(timeout=300)
+        except concurrent.futures.TimeoutError:
+            logging.warning('[P3] 锦囊二超时（300s），降级为空结果')
+            jinnang_2_results = []
+        except Exception as e:
+            logging.warning(f'[P3] 锦囊二异常: {e}')
+            jinnang_2_results = []
+
+        try:
+            jinnang_3_results = future_3.result(timeout=300)
+        except concurrent.futures.TimeoutError:
+            logging.warning('[P3] 锦囊三超时（300s），降级为空结果')
+            jinnang_3_results = []
+        except Exception as e:
+            logging.warning(f'[P3] 锦囊三异常: {e}')
+            jinnang_3_results = []
 
     stats['jinnang_2_count'] = len(jinnang_2_results)
     stats['jinnang_3_count'] = len(jinnang_3_results)
@@ -315,12 +241,8 @@ def collect_p3_parallel_only(backtrack: str = '24h') -> tuple[str, dict]:
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    mock_failed = [
-        {'title': 'SemiAnalysis: NVIDIA Blackwell B200 Yield Improvements', 'url': 'https://www.semianalysis.com/p/nvidia-blackwell-yield', 'source': 'SemiAnalysis'},
-        {'title': 'HBM4 Mass Production Timeline Update from SK Hynix', 'url': 'https://example.com/hbm4-update', 'source': 'TheElec_KR'}
-    ]
-
-    text, stats = collect_from_p3(failed_urls=mock_failed)
+    print("测试 P3 机动情报三锦囊（仅内部收集）...")
+    text, stats = collect_p3_parallel_only(backtrack='24h')
     print(f"\n===== P3 输出 ({len(text)} 字) =====\n")
     print(text[:2000] if text else "(空)")
     print(f"\n统计: {json.dumps(stats, ensure_ascii=False, indent=2)}")

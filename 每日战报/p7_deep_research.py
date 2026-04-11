@@ -11,11 +11,58 @@ P7 深度研究层 — Opus 指定主题的多轮迭代搜索。
 """
 
 import logging
-import os
 import re
 import random
 import time
 from datetime import datetime
+
+_INVALID_REFINE_QUERIES = {
+    'initiating the analysis',
+    'initiating inquiry process',
+    'initiating query generation',
+    'analysis',
+    'query generation',
+    'search query',
+}
+
+
+def _pick_refined_query(raw_text: str, fallback: str) -> tuple[str, bool]:
+    """从模型返回中提取可用查询词；无效则回退到原主题。"""
+    if not raw_text or not raw_text.strip():
+        return fallback, True
+
+    lines = []
+    for line in raw_text.splitlines():
+        t = line.strip()
+        if not t:
+            continue
+        if t.startswith('```') or t.startswith('#'):
+            continue
+        lines.append(t)
+
+    if not lines:
+        return fallback, True
+
+    query = lines[0].strip().strip('"\'` ')
+    query = re.sub(r'^\*+|\*+$', '', query).strip()
+    query = re.sub(r'^[\-•\d\.\)\s]+', '', query).strip()
+    query = re.sub(r'\s+', ' ', query)
+
+    if len(query) < 8:
+        return fallback, True
+
+    q_lower = query.lower()
+    if q_lower in _INVALID_REFINE_QUERIES:
+        return fallback, True
+    if re.match(r'^(initiating|starting|analysis|query generation)', q_lower):
+        return fallback, True
+    if not re.search(r'[A-Za-z0-9\u4e00-\u9fa5]', query):
+        return fallback, True
+
+    if len(query) > 220:
+        query = query[:220].rstrip()
+
+    return query, False
 
 
 def pick_deep_topics(p6_mapping: str) -> list[str]:
@@ -46,11 +93,15 @@ def iterative_deep_search(topic: str, rounds: int = 3) -> str:
         if r == 0:
             query = topic
         else:
-            refine_prompt = f'基于以下已搜集到的信息，生成 1 条更深入的搜索查询。\n目标：挖掘上一轮结果中未解答的关键问题，例如：\n- 事件的根本原因（why）\n- 产业链上下游的具体影响（who wins/loses）\n- 替代方案或竞争格局变化\n\n已搜集信息摘要：\n{all_findings[-1][:2000]}\n\n只输出 1 行搜索关键词（英文），不要任何解释：'
+            now_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
+            refine_prompt = f'⚠️ 当前北京时间：{now_str}\n\n基于以下已搜集到的信息，生成 1 条更深入的搜索查询。\n目标：挖掘上一轮结果中未解答的关键问题，例如：\n- 事件的根本原因（why）\n- 产业链上下游的具体影响（who wins/loses）\n- 替代方案或竞争格局变化\n\n已搜集信息摘要：\n{all_findings[-1][:2000]}\n\n只输出 1 行搜索关键词（英文），不要任何解释：'
             try:
                 resp = pro_adapter.invoke(refine_prompt)
                 if resp.content:
-                    query = resp.content.strip().split('\n')[0].strip().strip('"\'')
+                    query, used_fallback = _pick_refined_query(resp.content, topic)
+                    if used_fallback:
+                        preview = resp.content.strip().split('\n')[0][:80] if resp.content else ''
+                        logging.warning(f"[P6.5 深研] R{r + 1} 细化查询无效（{preview}），回退原主题")
                 else:
                     query = topic
             except Exception as e:
@@ -69,7 +120,7 @@ def iterative_deep_search(topic: str, rounds: int = 3) -> str:
             
     if not all_findings:
         return ''
-        
+
     combined = '\n\n'.join([f'### 深度研究 第{i + 1}轮\n{f}' for i, f in enumerate(all_findings)])
     logging.info(f"[P6.5 深研] '{topic}' 完成: {len(combined)} 字 ({len(all_findings)}/{rounds} 轮成功)")
     return combined
@@ -96,17 +147,6 @@ def run_deep_research(p6_mapping: str) -> str:
     if all_research:
         combined = '\n\n' + '\n\n'.join(all_research)
         logging.info(f'[P6.5] 深度研究完成: {len(topics)} 主题, {len(combined)} 字')
-        try:
-            from settings import get_today_output_dir
-            now_str = datetime.now().strftime('%Y%m%d%H%M')
-            fname = os.path.join(get_today_output_dir(), f'P7_深度研究_{now_str}.md')
-            with open(fname, 'w', encoding='utf-8') as f:
-                f.write(f'# P7 深度研究结果\n\n> 生成时间: {datetime.now().isoformat()}\n\n')
-                f.write(combined)
-            logging.info(f'[P6.5] 已保存: {fname}')
-            return combined
-        except Exception as e:
-            logging.warning(f'[P6.5] 保存失败: {e}')
-            return combined
-            
+        return combined
+
     return ''

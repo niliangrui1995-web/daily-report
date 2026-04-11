@@ -29,15 +29,16 @@ P5 审计清洗 (Gemini 3.1 Pro High)
     ↓ 时效验证 + 可信度打分 + 产业链关联度筛选 + 去主观噪声
 P6 A 股映射 (Claude Opus 4.6 Thinking)
     ↓ 产业链事件 → A 股标的 + 弹性评级
-    ├── P7 深度研究 (1-3 主题 × 3 轮迭代搜索) ── 并行启动
-    └── P8a 补充搜索 (Opus 指挥官下达 SEARCH 指令) ─┘
-P8 股价分析 (本地通达信 K 线数据)
-    ↓ 250 日 K 线 + 14 项技术指标 + 财务数据
-P7.5 审计 (Gemini 3.1 Pro High)
-    ↓ 补充搜索结果二次审计
+    ├── P7 深度研究 (1-3 主题 × 3 轮迭代搜索) ─┐ (高并发双轨搜索)
+    └── P7.5 补充搜索 (Opus 下达 SEARCH 密令) ─┴→ 等待所有搜索双双完成
+        ↓ (按顺序串行启动严格的脱水盲审)
+        ├── P7a 深度研究审计 (Gemini 3.1 Pro High) ── 将 40K P7源数据去重提取，JSON+MD双轨落盘
+        └── P7.5 补充审计 (Gemini 3.1 Pro High) ──    对 P7.5生肉盲审排雷，JSON+MD双轨落盘
+P8 股价分析 (本地通达信 K 线数据) ── 承接前线搜索和清洗完毕后安全执行
+    ↓ 提取 P6 映射标的，获取 250 日 K 线 + 14 项技术指标 + 财务数据
 P9 终极战报 (Claude Opus 4.6 Thinking)
     ↓ 九层数据综合 → 标的狙击表 + 操作建议
-    ↓ (P5 + P2 + P3 + P4 + P6 + P7 + P7.5 + P8 股价 + 海外行情)
+    ↓ (P5 + P2 + P3 + P4 + P6 + P7a + P7.5 + P8 股价 + 海外行情)
 📧 邮件推送
 ```
 
@@ -56,7 +57,7 @@ P9 终极战报 (Claude Opus 4.6 Thinking)
 │   ├── settings.py              # 配置中心（.env 加载 + 适配器单例）
 │   ├── search_engine.py         # 搜索引擎（Key 轮换 + 熔断器 + 三级降级）
 │   ├── scraper_utils.py         # Scrapling 公共工具（正文深挖 + URL 过滤）
-│   ├── audit_engine.py          # P5/P7.5 Pro 审计
+│   ├── audit_engine.py          # P5/P7a/P7.5 Pro 审计
 │   ├── p1_rss.py                # P1 Phase1+2：RSS 发现 + Scrapling 正文深挖
 │   ├── p1_web.py                # P1 网页列表页发现 + 正文深挖
 │   ├── p2_x_intel.py            # 📱 P2 X(Twitter) 产业链情报采集（Grok API）
@@ -81,6 +82,8 @@ P9 终极战报 (Claude Opus 4.6 Thinking)
 │   │   ├── p3_jinnang2.txt      # P3 锦囊二：极客圈非共识扫雷
 │   │   ├── p3_jinnang3.txt      # P3 锦囊三：产业链异动地震仪
 │   │   ├── p6_mapping.txt       # P6 A股映射逻辑
+│   │   ├── p7a_audit.txt        # P7a 深度研究提取压缩审计
+│   │   ├── audit.txt            # P5/P7.5 常规脱水盲审
 │   │   ├── p9_report.txt        # P9 最终战报模板
 │   │   └── ...                  # 其它各阶段提示词
 │   └── tests/                   # 单元测试（36 个离线测试用例）
@@ -257,15 +260,18 @@ Grok 是目前唯一天生拥有 X(Twitter) 实时数据访问能力的大模型
 ↓ P1 完成 → P3 锦囊一（阵亡名单空袭）→ P5 审计 → 收割 P2/P3
 ↓ P5 + P2 + P3 拼接 → 送入 P6
 
-P6 完成后（P7 + P8a + P8 并行）:
-ThreadPoolExecutor(max_workers=3)
+P6 完成后（P7 + P7.5 双轨并跑）:
+ThreadPoolExecutor(max_workers=2)
 ├── 线程A: 深度研究 (run_deep_research)
-│   └── 串行：每个主题 3 轮，每轮调 gemini_search → 走反代 Pro 模型
-│       轮与轮间 sleep 2~5 秒
-├── 线程B: 补充搜索 (_run_p8a_search)
-│   └── 并发池：最多 9 线程 → 走官方直连 API Key 池
-│       任务间 sleep 0.5~2 秒
-└── 线程C: P8 通达信 K 线查询（本地）
+│   └── 串行：每个主题 3 轮，每轮调 gemini_search
+└── 主线程: 补充搜索发射 (P7.5补充)
+    └── 内建并发池：针对 Opus 密令并发补充搜索
+
+等上述原石数据（P7 与 P7.5 搜索）全部采集组装后，进入串行安全清洗：
+1. P7.5 审计: 对刚带回来的补充搜索原始生肉脱水 (JSON+MD 双轨落盘)
+2. P7a 审计: 对 4 万字深研精华强力压榨提取 (JSON+MD 双轨落盘)
+3. P8 股价提取: 基于 P6 的标的获取纯本地技术面
+4. P9 终极战报: 总领全局撰写战役简报
 ```
 
 ---
@@ -283,10 +289,13 @@ ThreadPoolExecutor(max_workers=3)
 | `P3_机动情报_*.json` | P3 结构化原始数据（断点恢复用） |
 | `P5_审计_*.md` | Pro 审计后的高可信情报 |
 | `P6_映射_*.md` | Opus A 股映射 + 指令 |
-| `P7_深度研究_*.md` | 1-3 主题深研 + Scrapling 增强 |
+| `P7_深度研究_*.md` | 1-3 主题深研原始结果 (保留以备查) |
+| `P7a_深研审计_*.md` | P7a 跨轮去重+过滤后的精炼深研 |
+| `P7a_深研审计_*.json`| P7a 提取的结构化 JSON 数据 |
 | `P8_技术面_*.md` | 通达信 K 线 + 技术指标 + 财务 |
-| `P8a_补充搜索_*.md` | Opus 补充搜索 + Scrapling 增强 |
-| `P7.5_补充审计_*.md` | 补充搜索审计 |
+| `P7.5_补充搜索原始数据_*.md` | Opus 补充搜索抓取的生肉文本 |
+| `P7.5_补充审计_*.md` | 补充搜索提取清洗后的核心报告 |
+| `P7.5_补充审计_*.json`| 补充搜索的结构化 JSON 数据 |
 | `战报_*.md` | 最终战报（邮件同步推送） |
 
 ---

@@ -22,19 +22,18 @@ import urllib3
 from datetime import datetime, timedelta, timezone
 import feedparser
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, ALL_COMPLETED
 
 from config import (
     RSS_FEEDS as V2_RSS_FEEDS,
     REDDIT_SUBS as V2_REDDIT_SUBS,
-    RSSHUB_INSTANCES as V2_RSSHUB_INSTANCES,
-    NITTER_INSTANCES as V2_NITTER_INSTANCES,
     FAKE_UA,
     SEC_USER_AGENT,
     REQUEST_TIMEOUT,
     SUMMARY_LEN,
-    URL_BLACKLIST
 )
+from scraper_utils import is_article_url as _is_article_url
+from utils import parse_backtrack_hours
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -62,7 +61,6 @@ def _parse_rss_date(entry: dict) -> str:
                 return dt_bj.strftime('%Y-%m-%dT%H:%M:%S (北京时间)')
             except Exception as e:
                 logging.debug(f'Ignored pass exception: {e}')
-                pass
     pub = entry.get('published') or entry.get('updated') or ''
     return pub[:19]
 
@@ -138,74 +136,46 @@ def _fetch_hackernews() -> list[dict]:
         logging.debug(f'Ignored return [] exception: {e}')
         return []
         
-    entries = []
-    for item_id in ids:
+    def _fetch_one_hn_story(item_id: int) -> dict | None:
         try:
             item = requests.get(f'https://hacker-news.firebaseio.com/v0/item/{item_id}.json', timeout=5).json()
             if not item or item.get('type') != 'story':
-                continue
+                return None
             created = item.get('time', 0)
             if created:
                 pub = datetime.fromtimestamp(created, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%dT%H:%M:%S (北京时间)')
             else:
                 pub = ''
-            entries.append({
+            return {
                 'title': item.get('title', ''),
                 'content': '',
                 'url': item.get('url', f'https://news.ycombinator.com/item?id={item_id}'),
                 'published_at': pub,
                 'source': 'hackernews'
-            })
+            }
         except Exception as e:
             logging.debug(f'Ignored continue exception: {e}')
-            continue
+            return None
+
+    entries = []
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(_fetch_one_hn_story, item_id): item_id for item_id in ids}
+        done, not_done = wait(futures.keys(), timeout=60, return_when=ALL_COMPLETED)
+
+        for future in done:
+            try:
+                entry = future.result()
+                if entry:
+                    entries.append(entry)
+            except Exception as e:
+                logging.debug(f'Ignored continue exception: {e}')
+
+        for future in not_done:
+            future.cancel()
+            item_id = futures[future]
+            logging.debug(f'Ignored timeout item_id exception: {item_id}')
+
     return entries
-
-_rsshub_reachable: bool | None = None
-
-def _check_rsshub_reachable() -> bool:
-    global _rsshub_reachable
-    if _rsshub_reachable is not None:
-        return _rsshub_reachable
-    for instance in V2_RSSHUB_INSTANCES:
-        try:
-            resp = requests.head(instance, timeout=3, headers=HEADERS)
-            if resp.status_code < 500:
-                _rsshub_reachable = True
-                return True
-        except Exception as e:
-            logging.debug(f'Ignored continue exception: {e}')
-            continue
-    _rsshub_reachable = False
-    logging.warning('⚠️ 所有 RSSHub 实例不可达，跳过全部 Twitter 源')
-    return False
-
-def _fetch_twitter_user(username: str) -> list[dict]:
-    if not _check_rsshub_reachable() and not V2_NITTER_INSTANCES:
-        return []
-        
-    if _check_rsshub_reachable():
-        for instance in V2_RSSHUB_INSTANCES:
-            rss_url = f'{instance.rstrip("/")}/twitter/user/{username}'
-            entries = _fetch_rss(f'Twitter/@{username}', rss_url, f'twitter_{username}')
-            if entries:
-                return entries
-                
-    for instance in V2_NITTER_INSTANCES:
-        rss_url = f'{instance.rstrip("/")}/{username}/rss'
-        entries = _fetch_rss(f'Twitter/@{username}', rss_url, f'twitter_{username}')
-        if entries:
-            return entries
-            
-    return []
-
-def _is_article_url(url: str) -> bool:
-    url_lower = url.lower()
-    for pattern in URL_BLACKLIST:
-        if pattern in url_lower:
-            return False
-    return True
-
 def _is_within_window(published_at: str | None, hours: int) -> bool:
     if not published_at:
         return True
@@ -299,7 +269,7 @@ def _rss_name_to_category(name: str) -> str:
     return '综合RSS'
 
 def collect_from_rss(backtrack: str = '24h') -> tuple[list[dict], dict]:
-    hours = int(backtrack.replace('h', ''))
+    hours = parse_backtrack_hours(backtrack)
     all_results = []
     stats = {'total': 0, 'success': [], 'empty': [], 'failed': []}
     
@@ -327,11 +297,11 @@ def collect_from_rss(backtrack: str = '24h') -> tuple[list[dict], dict]:
     
     def _run_task(task_info):
         fn, args, category, source_name = task_info
-        time.sleep(random.uniform(0.3, 1.5))
+        time.sleep(random.uniform(0.1, 0.5))
         try:
             entries = fn(*args)
             if not entries:
-                return [], 'error', 'RSS 返回 0 条目（网站可能无法访问或被墙）'
+                return [], 'empty', 'RSS 返回 0 条目（可能近期无更新）'
             for e in entries:
                 e['_feed_name'] = source_name
                 e['_category'] = category
@@ -341,12 +311,14 @@ def collect_from_rss(backtrack: str = '24h') -> tuple[list[dict], dict]:
             
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(_run_task, t): t for t in tasks}
-        for future in as_completed(futures, timeout=180):
+        done, not_done = wait(futures.keys(), timeout=180, return_when=ALL_COMPLETED)
+
+        for future in done:
             task_info = futures[future]
             source_name = task_info[3]
             category = task_info[2]
             try:
-                entries, status, reason = future.result(timeout=30)
+                entries, status, reason = future.result()
                 if status == 'ok' and entries:
                     filtered = [e for e in entries if _is_within_window(e.get('published_at'), hours)]
                     if filtered:
@@ -365,6 +337,14 @@ def collect_from_rss(backtrack: str = '24h') -> tuple[list[dict], dict]:
             except Exception as exc:
                 stats['failed'].append((source_name, str(exc)))
                 logging.warning(f'  ❌ {source_name}: {exc}')
+
+        for future in not_done:
+            task_info = futures[future]
+            source_name = task_info[3]
+            future.cancel()
+            reason = '采集任务超时（180s），已保留其他已完成结果'
+            stats['failed'].append((source_name, reason))
+            logging.warning(f'  ⏱️ {source_name}: {reason}')
                 
     logging.info(f'\n[P1 Phase 1 完毕] 成功: {len(stats["success"])}/{stats["total"]} | 发现: {len(all_entries)} 篇')
     
@@ -376,29 +356,31 @@ def collect_from_rss(backtrack: str = '24h') -> tuple[list[dict], dict]:
             return set(eng + chn)
             
         unique_entries = []
+        unique_sets = []
         for entry in entries:
             is_duplicate = False
             text_a = f"{entry.get('title', '')} {entry.get('content', '')[:100]}"
             set_a = _tokenize(text_a)
             if not set_a:
                 unique_entries.append(entry)
+                unique_sets.append(set())
                 continue
-            for u in unique_entries:
-                text_b = f"{u.get('title', '')} {u.get('content', '')[:100]}"
-                set_b = _tokenize(text_b)
-                if not set_b:
+            for idx, u_set in enumerate(unique_sets):
+                if not u_set:
                     continue
-                intersection = len(set_a.intersection(set_b))
-                union = len(set_a.union(set_b))
+                intersection = len(set_a.intersection(u_set))
+                union = len(set_a.union(u_set))
                 jaccard = intersection / union if union > 0 else 0
                 if jaccard > threshold:
                     is_duplicate = True
                     new_src = entry.get('source', '')
-                    if new_src and new_src not in u.get('source', ''):
-                        u['source'] = f"{u.get('source', '')}, {new_src}"
+                    u_entry = unique_entries[idx]
+                    if new_src and new_src not in u_entry.get('source', ''):
+                        u_entry['source'] = f"{u_entry.get('source', '')}, {new_src}"
                     break
             if not is_duplicate:
                 unique_entries.append(entry)
+                unique_sets.append(set_a)
         return unique_entries
         
     if all_entries:

@@ -20,7 +20,6 @@ P2 X(Twitter) 产业链情报采集 — 使用 Grok API 抓取 X 平台 AI 产�
 3. 处理模型分批轮询（Chunked Calling）时，严禁合并请求以图省事，因为超过 5 个赛道塞入单次 Prompt 会引起严重的注意力涣散和选择性失明症。
 """
 
-import os
 import time
 import random
 import logging
@@ -28,7 +27,9 @@ import requests
 from datetime import datetime
 import re
 
-from settings import get_today_output_dir, load_prompt, GROK_API_KEY
+from artifact_store import update_run_manifest, write_text_artifact
+from utils import parse_backtrack_hours
+from settings import require_prompt, GROK_API_KEY
 from industry_dict import OLIGARCH_DICT, SUPER_GIANTS
 
 GROK_BASE_URL = 'https://api.x.ai'
@@ -53,15 +54,12 @@ INDUSTRY_SCAN_KEYWORDS = [
 ]
 
 def _build_user_prompt(backtrack: str = '24h', keyword_chunk: list = None) -> str:
-    if 'h' in backtrack:
-        hours = int(backtrack.replace('h', ''))
-    else:
-        hours = 24
+    hours = parse_backtrack_hours(backtrack)
 
     targets = keyword_chunk if keyword_chunk else INDUSTRY_SCAN_KEYWORDS
     keyword_section = '\n'.join([f'  - {kw}' for kw in targets])
 
-    template = load_prompt('p2_user.txt')
+    template = require_prompt('p2_user.txt')
     return template.format(hours=hours, keyword_section=keyword_section, current_time=datetime.now().strftime('%Y-%m-%d %H:%M'))
 
 
@@ -77,13 +75,20 @@ def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, d
     if not GROK_API_KEY:
         logging.warning('⚠️ [P2] GROK_API_KEY 未配置，跳过 X 平台采集')
         stats['status'] = 'skipped_no_key'
+        update_run_manifest('p2', status='skipped_no_key', metrics=stats)
         return '', stats
 
     logging.info(f'📱 [P2] 启动 X(Twitter) 产业链情报采集 (Grok {GROK_MODEL})...')
     logging.info(f'  回溯窗口: {backtrack}')
 
-    user_prompt = _build_user_prompt(backtrack)
-    raw_system_prompt = load_prompt('p2_system.txt')
+    try:
+        user_prompt = _build_user_prompt(backtrack)
+        raw_system_prompt = require_prompt('p2_system.txt')
+    except FileNotFoundError as e:
+        logging.error(f'🚨 [P2] 关键 Prompt 缺失: {e}')
+        stats['status'] = 'failed_missing_prompt'
+        update_run_manifest('p2', status='failed_missing_prompt', metrics={**stats, 'error': str(e)})
+        return '', stats
 
     track_lines = []
     for i, (track, companies) in enumerate(OLIGARCH_DICT.items(), 1):
@@ -106,6 +111,7 @@ def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, d
     chunks = [INDUSTRY_SCAN_KEYWORDS[i:i + CHUNK_SIZE] for i in range(0, len(INDUSTRY_SCAN_KEYWORDS), CHUNK_SIZE)]
 
     all_filtered_leaks = []
+    seen_tweet_ids = set()
     overall_start_time = time.time()
 
     for c_idx, chunk in enumerate(chunks, 1):
@@ -195,6 +201,10 @@ def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, d
                         match = re.search(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/[^/]+/status/(\d+)', line)
                         if match:
                             tweet_id = match.group(1)
+                            if tweet_id in seen_tweet_ids:
+                                block_valid = False
+                                logging.info(f'🔄   -> 剔除跨批次重复爆发：重复ID({tweet_id})')
+                            seen_tweet_ids.add(tweet_id)
                             if re.search(r'(01234|12345|23456|34567|45678|56789|67890|98765|87654|76543|65432|54321|43210|0000|1111)', tweet_id):
                                 block_valid = False
                                 logging.warning(f'🚫   -> 剔除幻觉：连号假ID({tweet_id})')
@@ -220,6 +230,7 @@ def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, d
     if not content.strip() or '<x_leaks>' not in content:
         logging.warning('⚠️ [P2] 所有批次均未获取到有效情报（全部作废）。')
         stats['status'] = 'failed_empty'
+        update_run_manifest('p2', status='failed_empty', metrics=stats)
         return '', stats
 
     elapsed = time.time() - overall_start_time
@@ -231,24 +242,30 @@ def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, d
 
     formatted = f'============================================================\n以下数据来自 X(Twitter) 平台实时分批采集（Grok {GROK_MODEL}）\n信息来源: X平台产业链insider/leaker/分析师/官方账号\n采集时间: {datetime.now().strftime("%Y-%m-%d %H:%M")}\n⚠️ 注意: X平台信息未经 P5 审计，可信度参差不齐，需结合其他数据源交叉验证\n============================================================\n\n{content}'
 
-    _save_p2_output(formatted, stats)
+    output_path = _save_p2_output(formatted, stats)
+    update_run_manifest(
+        'p2',
+        status='completed',
+        files={'md': output_path} if output_path else None,
+        metrics=stats,
+    )
     return formatted, stats
 
 
-def _save_p2_output(content: str, stats: dict) -> None:
+def _save_p2_output(content: str, stats: dict) -> str:
     try:
-        now_str = datetime.now().strftime('%Y%m%d%H%M')
-        output_dir = get_today_output_dir()
-        filename = os.path.join(output_dir, f'P2_X平台情报_{now_str}.md')
-
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write('# P2 X(Twitter) 产业链情报\n\n')
-            f.write(f'> 采集时间: {datetime.now().isoformat()}\n')
-            f.write(f"> 模型: {stats.get('model', GROK_MODEL)}\n")
-            f.write(f"> 耗时: {stats.get('duration_seconds', 0)}s\n")
-            f.write(f"> 内容长度: {stats.get('content_length', 0)} 字\n\n")
-            f.write(content)
+        md_body = (
+            '# P2 X(Twitter) 产业链情报\n\n'
+            f'> 采集时间: {datetime.now().isoformat()}\n'
+            f"> 模型: {stats.get('model', GROK_MODEL)}\n"
+            f"> 耗时: {stats.get('duration_seconds', 0)}s\n"
+            f"> 内容长度: {stats.get('content_length', 0)} 字\n\n"
+            f'{content}'
+        )
+        filename = write_text_artifact('P2_X平台情报', md_body)
 
         logging.info(f'[P2] 原始数据已保存: {filename}')
+        return filename
     except Exception as e:
         logging.warning(f'[P2] 保存失败: {e}')
+        return ''

@@ -13,6 +13,21 @@ import json
 import re
 from typing import Any
 
+
+def parse_backtrack_hours(backtrack: str, default: int = 24) -> int:
+    """统一解析回溯窗口字符串为小时数。
+
+    Why: p1_rss/p2_x_intel/p3_agent 三处各自用 int(backtrack.replace('h','')) 做简易解析，
+         一旦传入非预期格式（如 '3d' 或空串）就会 ValueError 崩溃。
+         统一到此函数做鲁棒解析 + 兜底默认值。
+
+    支持格式: '24h', '72h', '240h', '24', 纯数字字符串
+    """
+    if not backtrack or not backtrack.strip():
+        return default
+    match = re.match(r'(\d+)\s*h?', backtrack.strip(), re.IGNORECASE)
+    return int(match.group(1)) if match else default
+
 def _type_matches(obj: Any, expect_type: str) -> bool:
     if expect_type == 'dict':
         return isinstance(obj, dict)

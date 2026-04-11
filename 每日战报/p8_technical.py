@@ -1,12 +1,29 @@
+"""
+P8 技术面分析层 — 从本地通达信 K 线数据计算技术指标。
+
+从 daily_report.py 拆分，包含：
+- 股票代码提取（从 P6 映射文本中解析 A 股代码）
+- 通达信 .day 二进制文件解析（struct.unpack）
+- 技术指标计算（MACD/RSI/KDJ/布林/均线/量能/RS/周线）
+- 大盘对比基准（上证指数 + 创业板指）
+
+【⚠️核心维护规则 / Agent 指令】
+1. `read_day_file_simple()` 的 struct 解包格式 '<IIIIIfII' 严格对应通达信
+   .day 文件的 32 字节记录结构，修改前必须确认通达信版本兼容性。
+2. `_resolve_tdx_market_and_path()` 的多路径回退探测顺序（bj→sz→sh）
+   是兼容北交所历史数据落在 sz 目录的特殊处理，不可简化。
+3. `p8_search_stock_prices()` 返回纯 Markdown 字符串（不含 JSON），
+   JSON 数据单独落盘至 .json 文件，避免将 JSON 原样发送到 P9 浪费 Token。
+"""
+
 import os
 import re
 import struct
 import logging
 
-import json
 from datetime import datetime
 
-from settings import get_today_output_dir
+from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
 
 _TDX_VIPDOC_CANDIDATES = [
     'D:\\HT\\vipdoc',
@@ -21,6 +38,45 @@ def _find_tdx_vipdoc():
         if os.path.isdir(candidate):
             return candidate
     return None
+
+
+def _resolve_tdx_market_and_path(vipdoc: str, code: str):
+    """按股票代码推断通达信市场目录，并做文件存在性回退探测。"""
+    candidates = []
+
+    if code.startswith(('6', '9', '5')):
+        candidates.append(('sh', f'sh{code}.day'))
+    elif code.startswith(('8', '4')):
+        # Why: 北交所代码优先走 bj；兼容部分历史数据落在 sz/sh 目录的情况
+        candidates.extend([
+            ('bj', f'bj{code}.day'),
+            ('sz', f'sz{code}.day'),
+            ('sh', f'sh{code}.day'),
+        ])
+    else:
+        candidates.extend([
+            ('sz', f'sz{code}.day'),
+            ('sh', f'sh{code}.day'),
+        ])
+
+    # 去重并按顺序探测
+    deduped = []
+    seen = set()
+    for market, fname in candidates:
+        key = (market, fname)
+        if key not in seen:
+            deduped.append((market, fname))
+            seen.add(key)
+
+    for market, fname in deduped:
+        path = os.path.join(vipdoc, market, 'lday', fname)
+        if os.path.exists(path):
+            return market, path
+
+    # 回退到首候选路径（用于后续统一缺失处理）
+    fallback_market, fallback_name = deduped[0]
+    fallback_path = os.path.join(vipdoc, fallback_market, 'lday', fallback_name)
+    return fallback_market, fallback_path
 
 def extract_stocks_from_report(report: str):
     patterns = [
@@ -106,32 +162,129 @@ def calc_kdj(highs, lows, closes, period=9):
     j = 3*k - 2*d
     return j
 
+
+def _calc_period_change(closes, lookback: int) -> float:
+    if not closes:
+        return 0.0
+    base = closes[-lookback] if len(closes) >= lookback else closes[0]
+    return (closes[-1] - base) / base * 100 if base > 0 else 0.0
+
+
+def _calc_boll_width(closes, period: int = 20) -> float:
+    if len(closes) < period:
+        return 0.0
+    ma = sum(closes[-period:]) / period
+    std = (sum((c - ma) ** 2 for c in closes[-period:]) / period) ** 0.5
+    return (4 * std) / ma * 100 if ma > 0 else 0.0
+
+
+def _calc_atr_pct(highs, lows, closes, period: int = 14) -> float:
+    if len(closes) <= period:
+        return 0.0
+    atr_sum = 0.0
+    for i in range(1, period + 1):
+        high_val = highs[-i]
+        low_val = lows[-i]
+        prev_close = closes[-i - 1]
+        atr_sum += max(high_val - low_val, abs(high_val - prev_close), abs(low_val - prev_close))
+    latest_close = closes[-1]
+    return (atr_sum / period) / latest_close * 100 if latest_close > 0 else 0.0
+
+
+def _calc_weekly_summary(closes):
+    weekly_c = closes[::5]
+    if len(weekly_c) < 20:
+        return {
+            'w_stat': '未知',
+            'wmacd': 0.0,
+            'wmacd_stat': '未知',
+            'trend': '数据不足',
+        }
+
+    wm20 = sum(weekly_c[-20:]) / 20
+    w_stat = '站上' if weekly_c[-1] > wm20 else '跌破'
+    wmacd, wmacd_stat = calc_macd(weekly_c)
+    if wmacd > 0 and weekly_c[-1] > wm20:
+        trend = '上行'
+    elif wmacd < 0 and weekly_c[-1] < wm20:
+        trend = '下行'
+    else:
+        trend = '横盘震荡'
+    return {
+        'w_stat': w_stat,
+        'wmacd': wmacd,
+        'wmacd_stat': wmacd_stat,
+        'trend': trend,
+    }
+
+
+def _persist_p8_outputs(markdown_text: str, json_data: dict, *, status: str, metrics: dict) -> str:
+    md_path = ''
+    json_path = ''
+
+    try:
+        md_path = write_text_artifact('P8_技术面', markdown_text)
+    except Exception as e:
+        logging.error(f'[P8] Markdown 写入失败: {e}')
+
+    try:
+        json_path = write_json_artifact('P8_技术面', json_data)
+    except Exception as e:
+        logging.error(f'[P8] JSON 写入失败: {e}')
+
+    files = {}
+    if md_path:
+        files['md'] = md_path
+    if json_path:
+        files['json'] = json_path
+
+    update_run_manifest('p8', status=status, files=files or None, metrics=metrics)
+    return markdown_text
+
 def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
     if not stocks:
-        return ""
+        markdown = (
+            '# P8 股价分析数据（本地通达信 250 日 K 线）\n\n'
+            f'> 读取时间: {datetime.now().isoformat()}\n\n'
+            '> 本次未从 P6 映射中提取到 A 股标的，技术面分析跳过。\n'
+        )
+        return _persist_p8_outputs(
+            markdown,
+            {},
+            status='skipped_no_stocks',
+            metrics={'stocks_requested': 0, 'stocks_with_data': 0},
+        )
     vipdoc = _find_tdx_vipdoc()
     if not vipdoc:
-        return ""
+        markdown = (
+            '# P8 股价分析数据（本地通达信 250 日 K 线）\n\n'
+            f'> 读取时间: {datetime.now().isoformat()}\n\n'
+            '> 未找到本地通达信 `vipdoc` 目录，技术面分析不可用。\n'
+        )
+        return _persist_p8_outputs(
+            markdown,
+            {},
+            status='skipped_no_vipdoc',
+            metrics={'stocks_requested': len(stocks), 'stocks_with_data': 0},
+        )
 
     def read_day_file_simple(filepath):
         records = []
         try:
             with open(filepath, 'rb') as f:
-                while True:
-                    buf = f.read(32)
-                    if len(buf) < 32:
-                        break
-                    date_int, o, h, low, c, _amount_f, vol, _ = struct.unpack('<IIIIIfII', buf)
-                    date_str = str(date_int)
-                    if len(date_str) == 8:
-                        records.append({
-                            'date': date_str,
-                            'open': o / 100.0,
-                            'high': h / 100.0,
-                            'low': low / 100.0,
-                            'close': c / 100.0,
-                            'vol': vol
-                        })
+                data = f.read()
+            for chunk in struct.iter_unpack('<IIIIIfII', data):
+                date_int, o, h, low, c, _amount_f, vol, _ = chunk
+                date_str = str(date_int)
+                if len(date_str) == 8:
+                    records.append({
+                        'date': date_str,
+                        'open': o / 100.0,
+                        'high': h / 100.0,
+                        'low': low / 100.0,
+                        'close': c / 100.0,
+                        'vol': vol
+                    })
             return records
         except Exception as e:
             logging.error(f"[P8] 读取本地 K 线数据失败 ({filepath}): {e}")
@@ -164,12 +317,15 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
 
 
     for name, code in stocks:
-        elasticity = elasticity_map.get(code, '💧中弹性') if elasticity_map else '💧中弹性'
+        elasticity = elasticity_map.get(code, '⚡中弹性') if elasticity_map else '⚡中弹性'
         track_label = track_map.get(code, '未分类') if track_map else '未分类'
 
-        market = 'sh' if code.startswith('6') else 'sz'
-        filepath = os.path.join(vipdoc, market, 'lday', f'{market}{code}.day')
-        records = read_day_file_simple(filepath)
+        market, filepath = _resolve_tdx_market_and_path(vipdoc, code)
+        if os.path.exists(filepath):
+            records = read_day_file_simple(filepath)
+        else:
+            records = []
+            logging.warning(f"[P8] 本地 K 线文件缺失 ({code}): {filepath}")
 
         is_core = '高弹性' in elasticity or '核心' in elasticity
 
@@ -177,25 +333,53 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
             if records:
                 r = records[-1]
                 closes = [rc['close'] for rc in records[-250:]]
-                c_1m = closes[-20] if len(closes) >= 20 else closes[0]
-                chg_1m = (r['close'] - c_1m) / c_1m * 100 if c_1m > 0 else 0
+                highs = [rc['high'] for rc in records[-250:]]
+                lows = [rc['low'] for rc in records[-250:]]
+                chg_1m = _calc_period_change(closes, 20)
                 rs_20d = chg_1m - _index_returns.get('上证指数', {}).get('chg_20d', 0)
-                boll_width = 0
-                atr_pct = 0
-                weekly_trend = "周线下行" # simplified
-                if len(closes) >= 20:
-                    ma20 = sum(closes[-20:]) / 20.0
-                    std20 = (sum((c - ma20)**2 for c in closes[-20:]) / 20.0) ** 0.5
-                    boll_width = (4 * std20) / ma20 * 100 if ma20 > 0 else 0
-                low_elasticity_names.append(f"- 【{track_label}】{name}({code}) | {r['close']:.2f}元 | 20日{chg_1m:+.1f}% | RS{rs_20d:+.1f}% | ATR{atr_pct:.1f}% | {weekly_trend} | 布林宽{boll_width:.1f}%")
+                boll_width = _calc_boll_width(closes)
+                atr_pct = _calc_atr_pct(highs, lows, closes)
+                weekly = _calc_weekly_summary(closes)
+                low_elasticity_names.append(
+                    f"- 【{track_label}】{name}({code}) | 收盘 {r['close']:.2f}元 | "
+                    f"20日{chg_1m:+.1f}% | RS{rs_20d:+.1f}% | ATR{atr_pct:.1f}% | "
+                    f"周线{weekly['trend']} | 布林宽{boll_width:.1f}%"
+                )
+                p8_json_db[code] = {
+                    'name': name,
+                    'code': code,
+                    'elasticity': elasticity,
+                    'fast_path': True,
+                    'track': track_label,
+                    'latest_close': round(r['close'], 2),
+                    'chg_20d_pct': round(chg_1m, 1),
+                    'rs_20d_pct': round(rs_20d, 1),
+                    'atr_pct': round(atr_pct, 1),
+                    'boll_width_pct': round(boll_width, 1),
+                    'weekly_trend': weekly['trend'],
+                }
+            else:
+                low_elasticity_names.append(f"- 【{track_label}】{name}({code}) | 本地 K 线缺失，跳过技术画像")
+                p8_json_db[code] = {
+                    'name': name,
+                    'code': code,
+                    'elasticity': elasticity,
+                    'fast_path': True,
+                    'track': track_label,
+                    'error': 'missing_local_kline',
+                }
 
-            p8_json_db[code] = {
-                'name': name, 'code': code, 'elasticity': elasticity, 'fast_path': True
-            }
             continue
 
         if not records or len(records) < 60:
             price_summaries.append(f"### {name}（{code}）\n未找到足够的本地K线数据\n\n")
+            p8_json_db[code] = {
+                'name': name,
+                'code': code,
+                'elasticity': elasticity,
+                'track': track_label,
+                'error': 'insufficient_local_kline',
+            }
             continue
 
         records = records[-250:]
@@ -215,9 +399,9 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
             pos_desc = "历史高位区间"
 
         c_1m = closes[-20] if n_rec >= 20 else closes[0]
-        chg_1m = (latest_c - c_1m)/c_1m * 100
+        chg_1m = (latest_c - c_1m)/c_1m * 100 if c_1m > 0 else 0
         c_3m = closes[-60] if n_rec >= 60 else closes[0]
-        chg_3m = (latest_c - c_3m)/c_3m * 100
+        chg_3m = (latest_c - c_3m)/c_3m * 100 if c_3m > 0 else 0
 
         # 60日前高
         high_60 = max(highs[-60:])
@@ -233,7 +417,8 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
         ma10 = sum(closes[-10:])/10
         ma20 = sum(closes[-20:])/20
         ma60 = sum(closes[-60:])/60
-        ma_spread = (max(ma5, ma10, ma20, ma60) - min(ma5, ma10, ma20, ma60))/min(ma5, ma10, ma20, ma60)*100
+        min_ma = min(ma5, ma10, ma20, ma60)
+        ma_spread = (max(ma5, ma10, ma20, ma60) - min_ma)/min_ma*100 if min_ma > 0 else 0
 
         # 量能
         avg_vol_5d = sum(vols[-5:])/5 if vols[-5:] else 1
@@ -244,14 +429,8 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
         vol_desc = "明显放量" if vr > 1.5 else ("温和缩量" if vr < 0.7 else "正常")
 
         # 波动
-        atr14_sum = 0
-        for i in range(1, 15):
-            high_val, low_val, prev_close = highs[-i], lows[-i], closes[-i-1]
-            atr14_sum += max(high_val-low_val, abs(high_val-prev_close), abs(low_val-prev_close))
-        atr = (atr14_sum/14)/latest_c*100
-
-        std20 = (sum((c - ma20)**2 for c in closes[-20:]) / 20.0) ** 0.5
-        boll_w = (4 * std20) / ma20 * 100
+        atr = _calc_atr_pct(highs, lows, closes)
+        boll_w = _calc_boll_width(closes)
         boll_desc = "极窄蓄力" if boll_w < 10 else ""
         ac = atr / 5.0 # fallback normalization
 
@@ -272,14 +451,11 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
         rs_desc = "显著强于大盘" if rs_60 > 20 else ("强于大盘" if rs_60 > 10 else ("弱于大盘" if rs_60 < -5 else "基本持平"))
 
         # 周线
-        weekly_c = closes[::5]
-        if len(weekly_c) >= 20:
-            wm20 = sum(weekly_c[-20:])/20
-            w_stat = "站上" if weekly_c[-1] > wm20 else "跌破"
-            wmacd, wmacd_stat = calc_macd(weekly_c)
-            w_trend = "上行" if wmacd > 0 and weekly_c[-1] > wm20 else ("下行" if wmacd < 0 and weekly_c[-1] < wm20 else "横盘震荡")
-        else:
-            w_stat, wmacd, wmacd_stat, w_trend = "未知", 0, "未知", "数据不足"
+        weekly = _calc_weekly_summary(closes)
+        w_stat = weekly['w_stat']
+        wmacd = weekly['wmacd']
+        wmacd_stat = weekly['wmacd_stat']
+        w_trend = weekly['trend']
 
         # 涨跌停历程 (简易)
         limits = []
@@ -295,11 +471,11 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
 
         block = f"""### {name}（{code}）
 - 所属赛道：{track_label}
-- 收盘 {latest_c:.2f} 元（{latest_r['date'][4:6]}-{latest_r['date'][6:8]}）| 市值未知
+- 收盘 {latest_c:.2f} 元（{latest_r['date'][4:6]}-{latest_r['date'][6:8]}）
 - 涨跌：近20日 {chg_1m:+.1f}% | 近60日 {chg_3m:+.1f}% | 250日分位 {int(pct_250d)}%（{pos_desc}）
 - 距60日前高 {dist_to_60d_high:+.1f}%（回撤 {abs(dist_to_60d_high):.1f}%）| 突破：{breakouts}
 - 均线：5日{(latest_c-ma5)/ma5*100:+.1f}%，10日{(latest_c-ma10)/ma10*100:+.1f}%，20日{(latest_c-ma20)/ma20*100:+.1f}%，60日{(latest_c-ma60)/ma60*100:+.1f}% | 密集度 {ma_spread:.1f}%
-- 量能：{vol_desc}（量比 {vr:.2f}，缩量度 {vs:.2f}）| 换手 0.00% 异动 1.0x（正常）
+- 量能：{vol_desc}（量比 {vr:.2f}，5日/60日 {vs:.2f}）| 换手：未提供
 - 波动：布林宽 {boll_w:.1f}%{b_desc} | ATR {atr:.1f}% 压缩比 {ac:.2f}（{c_desc}）
 - 动量：MACD {macd_stat}({macd_val:.3f}) | RSI {rsi_val}（{rsi_desc}）| KDJ J={kdj_j}（{kdj_desc}）| 阳线 {int(yang_ratio)}%
 - ⚡ RS：20日超额 {rs_20:+.1f}% 60日超额 {rs_60:+.1f}%（{rs_desc}）
@@ -326,8 +502,8 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
             "tech_indicators": {
                 "vol_ratio_5d_20d": round(vr, 2),
                 "vol_shrink_5d_60d": round(vs, 2),
-                "turnover_10d_avg": 0,
-                "turnover_anomaly": 1,
+                "turnover_10d_avg": None,
+                "turnover_anomaly": None,
                 "boll_width_pct": round(boll_w, 1),
                 "atr_compress_ratio": round(ac, 2),
                 "ma_spread_pct": round(ma_spread, 1),
@@ -337,7 +513,7 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
                 "yang_ratio_20d": yang_ratio
             },
             "finance_data": {
-                "total_cap_yi": 0, "liutong_cap_yi": 0, "jinglirun_yi": 0
+                "total_cap_yi": None, "liutong_cap_yi": None, "jinglirun_yi": None
             },
             "tags": {
                 "vol_desc": vol_desc,
@@ -345,7 +521,7 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
                 "breakouts": [] if breakouts == "无" else [breakouts],
                 "rsi_desc": rsi_desc,
                 "macd_status": macd_stat,
-                "turnover_anom_desc": "正常"
+                "turnover_anom_desc": "未提供"
             },
             "relative_strength": {
                 "rs_excess_20d": round(rs_20, 1),
@@ -367,13 +543,6 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
     if low_elasticity_names:
         summary_chunk += "\n" + "\n\n".join(low_elasticity_names) + "\n"
 
-    # 写入文件以兼容旧架构的观测习惯
-    today_dir = get_today_output_dir()
-    now_str = datetime.now().strftime("%Y%m%d%H%M")
-
-    p8_md_path = os.path.join(today_dir, f"P8_技术面_{now_str}.md")
-    p8_json_path = os.path.join(today_dir, f"P8_技术面_{now_str}.json")
-
     # 抽取纯MD但不含JSON标签，以符合老格式
     pure_md_str = "".join([
         "# P8 股价分析数据（本地通达信 250 日 K 线）\n\n",
@@ -383,14 +552,12 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
         summary_chunk
     ])
 
-    try:
-        with open(p8_md_path, "w", encoding="utf-8") as f:
-            f.write(pure_md_str)
-        with open(p8_json_path, "w", encoding="utf-8") as f:
-            json.dump(p8_json_db, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.error(f"[P8] 写入文件失败: {e}")
-
-    final_output = pure_md_str + "\n### P8 机器视觉数据库\n<p8_technical_db>\n```json\n" + json.dumps(p8_json_db, ensure_ascii=False, indent=2) + "\n```\n</p8_technical_db>\n"
-
-    return final_output
+    # P8 JSON 数据已落盘至独立文件。
+    # 鉴于 P9 只需要读基本盘信息，这里只返回 Markdown，避免将 JSON 原样再发一遍浪费数千 Token
+    stocks_with_data = sum(1 for item in p8_json_db.values() if not item.get('error'))
+    return _persist_p8_outputs(
+        pure_md_str,
+        p8_json_db,
+        status='completed',
+        metrics={'stocks_requested': len(stocks), 'stocks_with_data': stocks_with_data},
+    )

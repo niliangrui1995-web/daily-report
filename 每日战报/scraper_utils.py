@@ -120,25 +120,70 @@ def extract_content_from_html(html_text: str, source_name: str = '', url: str = 
     return ''
 
 def enrich_article_url(url: str, source_name: str = '') -> str:
+    """一手源正文深挖——增强版。
+
+    Why: 原版只用 requests.get 裸拉 HTML，对 JS 渲染站点（seekingalpha/bloomberg）
+         和 Cloudflare 保护站点命中率为 0%。增强策略：
+         1. 直连原站 → 2. Google WebCache 镜像 → 3. og:description 降级
+    """
     if not scrapling_available or not url or not is_article_url(url):
         return ''
     try:
         time.sleep(random.uniform(0.2, 0.5))
-        fetch_url = url
-        if 'digitimes' in source_name.lower():
-            fetch_url = f'https://webcache.googleusercontent.com/search?q=cache:{url}'
-        resp = requests.get(fetch_url, headers=HEADERS, timeout=12, verify=False)
-        if resp.status_code >= 400:
-            if fetch_url != url:
-                resp = requests.get(url, headers=HEADERS, timeout=12, verify=False)
+
+        # Why: 构建尝试列表：原站 + Google WebCache 镜像
+        fetch_urls = [url]
+        # digitimes 等付费墙站点优先走 WebCache
+        if 'digitimes' in source_name.lower() or 'digitimes' in url.lower():
+            fetch_urls.insert(0, f'https://webcache.googleusercontent.com/search?q=cache:{url}')
+        else:
+            # Why: 对所有高价值域名通用追加 WebCache 回退
+            if _is_high_value_domain(url):
+                fetch_urls.append(f'https://webcache.googleusercontent.com/search?q=cache:{url}')
+
+        for fetch_url in fetch_urls:
+            try:
+                resp = requests.get(fetch_url, headers=HEADERS, timeout=12, verify=False)
                 if resp.status_code >= 400:
-                    return ''
-            else:
-                return ''
-        return extract_content_from_html(resp.text, source_name=source_name, url=url)
+                    continue
+                content = extract_content_from_html(resp.text, source_name=source_name, url=url)
+                if content and len(content) > 100:
+                    return content
+                # Why: 正文提取失败（JS 渲染空壳），降级到 meta 标签
+                content = _extract_meta_from_html(resp.text)
+                if content:
+                    return content
+            except requests.exceptions.RequestException:
+                continue
+
+        return ''
     except Exception as e:
         logging.debug(f'[Scrapling] enrich_article_url 请求失败 {url}: {e}')
         return ''
+
+
+def _extract_meta_from_html(html_text: str) -> str:
+    """从 HTML 中提取 og:description / description meta 标签内容。
+
+    Why: 即使 JS 渲染站点的正文 CSS 选择器全部失效，meta 标签通常仍在
+         服务端渲染的 <head> 中可用，是最后一道非结构化数据防线。
+    """
+    if not scrapling_available or not _Selector:
+        return ''
+    try:
+        page = _Selector(html_text)
+        for ms in ["meta[property='og:description']", "meta[name='description']"]:
+            try:
+                metas = page.css(ms)
+                if metas:
+                    c = metas[0].attrib.get('content', '').strip()
+                    if c and len(c) > 50:
+                        return c[:SUMMARY_LEN]
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ''
 
 def enrich_search_urls(result: dict) -> dict:
     if not scrapling_available or not isinstance(result, dict):

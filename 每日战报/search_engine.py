@@ -15,6 +15,7 @@
 import time
 import logging
 import threading
+import random
 import requests
 from ratelimit import limits, sleep_and_retry
 
@@ -106,10 +107,59 @@ class ChannelCircuitBreaker:
 
 search_rotator_direct = SearchKeyRotator(SEARCH_API_KEY_POOL, GEMINI_SEARCH_DIRECT_URL)
 search_rotator_cf = SearchKeyRotator(SEARCH_API_KEY_POOL, GEMINI_SEARCH_CF_URL)
-search_key_rotator = search_rotator_direct
 channel_breaker = ChannelCircuitBreaker(threshold=2)
+_http_session = requests.Session()
 
-GEMINI_CONCURRENCY = max(search_key_rotator.total, 1)
+# Why: search_key_rotator 是历史遗留的死代码（双通道重构后未清理），已删除
+GEMINI_CONCURRENCY = max(search_rotator_direct.total, 1)
+
+
+def _tavily_fallback(query: str, category: str = 'raw_search', return_dict: bool = False):
+    """Tavily 搜索降级兜底 — 双通道 Gemini 全挂时的最后防线。
+
+    Why: 原先在 raw_gemini_search() 和 gemini_search() 中各复制了一份几乎相同的
+         Tavily 降级代码（约 30 行重复），违反 DRY 原则。提取为公共函数统一维护。
+    """
+    if not TAVILY_API_KEY:
+        return {} if return_dict else ''
+    try:
+        logging.info(f'  [{category}] ↘️ 降级到 Tavily 搜索引擎...')
+        tavily_resp = requests.post(
+            'https://api.tavily.com/search',
+            json={
+                'api_key': TAVILY_API_KEY,
+                'query': query[:400],
+                'search_depth': 'advanced',
+                'max_results': 5,
+                'include_answer': True,
+            },
+            timeout=30,
+        )
+        tavily_resp.raise_for_status()
+        tavily_data = tavily_resp.json()
+        answer = tavily_data.get('answer', '')
+        results_list = tavily_data.get('results', [])
+        parts = []
+        if answer:
+            parts.append(f'[Tavily Fallback] {answer}')
+        sources = []
+        for r in results_list[:5]:
+            title = r.get('title', '')
+            content = r.get('content', '')
+            url = r.get('url', '')
+            parts.append(f'- {title}: {content[:300]} 【{url}】')
+            if url:
+                sources.append({'url': url, 'title': title})
+        if parts:
+            channel_breaker.record_success('Tavily')
+            logging.info(f'  [{category}] ✅ Tavily 降级成功，返回 {len(parts)} 条结果')
+            text = '\n'.join(parts)
+            if return_dict:
+                return {'text': text, 'grounding_sources': sources}
+            return text
+    except Exception as e:
+        logging.warning(f'  [{category}] Tavily 降级也失败: {e}')
+    return {} if return_dict else ''
 
 logging.info(f'[搜索 Key 池] 已加载 {search_rotator_direct.total} 个 Key（双通道：直连 Google + CF Worker + 熔断器）')
 
@@ -141,7 +191,7 @@ def raw_gemini_search(prompt: str, max_retries: int = 3) -> str:
                             'maxOutputTokens': 8192
                         }
                     }
-                    response = requests.post(url, json=payload, headers={'Content-Type': 'application/json'}, timeout=180)
+                    response = _http_session.post(url, json=payload, headers={'Content-Type': 'application/json'}, timeout=180)
 
                     if response.status_code in (429, 403):
                         logging.warning(f'  [raw_search] [{channel_name}] Key ...{key_last4} 触发限流({response.status_code})，标记耗尽')
@@ -175,43 +225,15 @@ def raw_gemini_search(prompt: str, max_retries: int = 3) -> str:
                         rotator.mark_exhausted(key_idx)
                         break
 
-                    wait = 3
-                    logging.warning(f'  [raw_search] [{channel_name}] 搜索异常: {exc}，{wait}s 后重试 ({attempt + 1}/{max_retries})')
+                    # Why: 指数退避 3→6→12s，比固定 3s 更有效应对突发 503 风暴
+                    wait = 3 * (2 ** attempt) + random.uniform(0, 2)
+                    logging.warning(f'  [raw_search] [{channel_name}] 搜索异常: {exc}，{wait:.0f}s 后重试 ({attempt + 1}/{max_retries})')
                     time.sleep(wait)
 
     # Why: Gemini 双通道全部失败后降级到 Tavily 搜索引擎
-    if TAVILY_API_KEY:
-        try:
-            logging.info('  [raw_search] ↘️ 降级到 Tavily 搜索引擎...')
-            tavily_resp = requests.post(
-                'https://api.tavily.com/search',
-                json={
-                    'api_key': TAVILY_API_KEY,
-                    'query': prompt[:400],
-                    'search_depth': 'advanced',
-                    'max_results': 5,
-                    'include_answer': True,
-                },
-                timeout=30,
-            )
-            tavily_resp.raise_for_status()
-            tavily_data = tavily_resp.json()
-            answer = tavily_data.get('answer', '')
-            results_list = tavily_data.get('results', [])
-            parts = []
-            if answer:
-                parts.append(f'[Tavily Fallback] {answer}')
-            for r in results_list[:5]:
-                title = r.get('title', '')
-                content = r.get('content', '')
-                url = r.get('url', '')
-                parts.append(f'- {title}: {content[:300]} 【{url}】')
-            if parts:
-                channel_breaker.record_success('Tavily')
-                logging.info(f'  [raw_search] ✅ Tavily 降级成功，返回 {len(parts)} 条结果')
-                return '\n'.join(parts)
-        except Exception as e:
-            logging.warning(f'  [raw_search] Tavily 降级也失败: {e}')
+    result = _tavily_fallback(prompt, category='raw_search', return_dict=False)
+    if result:
+        return result
 
     logging.error('❌ [raw_search] 所有通道和 Key 均失败（含 Tavily 降级），返回空结果')
     return ''
@@ -219,7 +241,9 @@ def raw_gemini_search(prompt: str, max_retries: int = 3) -> str:
 @sleep_and_retry
 @limits(calls=1, period=1)
 def gemini_search(category: str, query: str, backtrack: str = '24h', max_retries: int = 3) -> dict:
-    prompt = f'你是 AI 产业链深度研究员。请对以下主题进行深入搜索。\n搜索方向：{query}\n赛道：{category}\n格式：序号. [实体] 客观事实内容 【信源|URL|日期】\n搜不到的如实说"未搜索到"。严禁编造。'
+    from datetime import datetime
+    now_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
+    prompt = f'⚠️ 当前北京时间：{now_str}\n\n你是 AI 产业链深度研究员。请对以下主题进行深入搜索。\n搜索方向：{query}\n赛道：{category}\n格式：序号. [实体] 客观事实内容 【信源|URL|日期】\n搜不到的如实说"未搜索到"。严禁编造。'
 
     channels = [
         ('直连Google', search_rotator_direct),
@@ -248,7 +272,7 @@ def gemini_search(category: str, query: str, backtrack: str = '24h', max_retries
                             'maxOutputTokens': 8192
                         }
                     }
-                    r = requests.post(url, json=payload, headers={'Content-Type': 'application/json'}, timeout=180)
+                    r = _http_session.post(url, json=payload, headers={'Content-Type': 'application/json'}, timeout=180)
 
                     if r.status_code in (429, 403):
                         logging.warning(f'  [{category}] [{channel_name}] Key ...{key_last4} 限流({r.status_code})，跳过')
@@ -286,47 +310,15 @@ def gemini_search(category: str, query: str, backtrack: str = '24h', max_retries
                         rotator.mark_exhausted(key_idx)
                         break
 
-                    wait = 3
-                    logging.warning(f'  [{category}] [{channel_name}] 异常: {exc}，{wait}s 后重试 ({attempt + 1}/{max_retries})')
+                    # Why: 指数退避 3→6→12s，比固定 3s 更有效应对突发 503 风暴
+                    wait = 3 * (2 ** attempt) + random.uniform(0, 2)
+                    logging.warning(f'  [{category}] [{channel_name}] 异常: {exc}，{wait:.0f}s 后重试 ({attempt + 1}/{max_retries})')
                     time.sleep(wait)
 
     # Why: Gemini 双通道全部失败后降级到 Tavily
-    if TAVILY_API_KEY:
-        try:
-            logging.info(f'  [{category}] ↘️ 降级到 Tavily 搜索引擎...')
-            tavily_resp = requests.post(
-                'https://api.tavily.com/search',
-                json={
-                    'api_key': TAVILY_API_KEY,
-                    'query': query[:400],
-                    'search_depth': 'advanced',
-                    'max_results': 5,
-                    'include_answer': True,
-                },
-                timeout=30,
-            )
-            tavily_resp.raise_for_status()
-            tavily_data = tavily_resp.json()
-            answer = tavily_data.get('answer', '')
-            results_list = tavily_data.get('results', [])
-            parts = []
-            if answer:
-                parts.append(f'[Tavily Fallback] {answer}')
-            sources = []
-            for r in results_list[:5]:
-                title = r.get('title', '')
-                content = r.get('content', '')
-                url = r.get('url', '')
-                parts.append(f'- {title}: {content[:300]} 【{url}】')
-                if url:
-                    sources.append({'url': url, 'title': title})
-            if parts:
-                channel_breaker.record_success('Tavily')
-                logging.info(f'  [{category}] ✅ Tavily 降级成功，返回 {len(parts)} 条结果')
-                result = {'text': '\n'.join(parts), 'grounding_sources': sources}
-                return enrich_search_urls(result)
-        except Exception as e:
-            logging.warning(f'  [{category}] Tavily 降级也失败: {e}')
+    result = _tavily_fallback(query, category=category, return_dict=True)
+    if result:
+        return enrich_search_urls(result)
 
     logging.error(f'❌ [{category}] 所有搜索途径均失败（含 Tavily 降级）')
     return {}

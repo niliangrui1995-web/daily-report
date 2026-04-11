@@ -15,7 +15,7 @@
 """
 
 OLIGARCH_DICT = {
-    '芯片设计与底层IP': ['Synopsys', 'Cadence', 'ARM', 'Arteris', 'Qualcomm', 'Alphawave'],
+    '芯片设计与底层IP': ['Synopsys', 'Cadence', 'ARM', 'Arteris', 'Qualcomm', 'Alphawave (被Qualcomm收购已退市)'],
     '定制化ASIC与代工': ['TSMC (台积电)', 'Intel Foundry Services', 'Broadcom (博通)', 'Marvell (迈威尔)', 'Alchip (世芯)'],
     '晶圆制造与材料设备': ['ASML', 'Applied Materials (应材)', 'Lam Research (泛林)', 'TEL (东京电子)', 'KLA', 'Onto Innovation', 'Soitec', 'IQE', 'PVA TePla'],
     'HBM与核心存储矩阵': ['SK Hynix (SK海力士)', 'Samsung Memory', 'Micron (美光)', 'Hanmi Semi (韩美半导体)', 'NAMICS (纳美仕)'],
@@ -29,7 +29,7 @@ OLIGARCH_DICT = {
     '算力颠覆与主权生态': ['Groq', 'Cerebras', 'Tenstorrent', 'SMIC (中芯国际)', 'Huawei (华为)', 'NAURA (北方华创)', 'AMEC (中微)'],
     '云巨头/算力租赁与数据': ['Microsoft (微软)', 'Meta', 'Google', 'AWS', 'OpenAI', 'Anthropic', 'CoreWeave', 'Scale AI'],
     '边缘AI与具身智能': ['Apple (苹果)', 'Qualcomm (高通)', 'MediaTek (联发科)', 'Figure AI', 'Tesla (特斯拉)'],
-    '光纤光缆与通信基建': ['Corning Optical (康宁光纤)', 'Prysmian (普瞐司曼)', 'CommScope', 'Ciena', 'Calix', 'ADTRAN']
+    '光纤光缆与通信基建': ['Corning Optical (康宁光纤)', 'Prysmian (普睿司曼)', 'CommScope (更名为VISN)', 'Ciena', 'Calix', 'ADTRAN']
 }
 
 ALL_OLIGARCHS_FLAT: list[str] = []
@@ -41,7 +41,6 @@ VANGUARD_TICKERS = {
     'Cadence': 'CDNS',
     'ARM': 'ARM',
     'Qualcomm': 'QCOM',
-    'Alphawave': 'AWE.L',
     'TSMC': 'TSM',
     'Broadcom': 'AVGO',
     'Marvell': 'MRVL',
@@ -121,7 +120,7 @@ VANGUARD_TICKERS = {
     'MediaTek': '2454.TW',
     'Ciena': 'CIEN',
     'Calix': 'CALX',
-    'CommScope': 'COMM',
+    'CommScope': 'VISN',
     'ADTRAN': 'ADTN',
     'Prysmian': 'PRY.MI'
 }

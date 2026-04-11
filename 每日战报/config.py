@@ -7,16 +7,6 @@ SEC_USER_AGENT = 'VCP Hunter daily-report/3.6 research@localhost.invalid'
 SUMMARY_LEN = 5000
 
 RSSHUB_INSTANCES = ['https://rsshub.app', 'https://rsshub.rssforever.com', 'https://rsshub-instance.zeabur.app']
-NITTER_INSTANCES = ['https://xcancel.com', 'https://nitter.space', 'https://nitter.poast.org', 'https://nitter.privacydev.net']
-
-TWITTER_WATCHLIST = [
-    ['kopite7kimi', 'kopite7kimi'],
-    ['Dylan Patel', 'dylan522p'],
-    ['SemiAnalysis', 'SemiAnalysis'],
-    ['Jukanlosreve', 'Jukanlosreve'],
-    ['harukaze5719', 'harukaze5719'],
-    ['VideoCardz', 'VideoCardz']
-]
 
 RSS_FEEDS = [
     {'name': 'Bloomberg_Tech', 'url': 'https://feeds.bloomberg.com/technology/news.rss', 'source': 'bloomberg', 'group': 'major'},
@@ -45,12 +35,12 @@ SOURCE_CONTENT_SELECTORS = {
     'TechPowerUp': ['.article-content p', '#newsContent p', 'article p', '.fulltext p'],
     'TomsHardware': ['div#article-body p', '.article-body p', '#slice-container p', 'article p'],
     'SeekingAlpha_Tech': ["div[data-test-id='article-body'] p", '.paywall-full-content p', '.article-body p', 'article p'],
-    'SemiAnalysis': ['.body p', '.post-content p', '.markup p', 'article p'],
+
     'SemiEngineering': ['.entry-content p', '.post-content p', 'article p'],
     'EETimes': ['.article-content p', '.post-content p', '.entry-content p', 'article p'],
     'ServeTheHome': ['.entry-content p', '.post-content p', 'article p'],
     'TheRegister_AI': ['#article-body p', '#body p', 'article p', "div[class*='article_body'] p"],
-    'NVIDIA_Blog': ['.entry-content p', '.post-content p', '.blog-post p', 'article p'],
+
     'AWS_ML_Blog': ['.blog-post-content p', '.aws-blog-body p', '.entry-content p', 'article p'],
     'TechNews_TW': ['.indent p', '.entry-content p', '.article-content p', 'article p'],
     'DIGITIMES_TW': ['.article-body p', '.news_content p', '#content p', '.article-detail p', 'article p'],
@@ -59,12 +49,11 @@ SOURCE_CONTENT_SELECTORS = {
     'HackerNews': ['.article-body p', '.post-content p', '.entry-content p', 'article p', '.content p'],
     'Lightwave': ['.article-body p', '.post-content p', '.entry-content p', 'article p', '.content p'],
     'FierceTelecom': ['.article-body p', '.post-content p', '.entry-content p', 'article p', '.content p'],
-    'SEMI_News': ['.field-content p', '.node-content p', '.article-body p', 'article p'],
+
     'DataCenterKnowledge': ['.article-content p', '.post-content p', '.entry-content p', 'article p'],
     'TheElec_KR': ['.article-body p', '.view-content p', '.entry-content p', 'article p'],
-    'DigiTimes_Asia': ['.article-body p', '.news_content p', '#content p', 'article p'],
-    'FierceElectronics': ['.article-body p', '.post-content p', '.entry-content p', 'article p'],
-    'SMM_Metal': ['.article-content p', '.news-content p', 'article p']
+
+    'FierceElectronics': ['.article-body p', '.post-content p', '.entry-content p', 'article p']
 }
 
 GENERIC_CONTENT_SELECTORS = ['article p', 'main p', '.content p', '.post-content p', '.entry-content p', '.article-body p', 'p']

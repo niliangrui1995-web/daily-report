@@ -23,7 +23,8 @@ import logging
 from datetime import datetime, timedelta
 import glob
 
-from settings import opus_adapter, OPUS_MODEL, OUTPUT_DIR, get_today_output_dir, load_prompt
+from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
+from settings import opus_adapter, OPUS_MODEL, OUTPUT_DIR, require_prompt
 from industry_dict import OLIGARCH_DICT
 from utils import extract_json_from_llm_response
 
@@ -131,7 +132,20 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
         
     oligarch_display = '\n'.join([f"  [{k}]: {', '.join(v)}" for k, v in OLIGARCH_DICT.items()])
     
-    prompt = load_prompt('p6_mapping.txt').format(
+    now_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
+    try:
+        prompt_template = require_prompt('p6_mapping.txt')
+    except FileNotFoundError as e:
+        logging.error(f'🚨 [P6 映射] 关键 Prompt 缺失: {e}')
+        update_run_manifest(
+            'p6',
+            status='failed_missing_prompt',
+            metrics={'input_chars': len(evidence_text), 'error': str(e)},
+        )
+        return ''
+
+    prompt = prompt_template.format(
+        current_time=now_str,
         evidence_len=len(evidence_text),
         oligarch_display=oligarch_display,
         evidence_text=evidence_text,
@@ -144,19 +158,28 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
     
     if thinking_content:
         try:
-            now_str = datetime.now().strftime('%Y%m%d%H%M')
-            thinking_fname = os.path.join(get_today_output_dir(), f'P6_Opus推理链_{now_str}.md')
-            with open(thinking_fname, 'w', encoding='utf-8') as f:
-                f.write('# P6 Opus Thinking 推理链\n\n')
-                f.write(f'> 生成时间: {datetime.now().isoformat()}\n')
-                f.write(f'> 推理链长度: {len(thinking_content)} 字符\n\n---\n\n')
-                f.write(thinking_content)
+            thinking_body = (
+                '# P6 Opus Thinking 推理链\n\n'
+                f'> 生成时间: {datetime.now().isoformat()}\n'
+                f'> 推理链长度: {len(thinking_content)} 字符\n\n---\n\n'
+                f'{thinking_content}'
+            )
+            thinking_fname = write_text_artifact('P6_Opus推理链', thinking_body)
             logging.info(f'🧠 [P6] Opus 推理链已保存: {thinking_fname} ({len(thinking_content)} 字符)')
         except Exception as e:
             logging.warning(f'[P6] 推理链保存失败: {e}')
+            thinking_fname = ''
+    else:
+        thinking_fname = ''
             
     if not raw_content:
         logging.error('[P6 映射] 失败: 大模型返回为空')
+        update_run_manifest(
+            'p6',
+            status='failed_empty_output',
+            files={'thinking': thinking_fname} if thinking_fname else None,
+            metrics={'input_chars': len(evidence_text)},
+        )
         return ''
         
     try:
@@ -175,13 +198,11 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
                     data['events'][idx]['targets'][t_idx]['code'] = HALLUCINATION_MAP[name]
                     
         try:
-            now_str = datetime.now().strftime('%Y%m%d%H%M')
-            json_fname = os.path.join(get_today_output_dir(), f'P6_映射_{now_str}.json')
-            with open(json_fname, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            logging.info(f'💾 [P6 映射] 完美架构JSON数据已强制分离落盘: {json_fname}')
+            json_fname = write_json_artifact('P6_映射', data)
+            logging.info(f'💾 [P6 映射] 完美架构 JSON 数据已落盘: {json_fname}')
         except Exception as e:
             logging.warning(f'⚠️ [P6 映射] JSON落盘失败: {e}')
+            json_fname = ''
             
         lines = []
         for event in data.get('events', []):
@@ -217,10 +238,34 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
                 logging.warning(f'⚠️ [P6 映射] 渲染不完整（{len(report)} 字, {stock_count} 只标的），疑似 Opus 返回了压缩版，自动重试第 {_retry_count + 1} 次...')
                 time.sleep(10)
                 return generate_report(evidence_text, _retry_count=_retry_count + 1)
+            else:
+                logging.error(f'❌ [P6 映射] 连续 {_retry_count + 1} 次充当残缺渲染，已达强行放弃阈值，放行当前结果以防死循环。')
                 
+        manifest_files = {}
+        if json_fname:
+            manifest_files['json'] = json_fname
+        if thinking_fname:
+            manifest_files['thinking'] = thinking_fname
+        update_run_manifest(
+            'p6',
+            status='json_ready',
+            files=manifest_files or None,
+            metrics={
+                'input_chars': len(evidence_text),
+                'output_chars': len(report),
+                'stock_count': stock_count,
+                'retry_count': _retry_count,
+            },
+        )
         logging.info(f'✅ [P6 映射] 成功解析 JSON 并逆向渲染为 MarkDown，字数 {len(report)}')
         return report
         
     except json.JSONDecodeError as e:
         logging.error(f'❌ [P6 映射] JSON解析绝望失败(大模型幻觉了): {e}\n原文开头: {raw_content[:200]}')
+        update_run_manifest(
+            'p6',
+            status='fallback_raw_llm',
+            files={'thinking': thinking_fname} if thinking_fname else None,
+            metrics={'input_chars': len(evidence_text), 'raw_output_chars': len(raw_content), 'error': str(e)},
+        )
         return raw_content

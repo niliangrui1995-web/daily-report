@@ -22,8 +22,6 @@ for k in ('HTTP_PROXY', 'HTTPS_PROXY'):
     if k in os.environ:
         if not SYSTEM_PROXY:
             SYSTEM_PROXY = os.environ[k]
-        if '127.0.0.1' in os.environ[k] or 'localhost' in os.environ[k]:
-            del os.environ[k]
 
 ANTIGRAVITY_BASE_URL = os.environ.get('ANTIGRAVITY_BASE_URL', 'http://127.0.0.1:8045')
 ANTIGRAVITY_API_KEY = os.environ.get('ANTIGRAVITY_API_KEY', '')
@@ -55,8 +53,6 @@ EMAIL_ADDRESS = os.environ.get('EMAIL_ADDRESS', '')
 EMAIL_PASSWORD = os.environ.get('EMAIL_PASSWORD', '')
 RECEIVER_EMAIL = os.environ.get('RECEIVER_EMAIL', '')
 
-FAKE_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'}
-
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '每日热点输出')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -68,16 +64,25 @@ def get_today_output_dir() -> str:
 
 _prompt_cache: dict[str, str] = {}
 
-def load_prompt(name: str) -> str:
+def load_prompt(name: str, *, required: bool = False) -> str:
     if name not in _prompt_cache:
         prompt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts')
+        prompt_path = os.path.join(prompt_dir, name)
         try:
-            with open(os.path.join(prompt_dir, name), 'r', encoding='utf-8') as f:
+            with open(prompt_path, 'r', encoding='utf-8') as f:
                 _prompt_cache[name] = f.read()
         except Exception as e:
             logging.error(f'⚠️ [配置系统] 加载 Prompt 模板失败: {name}, Error: {e}')
             _prompt_cache[name] = ''
-    return _prompt_cache[name]
+    prompt_text = _prompt_cache[name]
+    if required and not prompt_text.strip():
+        raise FileNotFoundError(f'关键 Prompt 不存在或为空: {name}')
+    return prompt_text
+
+
+def require_prompt(name: str) -> str:
+    """关键阶段使用：Prompt 缺失时显式失败，而不是悄悄返回空串。"""
+    return load_prompt(name, required=True)
 
 _pro_adapter = None
 _opus_adapter = None
@@ -97,13 +102,18 @@ def _get_opus_adapter():
     return _opus_adapter
 
 class _LazyAdapter:
-    '''属性代理，兼容 `from settings import pro_adapter` 的直接使用方式。'''
+    '''属性代理，兼容 `from settings import pro_adapter` 的直接使用方式。
+
+    Why: 代理 __getattr__ + __repr__ + __call__，确保直接调用也能正确转发。
+    '''
     def __init__(self, getter):
         self._getter = getter
     def __getattr__(self, name):
         return getattr(self._getter(), name)
     def __repr__(self):
         return repr(self._getter())
+    def __call__(self, *args, **kwargs):
+        return self._getter()(*args, **kwargs)
 
 pro_adapter = _LazyAdapter(_get_pro_adapter)
 opus_adapter = _LazyAdapter(_get_opus_adapter)

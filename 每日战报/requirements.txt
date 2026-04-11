@@ -3,14 +3,17 @@
 
 # === 核心 ===
 google-genai>=1.0.0          # Gemini API (搜索 + Pro 审计)
-anthropic>=0.40.0             # Claude Opus (P6/P9 分析)
+anthropic>=0.87.0             # Claude Opus (P6/P9 分析) - patched CVE
 openai>=1.0.0                 # OpenAI 兼容协议兜底 (native_llm_adapter)
 requests>=2.31.0
 python-dotenv>=1.0.0            # .env 环境变量加载
 pydantic>=2.0.0                  # 数据模型校验
 feedparser>=6.0.0
-yfinance>=0.2.30              # Yahoo Finance 股价数据
+yfinance>=1.2.1               # Yahoo Finance 股价数据 (兼容 curl-cffi>=0.15)
 chinesecalendar>=1.9.0        # A 股交易日自动化判断
+cryptography>=46.0.7          # patched CVE
+curl-cffi>=0.15.0             # patched CVE (used by yfinance)
+setuptools>=78.1.1            # patched CVE/PYSEC
 
 # === 正文深挖 ===
 scrapling>=0.2.0              # Phase 2 网页正文提取
@@ -20,6 +23,10 @@ ratelimit>=2.2.1              # API 调速
 
 # === 邮件 ===
 markdown>=3.5.0               # 战报 HTML 渲染
+
+# === 开发与验证 ===
+pytest>=8.0.0                # 单元测试
+ruff>=0.11.0                 # 静态检查 / lint
 
 # === 可选 (LangChain 兼容层，不装也能跑) ===
 # langchain-core>=0.1.0

@@ -250,7 +250,12 @@ def fetch_all_asian_klines(
     return results
 
 
-def save_kline_data(data: list[dict], output_dir: str | None = None) -> str:
+def save_kline_data(
+    data: list[dict],
+    output_dir: str | None = None,
+    *,
+    keep_history: bool = False,
+) -> str:
     """保存 K 线数据到 JSON 文件。"""
     if not output_dir:
         # Why: 默认存到同级 data/ 目录，与脚本同文件夹
@@ -261,7 +266,7 @@ def save_kline_data(data: list[dict], output_dir: str | None = None) -> str:
     os.makedirs(output_dir, exist_ok=True)
 
     now_str = datetime.now().strftime("%Y%m%d_%H%M")
-    filepath = os.path.join(output_dir, f"asian_klines_{now_str}.json")
+    history_path = os.path.join(output_dir, f"asian_klines_{now_str}.json")
 
     # Why: 生成元数据摘要，前端可以读 meta 做标题/更新时间显示
     meta = {
@@ -279,18 +284,19 @@ def save_kline_data(data: list[dict], output_dir: str | None = None) -> str:
         "stocks": data,
     }
 
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
-
-    logging.info(f"💾 K 线数据已保存: {filepath} ({os.path.getsize(filepath) / 1024:.0f} KB)")
-
-    # Why: 同时生成一份 latest.json 供看板前端固定路径读取
+    # Why: latest.json 才是前端固定读取路径，默认只维护这一份，避免仓库持续堆积 1.7MB 历史快照
     latest_path = os.path.join(output_dir, "asian_klines_latest.json")
     with open(latest_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
     logging.info(f"💾 最新快照已更新: {latest_path}")
 
-    return filepath
+    if keep_history:
+        with open(history_path, "w", encoding="utf-8") as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
+        logging.info(f"💾 历史快照已保存: {history_path} ({os.path.getsize(history_path) / 1024:.0f} KB)")
+        return history_path
+
+    return latest_path
 
 
 def main():
@@ -324,6 +330,11 @@ def main():
         action="store_true",
         help="只列出目标标的，不实际拉数据",
     )
+    parser.add_argument(
+        "--keep-history",
+        action="store_true",
+        help="额外保留带时间戳的历史快照（默认仅更新 latest.json）",
+    )
 
     args = parser.parse_args()
 
@@ -343,7 +354,7 @@ def main():
     )
 
     if data:
-        save_kline_data(data, args.output_dir)
+        save_kline_data(data, args.output_dir, keep_history=args.keep_history)
 
 
 if __name__ == "__main__":

@@ -82,7 +82,8 @@ def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, d
     logging.info(f'  回溯窗口: {backtrack}')
 
     try:
-        user_prompt = _build_user_prompt(backtrack)
+        # Why: 先显式验证用户 Prompt 存在，实际检索 prompt 在分批循环内按 chunk 重建
+        _build_user_prompt(backtrack)
         raw_system_prompt = require_prompt('p2_system.txt')
     except FileNotFoundError as e:
         logging.error(f'🚨 [P2] 关键 Prompt 缺失: {e}')

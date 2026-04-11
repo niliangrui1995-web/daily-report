@@ -38,3 +38,7 @@ _archive/
 
 # 每日输出（运行时生成，不入版本控制）
 每日热点输出/
+
+# 亚洲 K 线快照（仅保留 latest，历史快照按需本地保留）
+亚洲寡头行情/data/asian_klines_*.json
+!亚洲寡头行情/data/asian_klines_latest.json

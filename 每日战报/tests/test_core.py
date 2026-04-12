@@ -487,6 +487,7 @@ class TestCheckpoint:
     def test_empty_dir_returns_none(self, tmp_path, monkeypatch):
         """空目录应返回 stage='none'"""
         monkeypatch.setattr('checkpoint.get_today_output_dir', lambda: str(tmp_path))
+        monkeypatch.setattr('artifact_store.get_today_output_dir', lambda: str(tmp_path))
         from checkpoint import detect_checkpoint
         ckpt = detect_checkpoint()
         assert ckpt['stage'] == 'none'
@@ -494,6 +495,7 @@ class TestCheckpoint:
     def test_p1_detected(self, tmp_path, monkeypatch):
         """有 P1 文件应返回 stage='p1'"""
         monkeypatch.setattr('checkpoint.get_today_output_dir', lambda: str(tmp_path))
+        monkeypatch.setattr('artifact_store.get_today_output_dir', lambda: str(tmp_path))
         (tmp_path / 'P1_RSS原始数据_202604091000.json').write_text('{}', encoding='utf-8')
         from checkpoint import detect_checkpoint
         ckpt = detect_checkpoint()
@@ -502,6 +504,7 @@ class TestCheckpoint:
     def test_war_report_done(self, tmp_path, monkeypatch):
         """有战报文件应返回 stage='p9_done'"""
         monkeypatch.setattr('checkpoint.get_today_output_dir', lambda: str(tmp_path))
+        monkeypatch.setattr('artifact_store.get_today_output_dir', lambda: str(tmp_path))
         (tmp_path / '战报_202604091200.md').write_text('done', encoding='utf-8')
         from checkpoint import detect_checkpoint
         ckpt = detect_checkpoint()
@@ -510,6 +513,7 @@ class TestCheckpoint:
     def test_p8_detected_as_p9_resume(self, tmp_path, monkeypatch):
         """有 P8 文件时应进入 p9_resume，避免重复重跑技术面"""
         monkeypatch.setattr('checkpoint.get_today_output_dir', lambda: str(tmp_path))
+        monkeypatch.setattr('artifact_store.get_today_output_dir', lambda: str(tmp_path))
         (tmp_path / 'P8_技术面_202604091130.md').write_text('p8 data', encoding='utf-8')
         from checkpoint import detect_checkpoint
         ckpt = detect_checkpoint()

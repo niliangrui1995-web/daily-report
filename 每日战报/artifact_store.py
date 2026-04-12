@@ -1,11 +1,3 @@
-"""运行产物管理工具。
-
-统一管理：
-- 同批次运行时间戳
-- 各阶段 JSON/Markdown 落盘路径
-- run_manifest.json 阶段状态记录
-"""
-
 from __future__ import annotations
 
 import json
@@ -13,18 +5,83 @@ import os
 import re
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-from settings import get_today_output_dir
+from settings import OUTPUT_DIR, get_today_output_dir
 
 RUN_TIMESTAMP_ENV = "VCP_RUN_TS"
 MANIFEST_FILENAME = "run_manifest.json"
 
+ARTIFACT_CATEGORIES = ("raw", "audit", "report", "metrics", "logs", "system")
+PREFIX_CATEGORY_RULES: list[tuple[str, str]] = [
+    ("Layer_ROI", "metrics"),
+    ("战报", "report"),
+    ("P9_Opus", "audit"),
+    ("P8_", "audit"),
+    ("P7.5_补充搜索原始数据", "raw"),
+    ("P7_研究计划", "system"),
+    ("P7a_", "audit"),
+    ("P7.5_", "audit"),
+    ("P7_", "audit"),
+    ("P6_", "audit"),
+    ("P5_", "audit"),
+    ("P4_", "raw"),
+    ("P3_", "raw"),
+    ("P2_", "raw"),
+    ("P1_", "raw"),
+]
+
 _MANIFEST_LOCK = threading.Lock()
 
 
+def ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def get_output_root_dir() -> str:
+    return ensure_dir(OUTPUT_DIR)
+
+
+def get_global_system_dir() -> str:
+    return ensure_dir(os.path.join(get_output_root_dir(), "_system"))
+
+
+def get_run_lock_path() -> str:
+    return os.path.join(get_global_system_dir(), "run.lock")
+
+
+def get_day_dir(day_dir: str | None = None) -> str:
+    return ensure_dir(day_dir or get_today_output_dir())
+
+
+def get_day_subdir(name: str, *, day_dir: str | None = None) -> str:
+    if name not in ARTIFACT_CATEGORIES:
+        raise ValueError(f"unsupported artifact category: {name}")
+    return ensure_dir(os.path.join(get_day_dir(day_dir), name))
+
+
+def get_today_logs_dir() -> str:
+    return get_day_subdir("logs")
+
+
+def get_pipeline_log_path() -> str:
+    return os.path.join(get_today_logs_dir(), "pipeline.log")
+
+
+def get_error_log_path() -> str:
+    return os.path.join(get_today_logs_dir(), "error.log")
+
+
+def infer_artifact_category(prefix: str) -> str:
+    for marker, category in PREFIX_CATEGORY_RULES:
+        if prefix.startswith(marker):
+            return category
+    return "raw"
+
+
 def extract_timestamp_from_name(text: str) -> str:
-    """从文件名中提取 12/14 位运行时间戳。"""
     if not text:
         return ""
     match = re.search(r"(\d{12,14})", text)
@@ -32,42 +89,58 @@ def extract_timestamp_from_name(text: str) -> str:
 
 
 def set_run_timestamp(timestamp: str | None = None) -> str:
-    """设置当前运行统一时间戳。"""
     ts = timestamp or datetime.now().strftime("%Y%m%d%H%M%S")
     os.environ[RUN_TIMESTAMP_ENV] = ts
     return ts
 
 
 def get_run_timestamp() -> str:
-    """获取当前运行统一时间戳。"""
     current = os.environ.get(RUN_TIMESTAMP_ENV, "").strip()
-    if current:
-        return current
-    return set_run_timestamp()
+    return current or set_run_timestamp()
 
 
-def build_artifact_path(prefix: str, extension: str, timestamp: str | None = None) -> str:
+def build_artifact_path(
+    prefix: str,
+    extension: str,
+    timestamp: str | None = None,
+    *,
+    category: str | None = None,
+) -> str:
     ext = extension.lstrip(".")
     ts = timestamp or get_run_timestamp()
-    return os.path.join(get_today_output_dir(), f"{prefix}_{ts}.{ext}")
+    artifact_category = category or infer_artifact_category(prefix)
+    target_dir = get_day_subdir(artifact_category)
+    return os.path.join(target_dir, f"{prefix}_{ts}.{ext}")
 
 
-def write_text_artifact(prefix: str, content: str, *, timestamp: str | None = None) -> str:
-    path = build_artifact_path(prefix, "md", timestamp=timestamp)
+def write_text_artifact(
+    prefix: str,
+    content: str,
+    *,
+    timestamp: str | None = None,
+    category: str | None = None,
+) -> str:
+    path = build_artifact_path(prefix, "md", timestamp=timestamp, category=category)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     return path
 
 
-def write_json_artifact(prefix: str, data: Any, *, timestamp: str | None = None) -> str:
-    path = build_artifact_path(prefix, "json", timestamp=timestamp)
+def write_json_artifact(
+    prefix: str,
+    data: Any,
+    *,
+    timestamp: str | None = None,
+    category: str | None = None,
+) -> str:
+    path = build_artifact_path(prefix, "json", timestamp=timestamp, category=category)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return path
 
 
 def get_manifest_path() -> str:
-    return os.path.join(get_today_output_dir(), MANIFEST_FILENAME)
+    return os.path.join(get_day_dir(), MANIFEST_FILENAME)
 
 
 def load_run_manifest() -> dict[str, Any]:
@@ -79,16 +152,18 @@ def load_run_manifest() -> dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            raise ValueError("manifest 根节点不是对象")
+            raise ValueError("manifest root is not a dict")
         data.setdefault("run_timestamp", get_run_timestamp())
         data.setdefault("updated_at", "")
         data.setdefault("stages", {})
+        data.setdefault("manifest_version", 2)
         return data
     except Exception:
         return {
             "run_timestamp": get_run_timestamp(),
             "updated_at": datetime.now().isoformat(),
             "stages": {},
+            "manifest_version": 2,
             "corrupt_manifest": True,
         }
 
@@ -101,7 +176,6 @@ def update_run_manifest(
     metrics: dict[str, Any] | None = None,
     timestamp: str | None = None,
 ) -> str:
-    """更新当日运行 manifest。"""
     run_ts = timestamp or get_run_timestamp()
     manifest_path = get_manifest_path()
 
@@ -109,6 +183,8 @@ def update_run_manifest(
         manifest = load_run_manifest()
         manifest["run_timestamp"] = run_ts
         manifest["updated_at"] = datetime.now().isoformat()
+        manifest["manifest_version"] = 2
+
         stages = manifest.setdefault("stages", {})
         stage_payload = stages.setdefault(stage, {})
         stage_payload["status"] = status
@@ -124,3 +200,17 @@ def update_run_manifest(
             json.dump(manifest, f, ensure_ascii=False, indent=2)
 
     return manifest_path
+
+
+def find_latest_day_dir() -> str:
+    root = Path(get_output_root_dir())
+    candidates = sorted(
+        (
+            path
+            for path in root.iterdir()
+            if path.is_dir() and path.name.isdigit() and len(path.name) == 8
+        ),
+        key=lambda item: item.name,
+        reverse=True,
+    )
+    return str(candidates[0]) if candidates else get_day_dir()

@@ -2,38 +2,44 @@
 setlocal EnableExtensions
 
 set "ROOT_DIR=%~dp0"
-set "PYTHON_EXE=%ROOT_DIR%.venv\Scripts\python.exe"
+for %%I in ("%ROOT_DIR%.") do set "ROOT_DIR=%%~fI\"
+
 set "APP_DIR="
+set "PYTHON_EXE=%ROOT_DIR%.venv\Scripts\python.exe"
 if not defined RUN_DAILY_HOLD_SECONDS set "RUN_DAILY_HOLD_SECONDS=15"
 
 for /d %%D in ("%ROOT_DIR%*") do (
-    if exist "%%~fD\scheduled_launcher.py" (
+    if exist "%%~fD\pipeline_cli.py" (
         set "APP_DIR=%%~fD"
     )
 )
 
-set NO_PROXY=127.0.0.1,localhost,::1
+set "NO_PROXY=127.0.0.1,localhost,::1"
 
 echo [%date% %time%] VCP Hunter Pipeline Starting...
 echo.
 
 if not exist "%PYTHON_EXE%" (
     echo [ERROR] Python venv not found: "%PYTHON_EXE%"
-    exit /b 3
+    goto :fail
 )
 
 if not defined APP_DIR (
-    echo [ERROR] scheduled_launcher.py not found under "%ROOT_DIR%"
-    exit /b 2
+    echo [ERROR] pipeline_cli.py not found under "%ROOT_DIR%"
+    goto :fail
 )
 
 pushd "%APP_DIR%"
 if errorlevel 1 (
     echo [ERROR] Failed to enter app dir: "%APP_DIR%"
-    exit /b 2
+    goto :fail
 )
 
-"%PYTHON_EXE%" -u "%APP_DIR%\scheduled_launcher.py"
+if "%~1"=="" (
+    "%PYTHON_EXE%" -u "%APP_DIR%\pipeline_cli.py" run
+) else (
+    "%PYTHON_EXE%" -u "%APP_DIR%\pipeline_cli.py" %*
+)
 set "EXIT_CODE=%errorlevel%"
 
 popd
@@ -44,7 +50,14 @@ if not "%EXIT_CODE%"=="0" (
     echo [OK] Done.
 )
 echo.
+goto :hold
 
+:fail
+set "EXIT_CODE=%errorlevel%"
+if "%EXIT_CODE%"=="0" set "EXIT_CODE=1"
+echo.
+
+:hold
 if not "%RUN_DAILY_HOLD_SECONDS%"=="0" (
     echo Window will close in %RUN_DAILY_HOLD_SECONDS% seconds...
     powershell -NoProfile -Command "Start-Sleep -Seconds %RUN_DAILY_HOLD_SECONDS%" >nul 2>&1

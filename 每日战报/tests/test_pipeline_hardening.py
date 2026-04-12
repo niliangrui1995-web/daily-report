@@ -1,0 +1,199 @@
+# -*- coding: utf-8 -*-
+"""Hardening tests for runtime control, TLS policy, and preflight checks."""
+
+from __future__ import annotations
+
+import importlib
+import os
+import sys
+import time
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def slow_stage_handler(context: dict) -> None:
+    time.sleep(float(context.get("sleep_seconds", 0)))
+    context["completed"] = True
+
+
+def _reload_module(name: str):
+    if name in sys.modules:
+        return importlib.reload(sys.modules[name])
+    return importlib.import_module(name)
+
+
+class TestPipelineRuntimeTimeout:
+    def test_stage_timeout_marks_manifest(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("VCP_STAGE_EXECUTION_MODE", "process")
+
+        import artifact_store
+        from pipeline_runtime import StageSpec, StageTimeoutError, run_stage_registry
+
+        monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+
+        with pytest.raises(StageTimeoutError):
+            run_stage_registry(
+                [StageSpec(name="slow_stage", handler=slow_stage_handler, timeout_seconds=1)],
+                {"sleep_seconds": 2},
+            )
+
+        manifest = artifact_store.load_run_manifest()
+        assert manifest["stages"]["slow_stage"]["status"] == "failed_timeout"
+        assert manifest["stages"]["slow_stage"]["metrics"]["timeout_seconds"] == 1
+
+
+class TestSettingsHardening:
+    def test_no_proxy_merge_and_tls_allowlist(self, monkeypatch):
+        original_no_proxy = os.environ.get("NO_PROXY")
+        original_no_proxy_lower = os.environ.get("no_proxy")
+        original_allowlist = os.environ.get("INSECURE_TLS_ALLOWLIST")
+
+        try:
+            monkeypatch.setenv("NO_PROXY", "corp.local,localhost")
+            monkeypatch.setenv("INSECURE_TLS_ALLOWLIST", "self-signed.local, Example.org")
+
+            settings = _reload_module("settings")
+            http_security = _reload_module("http_security")
+
+            merged = set(part.strip().lower() for part in settings.MERGED_NO_PROXY.split(","))
+            assert {"corp.local", "localhost", "127.0.0.1", "::1"}.issubset(merged)
+            assert settings.MERGED_NO_PROXY == os.environ["NO_PROXY"]
+            assert settings.MERGED_NO_PROXY == os.environ["no_proxy"]
+
+            insecure_policy = http_security.get_tls_policy_for_url("https://news.self-signed.local/article")
+            assert insecure_policy["verify"] is False
+            assert insecure_policy["tls_mode"] == "insecure_allowlisted"
+
+            strict_policy = http_security.get_tls_policy_for_url("https://secure.example.net/article")
+            assert strict_policy["verify"] is True
+            assert strict_policy["tls_mode"] == "strict"
+        finally:
+            if original_no_proxy is None:
+                os.environ.pop("NO_PROXY", None)
+            else:
+                os.environ["NO_PROXY"] = original_no_proxy
+
+            if original_no_proxy_lower is None:
+                os.environ.pop("no_proxy", None)
+            else:
+                os.environ["no_proxy"] = original_no_proxy_lower
+
+            if original_allowlist is None:
+                os.environ.pop("INSECURE_TLS_ALLOWLIST", None)
+            else:
+                os.environ["INSECURE_TLS_ALLOWLIST"] = original_allowlist
+
+            _reload_module("settings")
+            _reload_module("http_security")
+
+
+class TestP1WebTimeParsing:
+    def test_parse_failed_items_are_dropped(self):
+        from p1_web import _entries_to_p1_result
+
+        result = _entries_to_p1_result(
+            [
+                {
+                    "title": "Broken date item",
+                    "content": "",
+                    "url": "https://example.com/broken",
+                    "published_at": "totally-not-a-date",
+                    "source": "Example",
+                }
+            ],
+            "网页采集",
+            "Example",
+            24,
+        )
+
+        assert result is None
+
+    def test_unknown_time_is_retained_but_marked(self):
+        from p1_web import _entries_to_p1_result
+
+        result = _entries_to_p1_result(
+            [
+                {
+                    "title": "Missing date item",
+                    "content": "",
+                    "url": "https://example.com/missing",
+                    "published_at": "",
+                    "source": "Example",
+                }
+            ],
+            "网页采集",
+            "Example",
+            24,
+        )
+
+        assert result is not None
+        assert result["grounding_sources"][0]["time_status"] == "unknown_time"
+        assert "unknown_time" in result["text"]
+
+
+class TestManifestContext:
+    def test_manifest_root_contains_runtime_context_and_preflight(self, monkeypatch, tmp_path):
+        import artifact_store
+
+        monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+
+        artifact_store.update_manifest_context(
+            runtime_context={"python_version": "3.12.0", "cwd": "D:/workspace"},
+            preflight={"exit_code": 0, "search_keys_count": 3},
+            timestamp="20260413010101",
+        )
+        manifest = artifact_store.load_run_manifest()
+
+        assert manifest["manifest_version"] == 3
+        assert manifest["runtime_context"]["python_version"] == "3.12.0"
+        assert manifest["preflight"]["exit_code"] == 0
+
+
+class TestPreflightChecks:
+    def test_preflight_strict_returns_lock_exit_code(self, monkeypatch, tmp_path):
+        import pipeline_cli
+
+        today_dir = tmp_path / "today"
+        logs_dir = tmp_path / "logs"
+        today_dir.mkdir()
+        logs_dir.mkdir()
+
+        monkeypatch.setattr(pipeline_cli, "OUTPUT_DIR", str(tmp_path / "output"))
+        monkeypatch.setattr(pipeline_cli, "settings_today_output_dir", lambda: str(today_dir))
+        monkeypatch.setattr(pipeline_cli, "get_today_logs_dir", lambda: str(logs_dir))
+        monkeypatch.setattr(pipeline_cli, "require_prompt", lambda name: "ok")
+        monkeypatch.setattr(pipeline_cli, "SEARCH_API_KEY_POOL", ["key-1"])
+        monkeypatch.setattr(pipeline_cli, "ANTIGRAVITY_API_KEY", "secret")
+        monkeypatch.setattr(pipeline_cli, "GROK_API_KEY", "optional")
+        monkeypatch.setattr(pipeline_cli, "INSECURE_TLS_ALLOWLIST", ("self-signed.local",))
+        monkeypatch.setattr(
+            pipeline_cli.importlib,
+            "import_module",
+            lambda module_name: object(),
+        )
+        monkeypatch.setattr(pipeline_cli, "get_calendar_status", lambda: {"mode": "chinese_calendar"})
+        monkeypatch.setattr(pipeline_cli, "is_trading_day", lambda _: True)
+        monkeypatch.setattr(
+            pipeline_cli,
+            "read_run_lock",
+            lambda: {"pid": 1234, "command": "run", "started_at": "2026-04-13T00:00:00+00:00"},
+        )
+        monkeypatch.setattr(pipeline_cli, "is_lock_stale", lambda info, stale_after_seconds: False)
+
+        result = pipeline_cli._collect_preflight(strict=True)
+        assert result["summary"]["exit_code"] == pipeline_cli.EXIT_LOCK_ACTIVE
+        assert any(item["name"] == "run_lock" and not item["ok"] for item in result["checks"])
+
+
+class TestTradingCalendarStatus:
+    def test_calendar_status_exposes_package_and_import_names(self):
+        from trading_calendar import CALENDAR_IMPORT_NAME, CALENDAR_PACKAGE_NAME, get_calendar_status
+
+        status = get_calendar_status()
+
+        assert status["package_name"] == CALENDAR_PACKAGE_NAME
+        assert status["import_name"] == CALENDAR_IMPORT_NAME
+        if status["library_available"]:
+            assert status["package_version"]

@@ -10,7 +10,7 @@ python-dotenv>=1.0.0            # .env 环境变量加载
 pydantic>=2.0.0                  # 数据模型校验
 feedparser>=6.0.0
 yfinance>=1.2.1               # Yahoo Finance 股价数据 (兼容 curl-cffi>=0.15)
-chinesecalendar>=1.9.0        # A 股交易日自动化判断
+chinesecalendar>=1.9.0        # A 股交易日自动化判断（PyPI 包名 chinesecalendar，import 名 chinese_calendar）
 cryptography>=46.0.7          # patched CVE
 curl-cffi>=0.15.0             # patched CVE (used by yfinance)
 setuptools>=78.1.1            # patched CVE/PYSEC

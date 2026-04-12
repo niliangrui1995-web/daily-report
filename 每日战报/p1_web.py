@@ -21,9 +21,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait, ALL_COMPL
 from urllib.parse import urljoin
 
 import requests
-import warnings
-import urllib3
 from scraper_utils import enrich_article_url, is_article_url as _is_article_url
+from http_security import get_tls_policy_for_url, log_tls_policy
 
 
 from config import (
@@ -33,9 +32,6 @@ from config import (
 from utils import parse_backtrack_hours
 
 BEIJING_TZ = timezone(timedelta(hours=8))
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings('ignore', category=urllib3.exceptions.InsecureRequestWarning)
 
 _parser_available = False
 try:
@@ -173,17 +169,31 @@ def _extract_web_published_at(page_html: str, raw_link: str, link: str, title: s
     return ''
 
 
-def _is_within_window(published_at: str | None, hours: int) -> bool:
+def _classify_time_window(published_at: str | None, hours: int) -> dict:
     if not published_at:
-        return True
+        return {
+            'allowed': True,
+            'time_status': 'unknown_time',
+            'time_reason': 'missing_published_at',
+        }
+
     try:
         clean = published_at.replace('(北京时间)', '').replace('T', ' ').strip()
         dt = datetime.strptime(clean[:19], '%Y-%m-%d %H:%M:%S').replace(tzinfo=BEIJING_TZ)
         cutoff = datetime.now(BEIJING_TZ) - timedelta(hours=hours)
-        return dt >= cutoff
-    except Exception as e:
-        logging.debug(f'Ignored return True exception: {e}')
-        return True
+        is_recent = dt >= cutoff
+        return {
+            'allowed': is_recent,
+            'time_status': 'recent' if is_recent else 'stale',
+            'time_reason': '',
+        }
+    except Exception as exc:
+        logging.warning('[P1 Web] drop entry due to unparseable published_at=%s error=%s', published_at, exc)
+        return {
+            'allowed': False,
+            'time_status': 'parse_failed',
+            'time_reason': str(exc),
+        }
 
 def _scrape_one_source(source_cfg: dict) -> list[dict]:
     url = source_cfg['url']
@@ -198,7 +208,9 @@ def _scrape_one_source(source_cfg: dict) -> list[dict]:
         return []
         
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=SOURCE_TIMEOUT, verify=False)
+        tls_policy = get_tls_policy_for_url(url)
+        log_tls_policy('P1 Web', url, tls_policy)
+        resp = requests.get(url, headers=HEADERS, timeout=SOURCE_TIMEOUT, verify=tls_policy['verify'])
         resp.raise_for_status()
     except requests.exceptions.Timeout:
         logging.warning(f'[Web] {name}: 请求超时 ({SOURCE_TIMEOUT}s)')
@@ -258,12 +270,27 @@ def _scrape_one_source(source_cfg: dict) -> list[dict]:
             'content': '',
             'url': link,
             'published_at': published_at,
-            'source': name
+            'source': name,
+            'tls_mode': tls_policy['tls_mode'],
+            'insecure_fetch': tls_policy['insecure_fetch'],
         })
     return entries
 
 def _entries_to_p1_result(entries: list[dict], category: str, source_name: str, hours: int) -> dict | None:
-    filtered = [e for e in entries if _is_within_window(e.get('published_at'), hours)]
+    filtered = []
+    time_window_stats = {
+        'recent': 0,
+        'unknown_time': 0,
+        'stale': 0,
+        'parse_failed': 0,
+    }
+    for entry in entries:
+        time_window = _classify_time_window(entry.get('published_at'), hours)
+        entry['time_status'] = time_window['time_status']
+        entry['time_reason'] = time_window['time_reason']
+        time_window_stats[time_window['time_status']] = time_window_stats.get(time_window['time_status'], 0) + 1
+        if time_window['allowed']:
+            filtered.append(entry)
     if not filtered:
         return None
         
@@ -282,12 +309,22 @@ def _entries_to_p1_result(entries: list[dict], category: str, source_name: str, 
             text_line += f' — {content[:300]}'
         if published_at:
             text_line += f' [{published_at}]'
+        elif entry.get('time_status') == 'unknown_time':
+            text_line += ' [unknown_time]'
             
         text_line += f' 【{source}|{url}|】'
         lines.append(text_line)
         
         if url:
-            grounding_sources.append({'title': title, 'url': url})
+            grounding_sources.append({
+                'title': title,
+                'url': url,
+                'tls_mode': entry.get('tls_mode', 'strict'),
+                'insecure_fetch': bool(entry.get('insecure_fetch', False)),
+                'published_at': published_at,
+                'time_status': entry.get('time_status', 'unknown_time'),
+                'time_reason': entry.get('time_reason', ''),
+            })
             
     if not lines:
         return None
@@ -298,11 +335,21 @@ def _entries_to_p1_result(entries: list[dict], category: str, source_name: str, 
         'text': '\n'.join(lines),
         'grounding_sources': grounding_sources[:10],
         '_filtered_entries': filtered,
+        'time_window_stats': time_window_stats,
     }
 
 def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
     hours = parse_backtrack_hours(backtrack)
-    stats = {'total': 0, 'success': [], 'empty': [], 'failed': []}
+    stats = {
+        'total': 0,
+        'success': [],
+        'empty': [],
+        'failed': [],
+        'time_recent': 0,
+        'time_unknown': 0,
+        'time_stale': 0,
+        'time_parse_failed': 0,
+    }
     
     if not _parser_available:
         logging.warning('[P1 Web] Scrapling 未安装，跳过网页采集')
@@ -351,6 +398,11 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
                 result, status, reason = future.result()
                 if status == 'ok' and result:
                     n_items = len(result['grounding_sources'])
+                    time_window_stats = result.get('time_window_stats', {})
+                    stats['time_recent'] += int(time_window_stats.get('recent', 0))
+                    stats['time_unknown'] += int(time_window_stats.get('unknown_time', 0))
+                    stats['time_stale'] += int(time_window_stats.get('stale', 0))
+                    stats['time_parse_failed'] += int(time_window_stats.get('parse_failed', 0))
                     all_results.append(result)
                     stats['success'].append((source_name, n_items))
                     logging.info(f'  ✅ {source_name}: {n_items} 条')
@@ -441,7 +493,6 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
     return all_results, stats
 
 if __name__ == '__main__':
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     results, stats = collect_from_web('24h')
     print(f'\n===== 网页采集结果: {len(results)} 个数据源 =====\n')

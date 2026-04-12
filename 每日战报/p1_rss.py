@@ -17,8 +17,6 @@ import logging
 import re
 import time
 import random
-import warnings
-import urllib3
 from datetime import datetime, timedelta, timezone
 import feedparser
 import requests
@@ -36,9 +34,6 @@ from scraper_utils import is_article_url as _is_article_url
 from utils import parse_backtrack_hours
 
 BEIJING_TZ = timezone(timedelta(hours=8))
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings('ignore', category=urllib3.exceptions.InsecureRequestWarning)
 
 try:
     from scraper_utils import scrapling_available as _scrapling_available

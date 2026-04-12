@@ -170,6 +170,7 @@ class TestP8AndP9Simulation:
 class TestOrchestratorSimulation:
     def test_orchestrator_main_runs_full_pipeline_offline(self, monkeypatch, tmp_path):
         out_dir = _patch_output_dir(monkeypatch, tmp_path)
+        monkeypatch.setenv("VCP_STAGE_EXECUTION_MODE", "inline")
 
         import artifact_store
         import orchestrator

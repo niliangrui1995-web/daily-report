@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from settings import OUTPUT_DIR, get_today_output_dir
+from settings import OUTPUT_DIR, SEARCH_API_KEY_POOL, get_tls_policy_summary, get_today_output_dir
+from trading_calendar import get_calendar_mode
 
 RUN_TIMESTAMP_ENV = "VCP_RUN_TS"
+PREFLIGHT_SUMMARY_ENV = "VCP_PREFLIGHT_SUMMARY_JSON"
 MANIFEST_FILENAME = "run_manifest.json"
 
 ARTIFACT_CATEGORIES = ("raw", "audit", "report", "metrics", "logs", "system")
@@ -146,7 +150,14 @@ def get_manifest_path() -> str:
 def load_run_manifest() -> dict[str, Any]:
     path = get_manifest_path()
     if not os.path.exists(path):
-        return {"run_timestamp": get_run_timestamp(), "updated_at": "", "stages": {}}
+        return {
+            "run_timestamp": get_run_timestamp(),
+            "updated_at": "",
+            "stages": {},
+            "runtime_context": {},
+            "preflight": {},
+            "manifest_version": 3,
+        }
 
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -156,14 +167,18 @@ def load_run_manifest() -> dict[str, Any]:
         data.setdefault("run_timestamp", get_run_timestamp())
         data.setdefault("updated_at", "")
         data.setdefault("stages", {})
-        data.setdefault("manifest_version", 2)
+        data.setdefault("runtime_context", {})
+        data.setdefault("preflight", {})
+        data.setdefault("manifest_version", 3)
         return data
     except Exception:
         return {
             "run_timestamp": get_run_timestamp(),
             "updated_at": datetime.now().isoformat(),
             "stages": {},
-            "manifest_version": 2,
+            "runtime_context": {},
+            "preflight": {},
+            "manifest_version": 3,
             "corrupt_manifest": True,
         }
 
@@ -183,7 +198,7 @@ def update_run_manifest(
         manifest = load_run_manifest()
         manifest["run_timestamp"] = run_ts
         manifest["updated_at"] = datetime.now().isoformat()
-        manifest["manifest_version"] = 2
+        manifest["manifest_version"] = 3
 
         stages = manifest.setdefault("stages", {})
         stage_payload = stages.setdefault(stage, {})
@@ -195,6 +210,62 @@ def update_run_manifest(
             stage_payload.setdefault("files", {}).update(files)
         if metrics:
             stage_payload.setdefault("metrics", {}).update(metrics)
+
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    return manifest_path
+
+
+def set_preflight_summary(summary: dict[str, Any] | None) -> None:
+    if not summary:
+        os.environ.pop(PREFLIGHT_SUMMARY_ENV, None)
+        return
+    os.environ[PREFLIGHT_SUMMARY_ENV] = json.dumps(summary, ensure_ascii=False)
+
+
+def get_preflight_summary() -> dict[str, Any]:
+    raw = os.environ.get(PREFLIGHT_SUMMARY_ENV, "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def build_runtime_context(*, cwd: str | None = None) -> dict[str, Any]:
+    return {
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "cwd": cwd or os.getcwd(),
+        "calendar_mode": get_calendar_mode(),
+        "search_keys_count": len(SEARCH_API_KEY_POOL),
+        "tls_policy": get_tls_policy_summary(),
+        "executable": sys.executable,
+    }
+
+
+def update_manifest_context(
+    *,
+    runtime_context: dict[str, Any] | None = None,
+    preflight: dict[str, Any] | None = None,
+    timestamp: str | None = None,
+) -> str:
+    run_ts = timestamp or get_run_timestamp()
+    manifest_path = get_manifest_path()
+
+    with _MANIFEST_LOCK:
+        manifest = load_run_manifest()
+        manifest["run_timestamp"] = run_ts
+        manifest["updated_at"] = datetime.now().isoformat()
+        manifest["manifest_version"] = 3
+
+        if runtime_context:
+            manifest.setdefault("runtime_context", {}).update(runtime_context)
+        if preflight is not None:
+            manifest["preflight"] = preflight
 
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)

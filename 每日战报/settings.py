@@ -2,10 +2,9 @@ __doc__ = '统一配置中心 — 环境变量加载 + 全局常量 + 适配器�
 
 import os
 import logging
-import urllib3
-import warnings
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 try:
     from dotenv import load_dotenv
@@ -13,15 +12,76 @@ try:
 except ImportError:
     pass
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings('ignore', category=urllib3.exceptions.InsecureRequestWarning)
+def _merge_no_proxy(existing: str | None, required_hosts: list[str]) -> str:
+    merged: list[str] = []
+    seen: set[str] = set()
 
-os.environ['NO_PROXY'] = '127.0.0.1,localhost,::1'
+    def _append(value: str) -> None:
+        normalized = value.strip()
+        if not normalized:
+            return
+        lowered = normalized.lower()
+        if lowered in seen:
+            return
+        seen.add(lowered)
+        merged.append(normalized)
+
+    for raw in (existing or "").split(","):
+        _append(raw)
+    for host in required_hosts:
+        _append(host)
+    return ",".join(merged)
+
+
+NO_PROXY_REQUIRED_HOSTS = ['127.0.0.1', 'localhost', '::1']
+MERGED_NO_PROXY = _merge_no_proxy(os.environ.get('NO_PROXY'), NO_PROXY_REQUIRED_HOSTS)
+os.environ['NO_PROXY'] = MERGED_NO_PROXY
+os.environ['no_proxy'] = MERGED_NO_PROXY
 SYSTEM_PROXY = None
 for k in ('HTTP_PROXY', 'HTTPS_PROXY'):
     if k in os.environ:
         if not SYSTEM_PROXY:
             SYSTEM_PROXY = os.environ[k]
+
+
+def _parse_insecure_tls_allowlist(raw_value: str | None) -> tuple[str, ...]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in (raw_value or '').split(','):
+        normalized = item.strip().lower()
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(normalized)
+    return tuple(values)
+
+
+INSECURE_TLS_ALLOWLIST = _parse_insecure_tls_allowlist(os.environ.get('INSECURE_TLS_ALLOWLIST'))
+TLS_POLICY = {
+    'default_verify': True,
+    'insecure_allowlist': list(INSECURE_TLS_ALLOWLIST),
+}
+
+
+def get_tls_policy_summary() -> str:
+    allowlist = ','.join(INSECURE_TLS_ALLOWLIST) if INSECURE_TLS_ALLOWLIST else 'none'
+    return f"strict_default; allowlist={allowlist}"
+
+
+def is_insecure_tls_allowed(url: str) -> bool:
+    try:
+        host = urlparse(url).hostname or ''
+    except Exception:
+        host = ''
+    host = host.lower().strip()
+    if not host:
+        return False
+    for candidate in INSECURE_TLS_ALLOWLIST:
+        if host == candidate or host.endswith(f'.{candidate}'):
+            return True
+    return False
 
 ANTIGRAVITY_BASE_URL = os.environ.get('ANTIGRAVITY_BASE_URL', 'http://127.0.0.1:8045')
 ANTIGRAVITY_API_KEY = os.environ.get('ANTIGRAVITY_API_KEY', '')

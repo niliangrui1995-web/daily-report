@@ -15,6 +15,7 @@ import logging
 import requests
 from urllib.parse import urlparse
 from config import SUMMARY_LEN, SOURCE_CONTENT_SELECTORS, GENERIC_CONTENT_SELECTORS, CONTENT_NOISE_KEYWORDS, FAKE_UA, URL_BLACKLIST
+from http_security import get_tls_policy_for_url, log_tls_policy
 
 scrapling_available = False
 _Selector = None
@@ -61,7 +62,9 @@ def _quick_meta_extract(url: str) -> str:
     if not scrapling_available or not _Selector:
         return ''
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=8, verify=False)
+        tls_policy = get_tls_policy_for_url(url)
+        log_tls_policy('ScraperMeta', url, tls_policy)
+        resp = requests.get(url, headers=HEADERS, timeout=8, verify=tls_policy['verify'])
         if resp.status_code >= 400:
             return ''
         page = _Selector(resp.text)
@@ -119,7 +122,7 @@ def extract_content_from_html(html_text: str, source_name: str = '', url: str = 
             
     return ''
 
-def enrich_article_url(url: str, source_name: str = '') -> str:
+def enrich_article_url(url: str, source_name: str = '', return_meta: bool = False):
     """一手源正文深挖——增强版。
 
     Why: 原版只用 requests.get 裸拉 HTML，对 JS 渲染站点（seekingalpha/bloomberg）
@@ -141,25 +144,46 @@ def enrich_article_url(url: str, source_name: str = '') -> str:
             if _is_high_value_domain(url):
                 fetch_urls.append(f'https://webcache.googleusercontent.com/search?q=cache:{url}')
 
+        last_meta = {
+            'requested_url': url,
+            'resolved_url': '',
+            'tls_mode': 'strict',
+            'insecure_fetch': False,
+        }
+
         for fetch_url in fetch_urls:
             try:
-                resp = requests.get(fetch_url, headers=HEADERS, timeout=12, verify=False)
+                tls_policy = get_tls_policy_for_url(fetch_url)
+                log_tls_policy('ScraperFetch', fetch_url, tls_policy)
+                last_meta = {
+                    'requested_url': url,
+                    'resolved_url': fetch_url,
+                    'tls_mode': tls_policy['tls_mode'],
+                    'insecure_fetch': tls_policy['insecure_fetch'],
+                }
+                resp = requests.get(fetch_url, headers=HEADERS, timeout=12, verify=tls_policy['verify'])
                 if resp.status_code >= 400:
                     continue
                 content = extract_content_from_html(resp.text, source_name=source_name, url=url)
                 if content and len(content) > 100:
-                    return content
+                    return (content, last_meta) if return_meta else content
                 # Why: 正文提取失败（JS 渲染空壳），降级到 meta 标签
                 content = _extract_meta_from_html(resp.text)
                 if content:
-                    return content
+                    return (content, last_meta) if return_meta else content
             except requests.exceptions.RequestException:
                 continue
 
-        return ''
+        return ('', last_meta) if return_meta else ''
     except Exception as e:
         logging.debug(f'[Scrapling] enrich_article_url 请求失败 {url}: {e}')
-        return ''
+        empty_meta = {
+            'requested_url': url,
+            'resolved_url': '',
+            'tls_mode': 'strict',
+            'insecure_fetch': False,
+        }
+        return ('', empty_meta) if return_meta else ''
 
 
 def _extract_meta_from_html(html_text: str) -> str:

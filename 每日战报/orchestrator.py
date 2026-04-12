@@ -14,17 +14,20 @@ from logging.handlers import RotatingFileHandler
 from typing import Any
 
 from artifact_store import (
+    build_runtime_context,
     get_error_log_path,
+    get_preflight_summary,
     get_pipeline_log_path,
     load_run_manifest,
     set_run_timestamp,
+    update_manifest_context,
     update_run_manifest,
     write_json_artifact,
     write_text_artifact,
 )
 from checkpoint import detect_checkpoint
 from contribution_metrics import build_layer_roi_report, render_layer_roi_markdown
-from pipeline_runtime import StageSpec, run_stage_registry
+from pipeline_runtime import StageSpec, StageTimeoutError, run_stage_registry
 from run_config import get_run_config
 from trading_calendar import is_trading_day
 
@@ -268,6 +271,10 @@ def _stage_collect_intel(context: dict[str, Any]) -> None:
         "enrich_ok": int(rss_stats.get("enrich_ok", 0)) + int(web_stats.get("enrich_ok", 0)),
         "enrich_fail": int(rss_stats.get("enrich_fail", 0)) + int(web_stats.get("enrich_fail", 0)),
         "failed_urls": len(p1_failed_urls),
+        "web_time_recent": int(web_stats.get("time_recent", 0)),
+        "web_time_unknown": int(web_stats.get("time_unknown", 0)),
+        "web_time_stale": int(web_stats.get("time_stale", 0)),
+        "web_time_parse_failed": int(web_stats.get("time_parse_failed", 0)),
     }
 
     context.update(
@@ -714,6 +721,11 @@ def orchestrator_main(argv: list[str] | None = None):
         },
         timestamp=run_ts,
     )
+    update_manifest_context(
+        runtime_context=build_runtime_context(),
+        preflight=get_preflight_summary(),
+        timestamp=run_ts,
+    )
 
     if resume_from == "p9_done":
         logging.info("war report already exists for today, skip run")
@@ -732,7 +744,21 @@ def orchestrator_main(argv: list[str] | None = None):
 
     context = _build_context(now, run_ts, ckpt, resume_from)
     start_at = _resolve_start_stage(resume_from)
-    run_stage_registry(_build_stage_registry(), context, start_at=start_at)
+    try:
+        run_stage_registry(_build_stage_registry(), context, start_at=start_at)
+    except Exception as exc:
+        status = "failed_timeout" if isinstance(exc, StageTimeoutError) else "failed_exception"
+        update_run_manifest(
+            "orchestrator",
+            status=status,
+            metrics={
+                "resume_from": resume_from,
+                "total_elapsed_seconds": round(time.time() - total_start, 1),
+                "error": str(exc),
+            },
+            timestamp=run_ts,
+        )
+        raise
 
     total_elapsed = time.time() - total_start
     update_run_manifest(

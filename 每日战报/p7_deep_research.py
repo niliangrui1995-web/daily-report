@@ -22,14 +22,6 @@ ROUND_HINTS = (
     "Fill the remaining gaps around alternatives, substitutes, and competitive response.",
 )
 
-_INVALID_REFINE_QUERIES = {
-    "initiating the analysis",
-    "initiating inquiry process",
-    "initiating query generation",
-    "analysis",
-    "query generation",
-    "search query",
-}
 _TOPIC_VALUE_MARKERS = (
     "\u539f\u56e0",
     "\u4f20\u5bfc",
@@ -84,8 +76,32 @@ _STOPWORDS = {
     "event",
     "today",
     "latest",
+    "explain",
     "search",
     "research",
+    "cause",
+    "driver",
+    "trigger",
+    "winner",
+    "winners",
+    "loser",
+    "losers",
+    "benefit",
+    "beneficiary",
+    "beneficiaries",
+    "supplier",
+    "suppliers",
+    "alternative",
+    "alternatives",
+    "substitute",
+    "substitutes",
+    "competition",
+    "response",
+    "downside",
+    "pressure",
+    "implication",
+    "chain",
+    "transmission",
     "\u6df1\u5ea6",
     "\u7814\u7a76",
     "\u4e8b\u4ef6",
@@ -97,6 +113,7 @@ _STOPWORDS = {
     "\u6700\u65b0",
 }
 _CAUSE_MARKERS = (
+    "cause",
     "\u539f\u56e0",
     "\u89e6\u53d1",
     "\u9a71\u52a8",
@@ -163,42 +180,6 @@ def _topic_similarity(left: str, right: str) -> float:
     if not left_tokens or not right_tokens:
         return 0.0
     return len(left_tokens & right_tokens) / max(len(left_tokens), len(right_tokens))
-
-
-def _pick_refined_query(raw_text: str, fallback: str) -> tuple[str, bool]:
-    if not raw_text or not raw_text.strip():
-        return fallback, True
-
-    lines = []
-    for line in raw_text.splitlines():
-        text = line.strip()
-        if not text or text.startswith("```") or text.startswith("#"):
-            continue
-        lines.append(text)
-
-    if not lines:
-        return fallback, True
-
-    query = lines[0].strip().strip("\"'` ")
-    query = re.sub(r"^\*+|\*+$", "", query).strip()
-    query = re.sub(r"^[-\d\.\)\s]+", "", query).strip()
-    query = re.sub(r"\s+", " ", query)
-
-    if len(query) < 8:
-        return fallback, True
-
-    lowered = query.lower()
-    if lowered in _INVALID_REFINE_QUERIES:
-        return fallback, True
-    if re.match(r"^(initiating|starting|analysis|query generation)", lowered):
-        return fallback, True
-    if not re.search(r"[A-Za-z0-9\u4e00-\u9fa5]", query):
-        return fallback, True
-
-    if len(query) > 220:
-        query = query[:220].rstrip()
-
-    return query, False
 
 
 def extract_search_queries(p6_mapping: str) -> list[str]:
@@ -480,6 +461,64 @@ def _extract_entities(text: str) -> set[str]:
     return entities
 
 
+def _extract_query_terms(text: str, *, limit: int = 4) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[A-Z][A-Za-z0-9&\.-]{1,}|[A-Za-z]{3,}|[\u4e00-\u9fff]{2,8}", text or ""):
+        lowered = token.lower()
+        if lowered in _STOPWORDS or len(token) < 3:
+            continue
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        terms.append(token)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _collect_priority_sentences(text: str) -> list[str]:
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[\.\u3002\uff1b;])\s+", text or "")
+        if sentence and sentence.strip()
+    ]
+    if not sentences:
+        return []
+
+    prioritized: list[str] = []
+    seen: set[str] = set()
+    for markers in (_WINNER_MARKERS, _ALTERNATIVE_MARKERS, _LOSER_MARKERS, _CAUSE_MARKERS):
+        for sentence in sentences:
+            lowered = sentence.lower()
+            if sentence in seen:
+                continue
+            if any(marker.lower() in lowered for marker in markers):
+                seen.add(sentence)
+                prioritized.append(sentence)
+
+    for sentence in sentences:
+        if sentence in seen:
+            continue
+        prioritized.append(sentence)
+    return prioritized
+
+
+def _dedupe_query_parts(parts: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        text = re.sub(r"\s+", " ", str(part or "")).strip()
+        if not text:
+            continue
+        key = _normalize_topic_key(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(text)
+    return deduped
+
+
 def _estimate_incremental_novelty(previous_texts: list[str], current_text: str) -> float:
     current_facts = {_normalize_fact_line(line) for line in _extract_fact_lines(current_text)}
     current_facts.discard("")
@@ -505,6 +544,41 @@ def _coverage_flags(text: str) -> dict[str, bool]:
     }
 
 
+def _structured_summary(structured: dict[str, object] | None) -> str:
+    if not isinstance(structured, dict):
+        return ""
+    return str(structured.get("summary") or "").strip()
+
+
+def _structured_claim_lines(structured: dict[str, object] | None, fallback_text: str) -> list[str]:
+    if isinstance(structured, dict):
+        claims = [str(item).strip() for item in structured.get("claims") or [] if str(item).strip()]
+        if claims:
+            return claims[:6]
+    return _extract_fact_lines(fallback_text)
+
+
+def _structured_entity_terms(structured: dict[str, object] | None, fallback_text: str) -> list[str]:
+    if isinstance(structured, dict):
+        entities = [str(item).strip() for item in structured.get("entities") or [] if str(item).strip()]
+        if entities:
+            return entities[:8]
+    return []
+
+
+def _structured_coverage(structured: dict[str, object] | None, fallback_text: str) -> dict[str, bool]:
+    if isinstance(structured, dict):
+        coverage = structured.get("coverage_flags")
+        if isinstance(coverage, dict):
+            return {
+                "cause": bool(coverage.get("cause")),
+                "winners": bool(coverage.get("winners")),
+                "losers": bool(coverage.get("losers")),
+                "alternatives": bool(coverage.get("alternatives")),
+            }
+    return _coverage_flags(fallback_text)
+
+
 def _extract_dates(text: str) -> list[str]:
     patterns = (
         r"20\d{2}[-/]\d{1,2}[-/]\d{1,2}",
@@ -519,6 +593,14 @@ def _extract_dates(text: str) -> list[str]:
             seen.add(match)
             dates.append(match)
     return dates[:5]
+
+
+def _structured_dates(structured: dict[str, object] | None, fallback_text: str) -> list[str]:
+    if isinstance(structured, dict):
+        dates = [str(item).strip() for item in structured.get("dates") or [] if str(item).strip()]
+        if dates:
+            return dates[:5]
+    return _extract_dates(fallback_text)
 
 
 def _extract_implications(fact_lines: list[str]) -> list[str]:
@@ -540,6 +622,17 @@ def _extract_implications(fact_lines: list[str]) -> list[str]:
     return fact_lines[:2]
 
 
+def _structured_implications(
+    structured: dict[str, object] | None,
+    fact_lines: list[str],
+) -> list[str]:
+    if isinstance(structured, dict):
+        implications = [str(item).strip() for item in structured.get("implications") or [] if str(item).strip()]
+        if implications:
+            return implications[:3]
+    return _extract_implications(fact_lines)
+
+
 def _open_questions(coverage: dict[str, bool], topic: str) -> list[str]:
     questions: list[str] = []
     if not coverage["cause"]:
@@ -551,6 +644,18 @@ def _open_questions(coverage: dict[str, bool], topic: str) -> list[str]:
     if not coverage["alternatives"]:
         questions.append("Need alternatives, substitutes, or competitive-response context.")
     return questions[:3]
+
+
+def _structured_open_questions(
+    structured: dict[str, object] | None,
+    coverage: dict[str, bool],
+    topic: str,
+) -> list[str]:
+    if isinstance(structured, dict):
+        questions = [str(item).strip() for item in structured.get("open_questions") or [] if str(item).strip()]
+        if questions:
+            return questions[:3]
+    return _open_questions(coverage, topic)
 
 
 def _format_source_lines(sources: list[dict[str, str]]) -> list[str]:
@@ -570,20 +675,97 @@ def _format_source_lines(sources: list[dict[str, str]]) -> list[str]:
     return rendered or ["- No grounded sources returned by the search engine."]
 
 
-def _build_refine_prompt(topic: str, latest_text: str, goal: str, round_index: int) -> str:
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    hint = ROUND_HINTS[min(round_index, len(ROUND_HINTS) - 1)]
-    preview = latest_text[:2200]
-    return (
-        f"Current Beijing time: {now_str}\n"
-        f"Topic: {topic}\n"
-        f"Research goal: {goal or 'Explain the cause and concrete implication.'}\n"
-        f"Next-round focus: {hint}\n\n"
-        "Based on the latest findings below, output exactly one line of the next search query.\n"
-        "The query must be specific, entity-rich, and avoid repeating the same framing.\n"
-        "Do not explain anything.\n\n"
-        f"Latest findings:\n{preview}\n"
-    )
+def _build_rule_refined_query(
+    topic: str,
+    latest_text: str,
+    goal: str,
+    round_index: int,
+    *,
+    latest_structured: dict[str, object] | None = None,
+) -> tuple[str, bool]:
+    if not latest_text or not latest_text.strip():
+        return topic, True
+
+    coverage = _structured_coverage(latest_structured, latest_text)
+    evidence_lines = _structured_claim_lines(latest_structured, latest_text)
+    priority_sentences = _collect_priority_sentences("\n".join(evidence_lines[:6]) or latest_text)
+    entity_corpus = " ".join(priority_sentences[:6]) or "\n".join(evidence_lines[:6]) or latest_text
+    structured_entities = _structured_entity_terms(latest_structured, latest_text)
+    entities = structured_entities[:4] if structured_entities else _extract_query_terms(entity_corpus, limit=4)
+    goal_terms = _extract_query_terms(goal, limit=2)
+
+    focus_terms: list[str] = []
+    if not coverage["cause"]:
+        focus_terms.extend(["cause", "driver", "trigger"])
+    if not coverage["winners"]:
+        focus_terms.extend(["winners", "beneficiaries", "suppliers"])
+    if not coverage["losers"]:
+        focus_terms.extend(["losers", "downside", "pressure"])
+    if not coverage["alternatives"]:
+        focus_terms.extend(["alternatives", "substitutes", "competition"])
+
+    if not focus_terms:
+        if round_index <= 1:
+            focus_terms.extend(["supply chain", "transmission", "impact"])
+        else:
+            focus_terms.extend(["competitive response", "alternatives", "substitutes"])
+
+    query_parts = [topic]
+    query_parts.extend(goal_terms)
+    query_parts.extend(focus_terms)
+    query_parts.extend(entities)
+
+    deduped_parts = _dedupe_query_parts(query_parts)
+    query = " ".join(deduped_parts).strip()
+    if not query or _normalize_topic_key(query) == _normalize_topic_key(topic):
+        return topic, True
+    if len(query) > 220:
+        query = query[:220].rstrip()
+    return query, False
+
+
+def _pick_refined_query(raw_text: str, fallback: str) -> tuple[str, bool]:
+    invalid_queries = {
+        "initiating the analysis",
+        "initiating inquiry process",
+        "initiating query generation",
+        "analysis",
+        "query generation",
+        "search query",
+    }
+    if not raw_text or not raw_text.strip():
+        return fallback, True
+
+    lines = []
+    for line in raw_text.splitlines():
+        text = line.strip()
+        if not text or text.startswith("```") or text.startswith("#"):
+            continue
+        lines.append(text)
+
+    if not lines:
+        return fallback, True
+
+    query = lines[0].strip().strip("\"'` ")
+    query = re.sub(r"^\*+|\*+$", "", query).strip()
+    query = re.sub(r"^[-\d\.\)\s]+", "", query).strip()
+    query = re.sub(r"\s+", " ", query)
+
+    if len(query) < 8:
+        return fallback, True
+
+    lowered = query.lower()
+    if lowered in invalid_queries:
+        return fallback, True
+    if re.match(r"^(initiating|starting|analysis|query generation)", lowered):
+        return fallback, True
+    if not re.search(r"[A-Za-z0-9\u4e00-\u9fa5]", query):
+        return fallback, True
+
+    if len(query) > 220:
+        query = query[:220].rstrip()
+
+    return query, False
 
 
 def _format_round_section(
@@ -593,16 +775,17 @@ def _format_round_section(
     backtrack: str,
     goal: str,
     result_text: str,
+    structured: dict[str, object] | None,
     sources: list[dict[str, str]],
     novelty: float,
     coverage: dict[str, bool],
     new_entities_count: int,
 ) -> str:
-    fact_lines = _extract_fact_lines(result_text)
-    claim = fact_lines[0] if fact_lines else "No stable claim extracted."
-    implication_lines = _extract_implications(fact_lines)
-    date_lines = _extract_dates(result_text)
-    open_questions = _open_questions(coverage, query)
+    fact_lines = _structured_claim_lines(structured, result_text)
+    claim = _structured_summary(structured) or (fact_lines[0] if fact_lines else "No stable claim extracted.")
+    implication_lines = _structured_implications(structured, fact_lines)
+    date_lines = _structured_dates(structured, result_text)
+    open_questions = _structured_open_questions(structured, coverage, query)
 
     lines = [
         f"### Round {round_index}",
@@ -653,7 +836,6 @@ def iterative_deep_search(
     goal: str = "",
     round_backtracks: list[str] | None = None,
 ) -> dict[str, object]:
-    from settings import pro_adapter
     from search_engine import gemini_search
 
     round_backtracks = list(round_backtracks or ROUND_BACKTRACKS[:rounds])
@@ -663,6 +845,7 @@ def iterative_deep_search(
 
     round_sections: list[str] = []
     successful_texts: list[str] = []
+    successful_structured: list[dict[str, object] | None] = []
     queries_used: list[str] = []
     coverage_hits: set[str] = set()
     seen_entities: set[str] = set()
@@ -674,24 +857,23 @@ def iterative_deep_search(
         if round_index == 0:
             query = topic
         else:
-            refine_prompt = _build_refine_prompt(
+            query, used_fallback = _build_rule_refined_query(
                 topic=topic,
                 latest_text=successful_texts[-1],
                 goal=goal,
                 round_index=round_index,
+                latest_structured=successful_structured[-1],
             )
-            try:
-                response = pro_adapter.invoke(refine_prompt)
-                query, used_fallback = _pick_refined_query(getattr(response, "content", ""), topic)
-                fallback_streak = fallback_streak + 1 if used_fallback else 0
-            except Exception as exc:
-                logging.warning(f"[P7] refine-query fallback for '{topic}' round {round_index + 1}: {exc}")
-                query = topic
-                fallback_streak += 1
+            fallback_streak = fallback_streak + 1 if used_fallback else 0
 
         queries_used.append(query)
         time.sleep(random.uniform(1.5, 3.5))
-        result = gemini_search(f"deep_research_r{round_index + 1}", query, backtrack=backtrack)
+        result = gemini_search(
+            f"deep_research_r{round_index + 1}",
+            query,
+            backtrack=backtrack,
+            structured_mode="p7",
+        )
         if not result or not result.get("text"):
             logging.warning(f"[P7] search returned empty for '{topic}' round {round_index + 1}")
             if round_index == 0:
@@ -701,12 +883,18 @@ def iterative_deep_search(
             break
 
         result_text = result["text"].strip()
-        novelty = _estimate_incremental_novelty(successful_texts, result_text)
-        coverage = _coverage_flags(result_text)
+        structured = result.get("structured") if isinstance(result, dict) else None
+        analysis_lines = _structured_claim_lines(structured, result_text)
+        analysis_text = "\n".join(analysis_lines) if analysis_lines else result_text
+        novelty = _estimate_incremental_novelty(successful_texts, analysis_text)
+        coverage = _structured_coverage(structured, result_text)
         new_coverage = [name for name, enabled in coverage.items() if enabled]
         coverage_hits.update(new_coverage)
 
-        entities = _extract_entities(result_text)
+        if isinstance(structured, dict):
+            entities = {item.lower() for item in _structured_entity_terms(structured, result_text)}
+        else:
+            entities = _extract_entities(result_text)
         new_entities = entities - seen_entities
         seen_entities.update(entities)
 
@@ -717,13 +905,15 @@ def iterative_deep_search(
                 backtrack=backtrack,
                 goal=goal,
                 result_text=result_text,
+                structured=structured if isinstance(structured, dict) else None,
                 sources=result.get("grounding_sources", []),
                 novelty=novelty,
                 coverage=coverage,
                 new_entities_count=len(new_entities),
             )
         )
-        successful_texts.append(result_text)
+        successful_texts.append(analysis_text)
+        successful_structured.append(structured if isinstance(structured, dict) else None)
 
         if fallback_streak >= 2:
             stop_reason = "fallback_streak"

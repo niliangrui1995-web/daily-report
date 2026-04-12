@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import threading
@@ -19,7 +20,7 @@ from settings import (
     SEARCH_API_KEY_POOL,
     TAVILY_API_KEY,
 )
-from utils import parse_backtrack_hours
+from utils import extract_json_from_llm_response, parse_backtrack_hours
 
 
 class SearchKeyRotator:
@@ -118,8 +119,129 @@ channel_breaker = ChannelCircuitBreaker(threshold=2)
 _http_session = requests.Session()
 GEMINI_CONCURRENCY = max(search_rotator_direct.total, 1)
 
+P7_STRUCTURED_MODE = "p7"
+_P7_STRUCTURED_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "claims": {"type": "array", "items": {"type": "string"}},
+        "entities": {"type": "array", "items": {"type": "string"}},
+        "dates": {"type": "array", "items": {"type": "string"}},
+        "implications": {"type": "array", "items": {"type": "string"}},
+        "open_questions": {"type": "array", "items": {"type": "string"}},
+        "coverage_flags": {
+            "type": "object",
+            "properties": {
+                "cause": {"type": "boolean"},
+                "winners": {"type": "boolean"},
+                "losers": {"type": "boolean"},
+                "alternatives": {"type": "boolean"},
+            },
+            "required": ["cause", "winners", "losers", "alternatives"],
+        },
+    },
+    "required": [
+        "summary",
+        "claims",
+        "entities",
+        "dates",
+        "implications",
+        "open_questions",
+        "coverage_flags",
+    ],
+}
 
-def _build_search_prompt(category: str, query: str, backtrack: str) -> str:
+
+def _normalize_string_list(values, *, limit: int, max_length: int) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if len(text) > max_length:
+            text = text[:max_length].rstrip()
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+        if len(normalized) >= limit:
+            break
+    return normalized
+
+
+def _normalize_p7_structured_payload(payload: dict) -> dict:
+    coverage = payload.get("coverage_flags")
+    if not isinstance(coverage, dict):
+        coverage = {}
+    return {
+        "summary": str(payload.get("summary") or "").strip()[:400],
+        "claims": _normalize_string_list(payload.get("claims"), limit=6, max_length=240),
+        "entities": _normalize_string_list(payload.get("entities"), limit=8, max_length=80),
+        "dates": _normalize_string_list(payload.get("dates"), limit=6, max_length=40),
+        "implications": _normalize_string_list(payload.get("implications"), limit=4, max_length=240),
+        "open_questions": _normalize_string_list(payload.get("open_questions"), limit=4, max_length=240),
+        "coverage_flags": {
+            "cause": bool(coverage.get("cause")),
+            "winners": bool(coverage.get("winners")),
+            "losers": bool(coverage.get("losers")),
+            "alternatives": bool(coverage.get("alternatives")),
+        },
+    }
+
+
+def _render_p7_structured_text(payload: dict) -> str:
+    parts: list[str] = []
+    summary = str(payload.get("summary") or "").strip()
+    claims = payload.get("claims") or []
+    implications = payload.get("implications") or []
+    open_questions = payload.get("open_questions") or []
+    dates = payload.get("dates") or []
+
+    if summary:
+        parts.append(f"Summary: {summary}")
+    for claim in claims:
+        parts.append(f"- {claim}")
+    if dates:
+        parts.append(f"Dates: {', '.join(dates)}")
+    if implications:
+        parts.append("Implications:")
+        parts.extend(f"- {item}" for item in implications)
+    if open_questions:
+        parts.append("Open questions:")
+        parts.extend(f"- {item}" for item in open_questions)
+    return "\n".join(parts).strip()
+
+
+def _structured_mode_schema(structured_mode: str | None) -> dict | None:
+    if structured_mode == P7_STRUCTURED_MODE:
+        return _P7_STRUCTURED_RESPONSE_SCHEMA
+    return None
+
+
+def _parse_structured_payload(raw_text: str, structured_mode: str | None) -> dict | None:
+    if not structured_mode or not raw_text.strip():
+        return None
+    try:
+        payload = extract_json_from_llm_response(raw_text, expect_type="dict")
+    except json.JSONDecodeError:
+        return None
+
+    if structured_mode == P7_STRUCTURED_MODE:
+        return _normalize_p7_structured_payload(payload)
+    return None
+
+
+def _build_search_prompt(
+    category: str,
+    query: str,
+    backtrack: str,
+    *,
+    structured_mode: str | None = None,
+) -> str:
     hours = parse_backtrack_hours(backtrack, default=24)
     if hours <= 72:
         window_policy = (
@@ -132,6 +254,24 @@ def _build_search_prompt(category: str, query: str, backtrack: str) -> str:
             "for background, precedent, and named-entity context."
         )
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if structured_mode == P7_STRUCTURED_MODE:
+        return (
+            f"Current Beijing time: {now_str}\n\n"
+            "You are an AI industry-chain researcher. Search the topic below and return only grounded facts.\n"
+            f"Topic: {query}\n"
+            f"Category: {category}\n"
+            f"Search window: {backtrack}\n"
+            f"{window_policy}\n"
+            "Return a JSON object only. Do not wrap it in markdown.\n"
+            "The JSON must contain: summary, claims, entities, dates, implications, open_questions, coverage_flags.\n"
+            "claims: 3-6 grounded factual statements.\n"
+            "entities: 0-8 specific companies, technologies, materials, products, or industry-chain nodes.\n"
+            "dates: explicit dates or time anchors only.\n"
+            "implications: concrete downstream or A-share transmission implications only.\n"
+            "open_questions: unresolved evidence gaps only.\n"
+            "coverage_flags: booleans for cause, winners, losers, alternatives.\n"
+            "If nothing reliable is found, return empty arrays, an empty summary, and all coverage flags false."
+        )
     return (
         f"Current Beijing time: {now_str}\n\n"
         "You are an AI industry-chain researcher. Search the topic below and return only grounded facts.\n"
@@ -193,15 +333,20 @@ def _post_search_request(
     key: str,
     prompt: str,
     temperature: float,
+    response_json_schema: dict | None = None,
 ) -> requests.Response:
     url = f"{base_url}/v1beta/models/{GEMINI_SEARCH_MODEL}:generateContent?key={key}"
+    generation_config = {
+        "temperature": temperature,
+        "maxOutputTokens": 8192,
+    }
+    if response_json_schema:
+        generation_config["responseMimeType"] = "application/json"
+        generation_config["responseJsonSchema"] = response_json_schema
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "tools": [{"googleSearch": {}}],
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": 8192,
-        },
+        "generationConfig": generation_config,
     }
     return _http_session.post(
         url,
@@ -275,8 +420,16 @@ def raw_gemini_search(prompt: str, max_retries: int = 3) -> str:
 
 @sleep_and_retry
 @limits(calls=1, period=1)
-def gemini_search(category: str, query: str, backtrack: str = "24h", max_retries: int = 3) -> dict:
-    prompt = _build_search_prompt(category, query, backtrack)
+def gemini_search(
+    category: str,
+    query: str,
+    backtrack: str = "24h",
+    max_retries: int = 3,
+    *,
+    structured_mode: str | None = None,
+) -> dict:
+    prompt = _build_search_prompt(category, query, backtrack, structured_mode=structured_mode)
+    response_json_schema = _structured_mode_schema(structured_mode)
     channels = [("direct", search_rotator_direct), ("cf_worker", search_rotator_cf)]
 
     for channel_name, rotator in channels:
@@ -297,6 +450,7 @@ def gemini_search(category: str, query: str, backtrack: str = "24h", max_retries
                         key=key,
                         prompt=prompt,
                         temperature=1.0,
+                        response_json_schema=response_json_schema,
                     )
                     if response.status_code in (429, 403):
                         logging.warning(f"[{category}] key ...{key_last4} limited on {channel_name}")
@@ -320,7 +474,17 @@ def gemini_search(category: str, query: str, backtrack: str = "24h", max_retries
                             sources.append({"url": web.get("uri"), "title": web.get("title", "")})
 
                     channel_breaker.record_success(channel_name)
-                    return enrich_search_urls({"text": text, "grounding_sources": sources})
+                    structured_payload = _parse_structured_payload(text, structured_mode)
+                    result = {
+                        "text": _render_p7_structured_text(structured_payload)
+                        if structured_payload and structured_mode == P7_STRUCTURED_MODE
+                        else text,
+                        "grounding_sources": sources,
+                    }
+                    if structured_payload:
+                        result["structured"] = structured_payload
+                        result["raw_text"] = text
+                    return enrich_search_urls(result)
                 except requests.exceptions.ConnectTimeout:
                     channel_breaker.record_failure(channel_name)
                     logging.warning(f"[{category}] connect timeout on {channel_name}")

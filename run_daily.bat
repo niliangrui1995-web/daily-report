@@ -8,6 +8,8 @@ set "APP_DIR="
 set "PYTHON_EXE=%ROOT_DIR%.venv\Scripts\python.exe"
 if not defined RUN_DAILY_HOLD_SECONDS set "RUN_DAILY_HOLD_SECONDS=15"
 if not defined RUN_DAILY_PREFLIGHT set "RUN_DAILY_PREFLIGHT=off"
+if not defined RUN_DAILY_AUTO_RESUME set "RUN_DAILY_AUTO_RESUME=on"
+if not defined RUN_DAILY_RESUME_DELAY_SECONDS set "RUN_DAILY_RESUME_DELAY_SECONDS=10"
 
 for /d %%D in ("%ROOT_DIR%*") do (
     if exist "%%~fD\pipeline_cli.py" (
@@ -46,12 +48,18 @@ if errorlevel 1 (
     goto :hold
 )
 
+set "PRIMARY_COMMAND=run"
 if "%~1"=="" (
     "%PYTHON_EXE%" -u "%APP_DIR%\pipeline_cli.py" run
 ) else (
+    set "PRIMARY_COMMAND=%~1"
     "%PYTHON_EXE%" -u "%APP_DIR%\pipeline_cli.py" %*
 )
 set "EXIT_CODE=%errorlevel%"
+
+if not "%EXIT_CODE%"=="0" (
+    call :maybe_auto_resume
+)
 
 popd
 echo.
@@ -90,6 +98,32 @@ if /I "%PREFLIGHT_MODE%"=="preflight" set "PREFLIGHT_COMMAND=preflight"
 echo [%date% %time%] Preflight: %PREFLIGHT_COMMAND%
 "%PYTHON_EXE%" -u "%APP_DIR%\pipeline_cli.py" %PREFLIGHT_COMMAND%
 exit /b %errorlevel%
+
+:maybe_auto_resume
+if /I not "%PRIMARY_COMMAND%"=="run" exit /b 0
+if /I "%RUN_DAILY_AUTO_RESUME%"=="0" exit /b 0
+if /I "%RUN_DAILY_AUTO_RESUME%"=="off" exit /b 0
+if /I "%RUN_DAILY_AUTO_RESUME%"=="false" exit /b 0
+if /I "%RUN_DAILY_AUTO_RESUME%"=="skip" exit /b 0
+if "%EXIT_CODE%"=="2" exit /b 0
+
+echo.
+echo [WARN] Initial run failed with code: %EXIT_CODE%
+echo [INFO] Auto-resume will retry once in %RUN_DAILY_RESUME_DELAY_SECONDS% seconds...
+if not "%RUN_DAILY_RESUME_DELAY_SECONDS%"=="0" (
+    powershell -NoProfile -Command "Start-Sleep -Seconds %RUN_DAILY_RESUME_DELAY_SECONDS%" >nul 2>&1
+)
+
+"%PYTHON_EXE%" -u "%APP_DIR%\pipeline_cli.py" resume
+set "RESUME_EXIT_CODE=%errorlevel%"
+if "%RESUME_EXIT_CODE%"=="0" (
+    echo [OK] Auto-resume completed successfully.
+    set "EXIT_CODE=0"
+) else (
+    echo [ERROR] Auto-resume failed with code: %RESUME_EXIT_CODE%
+    set "EXIT_CODE=%RESUME_EXIT_CODE%"
+)
+exit /b 0
 
 :merge_no_proxy
 set "MERGED_NO_PROXY="

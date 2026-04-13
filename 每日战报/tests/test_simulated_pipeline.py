@@ -4,6 +4,7 @@
 import json
 import os
 import struct
+import subprocess
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -75,6 +76,66 @@ class TestScheduledLauncherSimulation:
         assert cmd[1].endswith("pipeline_cli.py")
         assert cmd[2] == "run"
         assert captured["result"].cwd.endswith("每日战报")
+
+
+class TestRunDailyBatchSimulation:
+    def test_run_daily_auto_resumes_once_after_failed_run(self, tmp_path):
+        if os.name != "nt":
+            return
+
+        source_batch = Path(__file__).resolve().parents[2] / "run_daily.bat"
+        batch_path = tmp_path / "run_daily.bat"
+        batch_path.write_text(source_batch.read_text(encoding="utf-8"), encoding="utf-8")
+
+        real_python = Path(sys.executable)
+        fake_python = tmp_path / ".venv" / "Scripts" / "python.exe"
+        fake_python.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fake_python.symlink_to(real_python)
+        except (NotImplementedError, OSError):
+            return
+
+        app_dir = tmp_path / "app"
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "pipeline_cli.py").write_text(
+            (
+                "import json\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "\n"
+                "state = Path(__file__).with_name('calls.json')\n"
+                "calls = json.loads(state.read_text(encoding='utf-8')) if state.exists() else []\n"
+                "command = sys.argv[1] if len(sys.argv) > 1 else 'run'\n"
+                "calls.append(command)\n"
+                "state.write_text(json.dumps(calls), encoding='utf-8')\n"
+                "if command == 'run':\n"
+                "    raise SystemExit(1)\n"
+                "if command == 'resume':\n"
+                "    print('resume ok')\n"
+                "    raise SystemExit(0)\n"
+                "print(command)\n"
+            ),
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env["RUN_DAILY_HOLD_SECONDS"] = "0"
+        env["RUN_DAILY_PREFLIGHT"] = "off"
+        env["RUN_DAILY_AUTO_RESUME"] = "on"
+
+        result = subprocess.run(
+            [str(batch_path)],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        calls = json.loads((app_dir / "calls.json").read_text(encoding="utf-8"))
+        assert result.returncode == 0
+        assert calls == ["run", "resume"]
+        assert "Auto-resume completed successfully." in result.stdout
 
 
 class TestP8AndP9Simulation:

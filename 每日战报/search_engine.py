@@ -242,17 +242,27 @@ def _build_search_prompt(
     *,
     structured_mode: str | None = None,
 ) -> str:
-    hours = parse_backtrack_hours(backtrack, default=24)
-    if hours <= 72:
+    hours = parse_backtrack_hours(backtrack, default=0)
+    # Why: 深度研究和补充搜索不需要时间窗口限制，只有新闻采集(P1/P3)才需要
+    #      backtrack 为空或 0 时表示不限制时间，让模型自由搜索所有相关信息
+    if hours <= 0:
+        window_policy = (
+            "Search window: no time restriction. "
+            "Search all available information regardless of publication date."
+        )
+        backtrack_label = "unlimited"
+    elif hours <= 72:
         window_policy = (
             f"Search window: focus on the last {hours} hours. "
             "Discard older items unless they are required to explain the direct cause."
         )
+        backtrack_label = backtrack
     else:
         window_policy = (
             f"Search window: prioritize the last 72 hours, but allow up to the last {hours} hours "
             "for background, precedent, and named-entity context."
         )
+        backtrack_label = backtrack
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     if structured_mode == P7_STRUCTURED_MODE:
         return (
@@ -260,7 +270,7 @@ def _build_search_prompt(
             "You are an AI industry-chain researcher. Search the topic below and return only grounded facts.\n"
             f"Topic: {query}\n"
             f"Category: {category}\n"
-            f"Search window: {backtrack}\n"
+            f"Search window: {backtrack_label}\n"
             f"{window_policy}\n"
             "Return a JSON object only. Do not wrap it in markdown.\n"
             "The JSON must contain: summary, claims, entities, dates, implications, open_questions, coverage_flags.\n"
@@ -277,7 +287,7 @@ def _build_search_prompt(
         "You are an AI industry-chain researcher. Search the topic below and return only grounded facts.\n"
         f"Topic: {query}\n"
         f"Category: {category}\n"
-        f"Search window: {backtrack}\n"
+        f"Search window: {backtrack_label}\n"
         f"{window_policy}\n"
         "Output format: 1. [Entity] factual statement [Source: URL | date]\n"
         "If nothing is found, say \"not found\". Do not fabricate."
@@ -340,9 +350,9 @@ def _post_search_request(
         "temperature": temperature,
         "maxOutputTokens": 8192,
     }
-    if response_json_schema:
-        generation_config["responseMimeType"] = "application/json"
-        generation_config["responseJsonSchema"] = response_json_schema
+    # Why: Google Search grounding（googleSearch 工具）和 JSON 结构化输出互斥。
+    #      同时传 responseJsonSchema + googleSearch 会返回 400 Bad Request。
+    #      P7 结构化模式改为在 prompt 中要求 JSON，拿到纯文本后用代码解析。
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "tools": [{"googleSearch": {}}],

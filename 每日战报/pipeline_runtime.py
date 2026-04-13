@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import multiprocessing
 import os
+import tempfile
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -83,6 +85,7 @@ def run_stage_registry(
 
 def _run_single_stage(stage: StageSpec, context: dict[str, Any]) -> None:
     attempts = max(stage.retry_limit, 0) + 1
+    context["current_stage"] = stage.name
 
     for attempt in range(1, attempts + 1):
         started_at = time.time()
@@ -171,20 +174,49 @@ def _execute_stage_handler(stage: StageSpec, context: dict[str, Any]) -> None:
 
     updated_context = runtime_result.get("context")
     if isinstance(updated_context, dict):
-        context.clear()
+        # Why: 用 update 而非 clear+update，保留主进程中不可 JSON 序列化的字段
+        #      （如 datetime 对象），子进程落盘时会跳过这些字段
         context.update(updated_context)
 
 
 def _run_stage_in_subprocess(stage: StageSpec, context: dict[str, Any]) -> dict[str, Any]:
+    """在子进程中执行 stage handler，通过临时文件传递结果。
+
+    Why: multiprocessing.Queue 底层基于管道(pipe)，Windows 管道缓冲区仅 64KB。
+         当 context 数据量超过缓冲区时（如 71h 回溯窗口下 354 篇文章 ~500KB+），
+         子进程 queue.put() 会阻塞等主进程 get() 腾空间，而主进程在 process.join()
+         里等子进程退出 → 经典互等死锁。
+         改用临时文件传递 context：Queue 只传几十字节的文件路径，永远不会阻塞管道。
+    """
     mp_context = multiprocessing.get_context("spawn")
+    # Why: Queue 只传极小的状态信号和文件路径，不传 context 数据本身
     result_queue: multiprocessing.queues.Queue = mp_context.Queue(maxsize=1)
+
+    # Why: 在主进程侧创建临时文件路径，子进程往里写，主进程从里读
+    tmp_dir = tempfile.gettempdir()
+    result_file_path = os.path.join(tmp_dir, f"vcp_stage_{stage.name}_{os.getpid()}.json")
+
     process = mp_context.Process(
         target=_stage_process_entrypoint,
-        args=(stage, context, result_queue),
+        args=(stage, context, result_queue, result_file_path),
         name=f"stage-{stage.name}",
     )
     process.start()
-    process.join(stage.timeout_seconds)
+
+    # Why: 先尝试非阻塞读取 Queue（Python 文档建议 drain queue before join），
+    #      防止子进程因 put() 阻塞而无法退出
+    result_signal: dict[str, Any] | None = None
+    deadline = time.time() + (stage.timeout_seconds or 900)
+    while process.is_alive() and time.time() < deadline:
+        try:
+            result_signal = result_queue.get(timeout=2.0)
+            break
+        except Exception:
+            continue
+
+    # Why: Queue 已经读取（或超时），现在安全地等待子进程退出
+    remaining_timeout = max(0.1, deadline - time.time())
+    process.join(timeout=min(remaining_timeout, 30))
 
     if process.is_alive():
         logging.error(
@@ -198,19 +230,24 @@ def _run_stage_in_subprocess(stage: StageSpec, context: dict[str, Any]) -> dict[
         if process.is_alive():
             process.kill()
             process.join(timeout=5)
+        _cleanup_temp_file(result_file_path)
         return {"status": "timeout"}
 
-    result: dict[str, Any] | None = None
     try:
-        if not result_queue.empty():
-            result = result_queue.get_nowait()
-    except Exception:
-        result = None
-    finally:
         result_queue.close()
         result_queue.join_thread()
+    except Exception:
+        pass
 
-    if result is None:
+    # Why: 如果循环中没读到信号，再做一次最终尝试
+    if result_signal is None:
+        try:
+            result_signal = result_queue.get_nowait()
+        except Exception:
+            result_signal = None
+
+    if result_signal is None:
+        _cleanup_temp_file(result_file_path)
         if process.exitcode == 0:
             return {"status": "success", "context": context}
         return {
@@ -218,18 +255,70 @@ def _run_stage_in_subprocess(stage: StageSpec, context: dict[str, Any]) -> dict[
             "error": f"stage subprocess exited unexpectedly with code={process.exitcode}",
         }
 
-    return result
+    status = result_signal.get("status", "error")
+
+    if status == "error":
+        _cleanup_temp_file(result_file_path)
+        return result_signal
+
+    # Why: 从临时文件读取完整 context，这比通过管道传输安全得多
+    updated_context = _read_context_from_file(result_file_path)
+    if updated_context is not None:
+        return {"status": "success", "context": updated_context}
+    else:
+        # Why: 文件读取失败时降级为使用入参 context（handler 已完成，数据通过 manifest 持久化了）
+        logging.warning("[control] stage %s: 临时文件读取失败，使用原始 context 降级", stage.name)
+        return {"status": "success", "context": context}
+
+
+def _read_context_from_file(file_path: str) -> dict[str, Any] | None:
+    """从临时文件读取子进程序列化的 context。"""
+    try:
+        if not os.path.exists(file_path):
+            return None
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data
+    except Exception as exc:
+        logging.warning("[control] 读取临时 context 文件失败: %s", exc)
+        return None
+    finally:
+        _cleanup_temp_file(file_path)
+
+
+def _cleanup_temp_file(file_path: str) -> None:
+    """安全清理临时文件。"""
+    try:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception:
+        pass
 
 
 def _stage_process_entrypoint(
     stage: StageSpec,
     context: dict[str, Any],
     result_queue: multiprocessing.queues.Queue,
+    result_file_path: str,
 ) -> None:
+    """子进程入口：执行 handler，通过临时文件传递大型结果。
+
+    Why: Queue 只发送极小的信号 dict（状态 + traceback），
+         大型 context 数据写入临时文件由主进程读取，
+         避免管道缓冲区溢出导致的死锁。
+    """
     _configure_child_logging()
     try:
         stage.handler(context)
-        result_queue.put({"status": "success", "context": context})
+
+        # Why: 先落盘再发信号，确保主进程读到信号时文件已就绪
+        try:
+            _write_context_to_file(context, result_file_path)
+        except Exception as write_exc:
+            logging.warning("[control] 写入临时 context 文件失败: %s", write_exc)
+
+        # Why: 只通过 Queue 发送极小的状态信号 → 永远不会阻塞管道
+        result_queue.put({"status": "success"})
     except Exception as exc:
         result_queue.put(
             {
@@ -238,3 +327,26 @@ def _stage_process_entrypoint(
                 "traceback": traceback.format_exc(),
             }
         )
+
+
+def _write_context_to_file(context: dict[str, Any], file_path: str) -> None:
+    """将 context 序列化到临时文件。
+
+    Why: context 可能包含不可 JSON 序列化的对象（如 datetime），
+         需要做容错处理，丢弃不可序列化的字段比整体失败更好。
+    """
+    serializable_context = {}
+    for key, value in context.items():
+        try:
+            json.dumps(value, ensure_ascii=False)
+            serializable_context[key] = value
+        except (TypeError, ValueError):
+            # Why: 不可序列化的字段（如 datetime、handler 函数）跳过
+            #      这些字段在主进程原始 context 中仍然存在
+            if isinstance(value, str):
+                serializable_context[key] = value
+            else:
+                logging.debug("[control] context key '%s' 不可序列化，跳过", key)
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(serializable_context, f, ensure_ascii=False)

@@ -18,7 +18,9 @@ from artifact_store import (
     get_today_output_dir,
     load_run_manifest,
     set_preflight_summary,
+    update_run_manifest,
 )
+from agent_assistant import explain_preflight
 from pipeline_lock import PipelineLockError, acquire_run_lock, is_lock_stale, read_run_lock
 from pipeline_maintenance import clean_workspace, prune_outputs
 from settings import (
@@ -106,6 +108,10 @@ def _run_orchestrator(flags: list[str], *, command_name: str) -> int:
 
     preflight_result = _collect_preflight(strict=False)
     set_preflight_summary(preflight_result["summary"])
+    try:
+        explain_preflight_and_record(preflight_result)
+    except Exception:
+        pass
     configure_run_logging()
     try:
         with acquire_run_lock(command=command_name):
@@ -298,12 +304,43 @@ def _print_preflight(result: dict) -> int:
     return int(summary["exit_code"])
 
 
+def explain_preflight_and_record(result: dict) -> dict:
+    agent_result = explain_preflight(result)
+    status = "completed" if agent_result.get("ok") else "skipped"
+    update_run_manifest(
+        "agent_preflight",
+        status=status,
+        files={
+            key: value
+            for key, value in {
+                "json": agent_result.get("json_path", ""),
+                "md": agent_result.get("md_path", ""),
+            }.items()
+            if value
+        } or None,
+        metrics={
+            "ok": bool(agent_result.get("ok")),
+            "reason": agent_result.get("reason", ""),
+        },
+    )
+    return agent_result
+
+
+def _run_preflight_with_agent(strict: bool) -> int:
+    result = _collect_preflight(strict=strict)
+    exit_code = _print_preflight(result)
+    agent_result = explain_preflight_and_record(result)
+    if agent_result.get("json_path"):
+        print(f"Agent preflight artifact: {agent_result['json_path']}")
+    return exit_code
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
-    return _print_preflight(_collect_preflight(strict=bool(getattr(args, "strict", False))))
+    return _run_preflight_with_agent(strict=bool(getattr(args, "strict", False)))
 
 
 def cmd_preflight(_: argparse.Namespace) -> int:
-    return _print_preflight(_collect_preflight(strict=True))
+    return _run_preflight_with_agent(strict=True)
 
 
 def cmd_clean(args: argparse.Namespace) -> int:

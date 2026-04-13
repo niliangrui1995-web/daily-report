@@ -15,7 +15,9 @@ from artifact_store import extract_timestamp_from_name
 from settings import OUTPUT_DIR
 
 P7_TOPIC_PREFIX = "## \u6df1\u5ea6\u7814\u7a76\uff1a"
-ROUND_BACKTRACKS = ("72h", "168h", "720h")
+# Why: 深度研究是研究型搜索，不需要时间窗口限制
+#      空串传入 _build_search_prompt 会走 unlimited 模式
+ROUND_BACKTRACKS = ("", "", "")
 ROUND_HINTS = (
     "Prioritize the freshest event facts and named entities.",
     "Expand into chain transmission, winners, losers, and supplier or customer context.",

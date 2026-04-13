@@ -17,24 +17,10 @@ RUN_TIMESTAMP_ENV = "VCP_RUN_TS"
 PREFLIGHT_SUMMARY_ENV = "VCP_PREFLIGHT_SUMMARY_JSON"
 MANIFEST_FILENAME = "run_manifest.json"
 
-ARTIFACT_CATEGORIES = ("raw", "audit", "report", "metrics", "logs", "system")
-PREFIX_CATEGORY_RULES: list[tuple[str, str]] = [
-    ("Layer_ROI", "metrics"),
-    ("战报", "report"),
-    ("P9_Opus", "audit"),
-    ("P8_", "audit"),
-    ("P7.5_补充搜索原始数据", "raw"),
-    ("P7_研究计划", "system"),
-    ("P7a_", "audit"),
-    ("P7.5_", "audit"),
-    ("P7_", "audit"),
-    ("P6_", "audit"),
-    ("P5_", "audit"),
-    ("P4_", "raw"),
-    ("P3_", "raw"),
-    ("P2_", "raw"),
-    ("P1_", "raw"),
-]
+# Why: 核心管线产出（P1~P9、战报）平铺在日期根目录，一览无余
+#      辅助/元数据文件（Agent 诊断、Layer ROI）放 meta/ 子目录，避免干扰主视图
+#      日志放 logs/ 子目录（持续追加写入，混在一起不好找）
+ARTIFACT_CATEGORIES = ("logs", "meta")
 
 _MANIFEST_LOCK = threading.Lock()
 
@@ -61,9 +47,10 @@ def get_day_dir(day_dir: str | None = None) -> str:
 
 
 def get_day_subdir(name: str, *, day_dir: str | None = None) -> str:
-    if name not in ARTIFACT_CATEGORIES:
-        raise ValueError(f"unsupported artifact category: {name}")
-    return ensure_dir(os.path.join(get_day_dir(day_dir), name))
+    # Why: logs 和 meta 有子目录，其他所有产出物直接放日期根目录
+    if name in ("logs", "meta"):
+        return ensure_dir(os.path.join(get_day_dir(day_dir), name))
+    return get_day_dir(day_dir)
 
 
 def get_today_logs_dir() -> str:
@@ -79,10 +66,11 @@ def get_error_log_path() -> str:
 
 
 def infer_artifact_category(prefix: str) -> str:
-    for marker, category in PREFIX_CATEGORY_RULES:
-        if prefix.startswith(marker):
-            return category
-    return "raw"
+    # Why: Agent 诊断/预检/审校 和 Layer_ROI 是辅助元数据，放 meta/ 子目录
+    #      核心管线产出（P1~P9、战报）平铺在日期根目录
+    if prefix.startswith("Agent_") or prefix.startswith("Layer_ROI"):
+        return "meta"
+    return ""
 
 
 def extract_timestamp_from_name(text: str) -> str:
@@ -113,7 +101,8 @@ def build_artifact_path(
     ext = extension.lstrip(".")
     ts = timestamp or get_run_timestamp()
     artifact_category = category or infer_artifact_category(prefix)
-    target_dir = get_day_subdir(artifact_category)
+    # Why: meta 类文件走子目录，其他直接写日期根目录
+    target_dir = get_day_subdir(artifact_category) if artifact_category else get_day_dir()
     return os.path.join(target_dir, f"{prefix}_{ts}.{ext}")
 
 
@@ -144,7 +133,8 @@ def write_json_artifact(
 
 
 def get_manifest_path() -> str:
-    return os.path.join(get_day_dir(), MANIFEST_FILENAME)
+    # Why: run_manifest.json 属于辅助元数据，和 Agent/LayerROI 一起放 meta/ 子目录
+    return os.path.join(get_day_subdir("meta"), MANIFEST_FILENAME)
 
 
 def load_run_manifest() -> dict[str, Any]:

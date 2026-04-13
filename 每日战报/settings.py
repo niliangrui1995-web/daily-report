@@ -105,6 +105,10 @@ if not SEARCH_API_KEY_POOL:
 GEMINI_SEARCH_MODEL = 'gemini-2.5-flash'
 GEMINI_PRO_MODEL = 'gemini-3.1-pro-high'
 OPUS_MODEL = 'claude-opus-4-6-thinking'
+AGENT_ASSIST_ENABLED = os.environ.get('AGENT_ASSIST_ENABLED', '').strip().lower() in {'1', 'true', 'yes', 'on'}
+AGENT_ASSIST_MODEL = os.environ.get('AGENT_ASSIST_MODEL', '').strip()
+AGENT_ASSIST_BASE_URL = os.environ.get('AGENT_ASSIST_BASE_URL', '').strip()
+AGENT_ASSIST_API_KEY = os.environ.get('AGENT_ASSIST_API_KEY', '').strip()
 
 TAVILY_API_KEY = os.environ.get('TAVILY_API_KEY', '')
 GROK_API_KEY = os.environ.get('GROK_API_KEY', '')
@@ -146,6 +150,7 @@ def require_prompt(name: str) -> str:
 
 _pro_adapter = None
 _opus_adapter = None
+_agent_adapter = None
 
 def _get_pro_adapter():
     global _pro_adapter
@@ -160,6 +165,25 @@ def _get_opus_adapter():
         from native_llm_adapter import NativeLLMAdapter
         _opus_adapter = NativeLLMAdapter(model=OPUS_MODEL, base_url=ANTIGRAVITY_BASE_URL, api_key=ANTIGRAVITY_API_KEY, timeout=600.0, max_retries=5)
     return _opus_adapter
+
+
+def get_agent_adapter():
+    global _agent_adapter
+    if not AGENT_ASSIST_ENABLED:
+        return None
+    if not AGENT_ASSIST_MODEL:
+        logging.warning('⚠️ AGENT_ASSIST_ENABLED 已开启，但 AGENT_ASSIST_MODEL 未配置；跳过 Agent 助手。')
+        return None
+    if _agent_adapter is None:
+        from native_llm_adapter import NativeLLMAdapter
+        _agent_adapter = NativeLLMAdapter(
+            model=AGENT_ASSIST_MODEL,
+            base_url=AGENT_ASSIST_BASE_URL or ANTIGRAVITY_BASE_URL,
+            api_key=AGENT_ASSIST_API_KEY or ANTIGRAVITY_API_KEY,
+            timeout=180.0,
+            max_retries=2,
+        )
+    return _agent_adapter
 
 class _LazyAdapter:
     '''属性代理，兼容 `from settings import pro_adapter` 的直接使用方式。

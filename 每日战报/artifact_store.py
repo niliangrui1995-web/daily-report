@@ -5,7 +5,9 @@ import os
 import platform
 import re
 import sys
+import tempfile
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,12 +19,16 @@ RUN_TIMESTAMP_ENV = "VCP_RUN_TS"
 PREFLIGHT_SUMMARY_ENV = "VCP_PREFLIGHT_SUMMARY_JSON"
 MANIFEST_FILENAME = "run_manifest.json"
 
-# Why: 核心管线产出（P1~P9、战报）平铺在日期根目录，一览无余
-#      辅助/元数据文件（Agent 诊断、Layer ROI）放 meta/ 子目录，避免干扰主视图
-#      日志放 logs/ 子目录（持续追加写入，混在一起不好找）
-ARTIFACT_CATEGORIES = ("logs", "meta")
+ARTIFACT_CATEGORIES = ("logs", "meta", "agent")
 
-_MANIFEST_LOCK = threading.Lock()
+_MANIFEST_LOCK = threading.RLock()
+
+
+class ManifestLoadError(RuntimeError):
+    def __init__(self, path: str, error: Exception) -> None:
+        super().__init__(f"failed to load manifest '{path}': {error}")
+        self.path = path
+        self.error = error
 
 
 def ensure_dir(path: str) -> str:
@@ -47,8 +53,7 @@ def get_day_dir(day_dir: str | None = None) -> str:
 
 
 def get_day_subdir(name: str, *, day_dir: str | None = None) -> str:
-    # Why: logs 和 meta 有子目录，其他所有产出物直接放日期根目录
-    if name in ("logs", "meta"):
+    if name in ARTIFACT_CATEGORIES:
         return ensure_dir(os.path.join(get_day_dir(day_dir), name))
     return get_day_dir(day_dir)
 
@@ -66,9 +71,9 @@ def get_error_log_path() -> str:
 
 
 def infer_artifact_category(prefix: str) -> str:
-    # Why: Agent 诊断/预检/审校 和 Layer_ROI 是辅助元数据，放 meta/ 子目录
-    #      核心管线产出（P1~P9、战报）平铺在日期根目录
-    if prefix.startswith("Agent_") or prefix.startswith("Layer_ROI"):
+    if prefix.startswith("Agent_"):
+        return "agent"
+    if prefix.startswith("Layer_ROI"):
         return "meta"
     return ""
 
@@ -101,7 +106,6 @@ def build_artifact_path(
     ext = extension.lstrip(".")
     ts = timestamp or get_run_timestamp()
     artifact_category = category or infer_artifact_category(prefix)
-    # Why: meta 类文件走子目录，其他直接写日期根目录
     target_dir = get_day_subdir(artifact_category) if artifact_category else get_day_dir()
     return os.path.join(target_dir, f"{prefix}_{ts}.{ext}")
 
@@ -133,44 +137,158 @@ def write_json_artifact(
 
 
 def get_manifest_path() -> str:
-    # Why: run_manifest.json 属于辅助元数据，和 Agent/LayerROI 一起放 meta/ 子目录
+    return os.path.join(get_day_dir(), MANIFEST_FILENAME)
+
+
+def _get_legacy_manifest_path() -> str:
     return os.path.join(get_day_subdir("meta"), MANIFEST_FILENAME)
 
 
-def load_run_manifest() -> dict[str, Any]:
-    path = get_manifest_path()
+def _build_default_manifest(run_ts: str | None = None) -> dict[str, Any]:
+    return {
+        "run_timestamp": run_ts or get_run_timestamp(),
+        "updated_at": "",
+        "stages": {},
+        "runtime_context": {},
+        "preflight": {},
+        "manifest_version": 3,
+    }
+
+
+def _normalize_manifest(data: dict[str, Any], *, run_ts: str | None = None) -> dict[str, Any]:
+    data.setdefault("run_timestamp", run_ts or get_run_timestamp())
+    data.setdefault("updated_at", "")
+    data.setdefault("stages", {})
+    data.setdefault("runtime_context", {})
+    data.setdefault("preflight", {})
+    data.setdefault("manifest_version", 3)
+    return data
+
+
+def _lock_manifest_handle(handle) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_manifest_handle(handle) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _manifest_file_lock():
+    lock_path = f"{get_manifest_path()}.lock"
+    with open(lock_path, "a+b") as handle:
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _lock_manifest_handle(handle)
+        try:
+            yield
+        finally:
+            _unlock_manifest_handle(handle)
+
+
+def _resolve_manifest_read_path() -> str:
+    manifest_path = get_manifest_path()
+    if os.path.exists(manifest_path):
+        return manifest_path
+
+    legacy_path = _get_legacy_manifest_path()
+    if os.path.exists(legacy_path):
+        return legacy_path
+
+    return manifest_path
+
+
+def _load_manifest_from_path(path: str, *, run_ts: str | None = None) -> dict[str, Any]:
     if not os.path.exists(path):
-        return {
-            "run_timestamp": get_run_timestamp(),
-            "updated_at": "",
-            "stages": {},
-            "runtime_context": {},
-            "preflight": {},
-            "manifest_version": 3,
-        }
+        return _build_default_manifest(run_ts)
 
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError("manifest root is not a dict")
-        data.setdefault("run_timestamp", get_run_timestamp())
-        data.setdefault("updated_at", "")
-        data.setdefault("stages", {})
-        data.setdefault("runtime_context", {})
-        data.setdefault("preflight", {})
-        data.setdefault("manifest_version", 3)
-        return data
-    except Exception:
-        return {
-            "run_timestamp": get_run_timestamp(),
-            "updated_at": datetime.now().isoformat(),
-            "stages": {},
-            "runtime_context": {},
-            "preflight": {},
-            "manifest_version": 3,
-            "corrupt_manifest": True,
-        }
+    except Exception as exc:
+        raise ManifestLoadError(path, exc) from exc
+
+    if not isinstance(data, dict):
+        raise ManifestLoadError(path, ValueError("manifest root is not a dict"))
+
+    return _normalize_manifest(data, run_ts=run_ts)
+
+
+def _backup_corrupt_manifest(path: str) -> str:
+    if not path or not os.path.exists(path):
+        return ""
+
+    backup_path = f"{path}.corrupt.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    os.replace(path, backup_path)
+    return backup_path
+
+
+def _write_manifest_file(path: str, manifest: dict[str, Any]) -> None:
+    ensure_dir(os.path.dirname(path))
+    fd, temp_path = tempfile.mkstemp(prefix="manifest_", suffix=".json", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def _cleanup_legacy_manifest(current_path: str) -> None:
+    legacy_path = _get_legacy_manifest_path()
+    if legacy_path != current_path and os.path.exists(legacy_path):
+        os.remove(legacy_path)
+
+
+def _load_manifest_for_write(run_ts: str) -> dict[str, Any]:
+    source_path = _resolve_manifest_read_path()
+    try:
+        return _load_manifest_from_path(source_path, run_ts=run_ts)
+    except ManifestLoadError as exc:
+        backup_path = _backup_corrupt_manifest(exc.path)
+        manifest = _build_default_manifest(run_ts)
+        manifest["updated_at"] = datetime.now().isoformat()
+        manifest["corrupt_manifest"] = True
+        if backup_path:
+            manifest["corrupt_manifest_backup"] = backup_path
+        return manifest
+
+
+def load_run_manifest() -> dict[str, Any]:
+    with _MANIFEST_LOCK:
+        with _manifest_file_lock():
+            source_path = _resolve_manifest_read_path()
+            try:
+                return _load_manifest_from_path(source_path)
+            except ManifestLoadError as exc:
+                manifest = _build_default_manifest()
+                manifest["updated_at"] = datetime.now().isoformat()
+                manifest["corrupt_manifest"] = True
+                manifest["corrupt_manifest_path"] = exc.path
+                return manifest
 
 
 def update_run_manifest(
@@ -185,24 +303,25 @@ def update_run_manifest(
     manifest_path = get_manifest_path()
 
     with _MANIFEST_LOCK:
-        manifest = load_run_manifest()
-        manifest["run_timestamp"] = run_ts
-        manifest["updated_at"] = datetime.now().isoformat()
-        manifest["manifest_version"] = 3
+        with _manifest_file_lock():
+            manifest = _load_manifest_for_write(run_ts)
+            manifest["run_timestamp"] = run_ts
+            manifest["updated_at"] = datetime.now().isoformat()
+            manifest["manifest_version"] = 3
 
-        stages = manifest.setdefault("stages", {})
-        stage_payload = stages.setdefault(stage, {})
-        stage_payload["status"] = status
-        stage_payload["updated_at"] = datetime.now().isoformat()
-        stage_payload["run_timestamp"] = run_ts
+            stages = manifest.setdefault("stages", {})
+            stage_payload = stages.setdefault(stage, {})
+            stage_payload["status"] = status
+            stage_payload["updated_at"] = datetime.now().isoformat()
+            stage_payload["run_timestamp"] = run_ts
 
-        if files:
-            stage_payload.setdefault("files", {}).update(files)
-        if metrics:
-            stage_payload.setdefault("metrics", {}).update(metrics)
+            if files:
+                stage_payload.setdefault("files", {}).update(files)
+            if metrics:
+                stage_payload.setdefault("metrics", {}).update(metrics)
 
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
+            _write_manifest_file(manifest_path, manifest)
+            _cleanup_legacy_manifest(manifest_path)
 
     return manifest_path
 
@@ -247,18 +366,19 @@ def update_manifest_context(
     manifest_path = get_manifest_path()
 
     with _MANIFEST_LOCK:
-        manifest = load_run_manifest()
-        manifest["run_timestamp"] = run_ts
-        manifest["updated_at"] = datetime.now().isoformat()
-        manifest["manifest_version"] = 3
+        with _manifest_file_lock():
+            manifest = _load_manifest_for_write(run_ts)
+            manifest["run_timestamp"] = run_ts
+            manifest["updated_at"] = datetime.now().isoformat()
+            manifest["manifest_version"] = 3
 
-        if runtime_context:
-            manifest.setdefault("runtime_context", {}).update(runtime_context)
-        if preflight is not None:
-            manifest["preflight"] = preflight
+            if runtime_context:
+                manifest.setdefault("runtime_context", {}).update(runtime_context)
+            if preflight is not None:
+                manifest["preflight"] = preflight
 
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
+            _write_manifest_file(manifest_path, manifest)
+            _cleanup_legacy_manifest(manifest_path)
 
     return manifest_path
 

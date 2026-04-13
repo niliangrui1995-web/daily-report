@@ -199,6 +199,7 @@ class NativeLLMAdapter(RunnableSerializable):
 
     def invoke(self, messages: Any, config: Any = None) -> Any:
         system_prompt, user_prompt = self._parse_messages(messages)
+        _ = config
 
         if self._tools_prompt:
             system_prompt = system_prompt + self._tools_prompt

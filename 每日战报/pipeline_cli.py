@@ -294,14 +294,15 @@ def _print_preflight(result: dict) -> int:
     for item in result["checks"]:
         print(_format_check_line(item["name"], item["ok"], item["detail"], item["severity"]))
 
-    summary = result["summary"]
+    summary = result.get("summary", {})
     status = "PASS" if summary["exit_code"] == EXIT_OK else "FAIL"
-    strict_label = "strict" if result["strict"] else "normal"
+    strict_label = "strict" if result.get("strict", False) else "normal"
     print(
-        f"[SUMMARY] status={status} mode={strict_label} total={summary['total']} "
-        f"failed={summary['failed']} warnings={summary['warnings']} exit_code={summary['exit_code']}"
+        f"[SUMMARY] status={status} mode={strict_label} total={summary.get('total', 0)} "
+        f"failed={summary.get('failed', 0)} warnings={summary.get('warnings', 0)} "
+        f"exit_code={summary.get('exit_code', EXIT_CHECK_FAILED)}"
     )
-    return int(summary["exit_code"])
+    return int(summary.get("exit_code", EXIT_CHECK_FAILED))
 
 
 def explain_preflight_and_record(result: dict) -> dict:
@@ -330,6 +331,22 @@ def _run_preflight_with_agent(strict: bool) -> int:
     result = _collect_preflight(strict=strict)
     exit_code = _print_preflight(result)
     agent_result = explain_preflight_and_record(result)
+    update_run_manifest(
+        "agent_preflight",
+        status="completed" if agent_result.get("ok") else "skipped",
+        files={
+            key: value
+            for key, value in {
+                "json": agent_result.get("json_path", ""),
+                "md": agent_result.get("md_path", ""),
+            }.items()
+            if value
+        } or None,
+        metrics={
+            "ok": bool(agent_result.get("ok")),
+            "reason": agent_result.get("reason", ""),
+        },
+    )
     if agent_result.get("json_path"):
         print(f"Agent preflight artifact: {agent_result['json_path']}")
     return exit_code

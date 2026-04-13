@@ -267,16 +267,21 @@ import chinese_calendar
 
 ## 输出目录
 
-主输出仍保持兼容：
+当前输出布局如下：
 
 ```text
 每日热点输出/
   └── YYYYMMDD/
       ├── run_manifest.json
       ├── logs/
-      ├── checkpoint/
-      ├── output/
+      ├── agent/
+      ├── meta/
       └── 各阶段 md/json 产物
 ```
 
-本轮整改没有改动 `manifest` / `checkpoint` / `output` 的既有目录约定。
+说明：
+
+- `run_manifest.json` 固定在日期根目录
+- `logs/` 存放流水日志
+- `agent/` 存放预检解释、失败诊断、终稿审校等 Agent 产物
+- `meta/` 存放 `Layer_ROI` 等辅助元数据

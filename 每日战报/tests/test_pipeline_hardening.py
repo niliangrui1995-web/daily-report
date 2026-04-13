@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import time
@@ -149,6 +150,64 @@ class TestManifestContext:
         assert manifest["manifest_version"] == 3
         assert manifest["runtime_context"]["python_version"] == "3.12.0"
         assert manifest["preflight"]["exit_code"] == 0
+
+    def test_manifest_is_written_at_day_root_and_migrates_legacy_file(self, monkeypatch, tmp_path):
+        import artifact_store
+
+        monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+        legacy_dir = tmp_path / "meta"
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        legacy_path = legacy_dir / artifact_store.MANIFEST_FILENAME
+        legacy_path.write_text(
+            json.dumps(
+                {
+                    "run_timestamp": "20260413010101",
+                    "updated_at": "",
+                    "stages": {"p1": {"status": "completed"}},
+                    "runtime_context": {},
+                    "preflight": {},
+                    "manifest_version": 3,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        artifact_store.update_run_manifest("p2", status="completed", timestamp="20260413010101")
+
+        manifest_path = tmp_path / artifact_store.MANIFEST_FILENAME
+        assert manifest_path.exists()
+        assert not legacy_path.exists()
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["stages"]["p1"]["status"] == "completed"
+        assert manifest["stages"]["p2"]["status"] == "completed"
+
+
+class TestReportStage:
+    def test_stage_report_raises_when_report_is_empty(self, monkeypatch):
+        import orchestrator
+
+        monkeypatch.setattr(orchestrator, "p9_risk_analysis", lambda **kwargs: ("", ""))
+        monkeypatch.setattr(orchestrator, "send_report_email", lambda content, now_str="": {"ok": True, "status": "completed_no_email"})
+        monkeypatch.setattr(orchestrator, "_run_agent_report_review", lambda context: None)
+
+        with pytest.raises(RuntimeError, match="empty report"):
+            orchestrator._stage_report({})
+
+    def test_stage_report_raises_when_delivery_fails(self, monkeypatch):
+        import orchestrator
+
+        monkeypatch.setattr(orchestrator, "p9_risk_analysis", lambda **kwargs: ("# report", "20260413010101"))
+        monkeypatch.setattr(
+            orchestrator,
+            "send_report_email",
+            lambda content, now_str="": {"ok": False, "status": "completed_email_failed"},
+        )
+        monkeypatch.setattr(orchestrator, "_run_agent_report_review", lambda context: None)
+
+        with pytest.raises(RuntimeError, match="completed_email_failed"):
+            orchestrator._stage_report({})
 
 
 class TestPreflightChecks:

@@ -572,6 +572,23 @@ def _run_agent_failure_diagnosis(stage_name: str, exc: Exception) -> None:
     manifest = load_run_manifest()
     log_excerpt = _read_log_excerpt()
     result = diagnose_failure_and_record(stage_name, str(exc), manifest, log_excerpt=log_excerpt)
+    update_run_manifest(
+        "agent_diagnose",
+        status="completed" if result.get("ok") else "skipped",
+        files={
+            key: value
+            for key, value in {
+                "json": result.get("json_path", ""),
+                "md": result.get("md_path", ""),
+            }.items()
+            if value
+        } or None,
+        metrics={
+            "ok": bool(result.get("ok")),
+            "reason": result.get("reason", ""),
+            "stage": stage_name,
+        },
+    )
     if result.get("json_path"):
         logging.info("agent diagnosis artifact saved: %s", result["json_path"])
 
@@ -615,6 +632,23 @@ def _run_agent_report_review(context: dict[str, Any]) -> None:
         )
         return
     result = review_final_report_and_record(report_md, context)
+    update_run_manifest(
+        "agent_review",
+        status="completed" if result.get("ok") else "skipped",
+        files={
+            key: value
+            for key, value in {
+                "json": result.get("json_path", ""),
+                "md": result.get("md_path", ""),
+            }.items()
+            if value
+        } or None,
+        metrics={
+            "ok": bool(result.get("ok")),
+            "reason": result.get("reason", ""),
+            "report_chars": len(report_md),
+        },
+    )
     if result.get("json_path"):
         logging.info("agent review artifact saved: %s", result["json_path"])
 
@@ -637,14 +671,21 @@ def _stage_report(context: dict[str, Any]) -> None:
                 final_report, report_ts = future.result(timeout=600)
         except concurrent.futures.TimeoutError:
             logging.error("[P9] report generation timed out")
-            final_report, report_ts = "", ""
+            raise RuntimeError("report generation timed out") from None
         except Exception as exc:
             logging.error("[P9] report generation failed: %s", exc)
-            final_report, report_ts = "", ""
+            raise RuntimeError(f"report generation failed: {exc}") from exc
 
     context["final_report"] = final_report
     context["report_ts"] = report_ts
-    send_report_email(final_report, report_ts)
+
+    if not final_report or not final_report.strip():
+        raise RuntimeError("report generation returned an empty report")
+
+    delivery = send_report_email(final_report, report_ts)
+    if not delivery.get("ok"):
+        raise RuntimeError(f"report delivery failed: {delivery.get('status', 'unknown')}")
+
     _run_agent_report_review(context)
 
 

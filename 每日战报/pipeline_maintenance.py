@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -8,7 +7,7 @@ from pathlib import Path
 from artifact_store import get_output_root_dir
 
 CACHE_DIR_NAMES = {"__pycache__", ".pytest_cache", ".ruff_cache"}
-TRANSIENT_OUTPUT_DIRS = {"raw", "audit", "logs", "system"}
+TRANSIENT_OUTPUT_DIRS = {"raw", "audit", "logs", "system", "agent"}
 LEGACY_LOG_FILES = {"pipeline.log", "error.log"}
 
 

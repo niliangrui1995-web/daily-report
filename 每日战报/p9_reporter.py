@@ -9,11 +9,153 @@ from p9_rendering import build_report_markdown
 from settings import EMAIL_ADDRESS, EMAIL_PASSWORD, RECEIVER_EMAIL, opus_adapter, require_prompt
 from utils import extract_json_from_llm_response
 
+_HARD_EVIDENCE_LAYERS = {"P4", "P5", "P6", "P7", "P7A", "P8"}
+_SOFT_EVIDENCE_LAYERS = {"P2", "P3", "P7.5"}
+_PRIORITY_RANKS = {"★": 1.0, "★☆☆": 1.5, "★★": 2.0, "★★☆": 2.5, "★★★": 3.0}
+
 
 def _section_or_fallback(value: str | None, fallback: str) -> str:
     if value and len(value.strip()) > 50:
         return value.strip()
     return fallback
+
+
+def _normalize_layer_tag(ref: Any) -> str | None:
+    text = re.sub(r"\s+", "", str(ref or "")).upper()
+    if not text:
+        return None
+    if re.match(r"^P(?:7\.5|75)(?:[:：\-].*)?$", text):
+        return "P7.5"
+    if re.match(r"^P7A(?:[:：\-].*)?$", text):
+        return "P7A"
+    match = re.match(r"^(P[2-9])(?:[:：\-].*)?$", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _extract_evidence_layers(evidence_refs: Any) -> list[str]:
+    if not isinstance(evidence_refs, list):
+        if evidence_refs in (None, ""):
+            return []
+        evidence_refs = [evidence_refs]
+
+    layers: list[str] = []
+    seen: set[str] = set()
+    for ref in evidence_refs:
+        layer = _normalize_layer_tag(ref)
+        if not layer or layer in seen:
+            continue
+        seen.add(layer)
+        layers.append(layer)
+    return layers
+
+
+def _normalize_confidence_value(raw_value: Any) -> float | None:
+    if raw_value in (None, ""):
+        return None
+    try:
+        text = str(raw_value).strip()
+        is_percent = text.endswith("%")
+        value = float(text.rstrip("%"))
+        if is_percent or value > 1:
+            value /= 100.0
+        return max(0.0, min(value, 1.0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _confidence_cap_for_layers(layers: list[str]) -> float:
+    unique_count = len(layers)
+    hard_count = sum(1 for layer in layers if layer in _HARD_EVIDENCE_LAYERS)
+
+    if unique_count == 0:
+        return 0.55
+    if unique_count == 1:
+        return 0.60
+    if hard_count == 0:
+        return 0.68
+    if hard_count >= 2:
+        return 0.88
+    return 0.82
+
+
+def _downgrade_significance(significance: Any, confidence_cap: float) -> str | Any:
+    if significance in (None, "") or confidence_cap > 0.68:
+        return significance
+    text = str(significance).strip()
+    high_markers = ("高", "🟢", "🔥", "优先")
+    if any(marker in text for marker in high_markers):
+        return "🟡中"
+    return significance
+
+
+def _downgrade_priority(priority: Any, confidence_cap: float) -> str | Any:
+    if priority in (None, ""):
+        return priority
+
+    try:
+        current_rank = _PRIORITY_RANKS[str(priority)]
+    except KeyError:
+        return priority
+
+    max_rank = 3.0
+    if confidence_cap <= 0.60:
+        max_rank = _PRIORITY_RANKS["★★"]
+    elif confidence_cap <= 0.68:
+        max_rank = _PRIORITY_RANKS["★★☆"]
+
+    if current_rank <= max_rank:
+        return priority
+
+    for label, rank in sorted(_PRIORITY_RANKS.items(), key=lambda item: item[1], reverse=True):
+        if rank <= max_rank:
+            return label
+    return priority
+
+
+def _apply_evidence_guardrails(data: dict[str, Any]) -> tuple[dict[str, Any], dict[str, int]]:
+    metrics = {
+        "confidence_caps_applied": 0,
+        "priority_downgrades": 0,
+        "significance_downgrades": 0,
+    }
+
+    for item in data.get("core_signals", []) or []:
+        if not isinstance(item, dict):
+            continue
+        layers = _extract_evidence_layers(item.get("evidence_refs"))
+        confidence_cap = _confidence_cap_for_layers(layers)
+        confidence_value = _normalize_confidence_value(item.get("confidence"))
+        if confidence_value is not None:
+            capped = round(min(confidence_value, confidence_cap), 2)
+            if abs(capped - confidence_value) > 1e-9:
+                metrics["confidence_caps_applied"] += 1
+            item["confidence"] = capped
+
+        downgraded_significance = _downgrade_significance(item.get("significance"), confidence_cap)
+        if downgraded_significance != item.get("significance"):
+            metrics["significance_downgrades"] += 1
+            item["significance"] = downgraded_significance
+
+    for item in data.get("today_advice", []) or []:
+        if not isinstance(item, dict):
+            continue
+        layers = _extract_evidence_layers(item.get("evidence_refs"))
+        confidence_cap = _confidence_cap_for_layers(layers)
+        confidence_value = _normalize_confidence_value(item.get("confidence"))
+        if confidence_value is not None:
+            capped = round(min(confidence_value, confidence_cap), 2)
+            if abs(capped - confidence_value) > 1e-9:
+                metrics["confidence_caps_applied"] += 1
+            item["confidence"] = capped
+
+        downgraded_priority = _downgrade_priority(item.get("priority"), confidence_cap)
+        if downgraded_priority != item.get("priority"):
+            metrics["priority_downgrades"] += 1
+            item["priority"] = downgraded_priority
+
+    return data, metrics
 
 
 def p9_risk_analysis(
@@ -97,6 +239,9 @@ def p9_risk_analysis(
 
     try:
         data = extract_json_from_llm_response(raw_content, expect_type="dict")
+        data, guardrail_metrics = _apply_evidence_guardrails(data)
+        if any(guardrail_metrics.values()):
+            logging.info("[P9] applied evidence guardrails: %s", guardrail_metrics)
         result = build_report_markdown(data, today_str)
         logging.info("[P9] rendered markdown report (%s chars)", len(result))
 
@@ -109,7 +254,11 @@ def p9_risk_analysis(
                 "p9",
                 status="json_ready",
                 files=manifest_files,
-                metrics={"markdown_chars": len(result), "raw_output_chars": len(raw_content)},
+                metrics={
+                    "markdown_chars": len(result),
+                    "raw_output_chars": len(raw_content),
+                    **guardrail_metrics,
+                },
             )
         except Exception as exc:
             logging.error("[P9] failed to save report JSON: %s", exc)
@@ -117,7 +266,11 @@ def p9_risk_analysis(
                 "p9",
                 status="json_ready",
                 files={"thinking": out_fn} if out_fn else None,
-                metrics={"markdown_chars": len(result), "raw_output_chars": len(raw_content)},
+                metrics={
+                    "markdown_chars": len(result),
+                    "raw_output_chars": len(raw_content),
+                    **guardrail_metrics,
+                },
             )
 
         return result, run_ts

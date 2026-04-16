@@ -68,6 +68,81 @@ class TestSharedResearchGuardrail:
         assert "04-11" in guardrail
 
 
+class TestP3GroundingRecovery:
+    def test_parse_json_response_prefers_grounding_source_url(self):
+        import p3_agent
+
+        raw = """```json
+[
+  {
+    "title": "Policy update",
+    "source_url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/ABC123",
+    "source_name": "Example Source",
+    "track": "HBM",
+    "summary": "Grounded summary",
+    "signal_type": "jinnang_3"
+  }
+]
+```"""
+
+        items = p3_agent._parse_json_response(
+            raw,
+            bucket="jinnang_3",
+            grounding_sources=[{"url": "https://example.com/policy", "title": "Policy update"}],
+        )
+
+        assert len(items) == 1
+        assert items[0]["source_url"] == "https://example.com/policy"
+
+    def test_parse_json_response_recovers_multiline_source_url(self):
+        import p3_agent
+
+        raw = """```json
+[
+  {
+    "title": "Policy update",
+    "source_url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/ABC
+DEF",
+    "source_name": "Example Source",
+    "track": "HBM",
+    "summary": "Grounded summary",
+    "signal_type": "jinnang_3"
+  }
+]
+```"""
+
+        items = p3_agent._parse_json_response(
+            raw,
+            bucket="jinnang_3",
+            grounding_sources=[{"url": "https://example.com/policy", "title": "Policy update"}],
+        )
+
+        assert len(items) == 1
+        assert items[0]["source_url"] == "https://example.com/policy"
+
+    def test_parse_json_response_persists_raw_response_on_unrecoverable_failure(self, monkeypatch):
+        import p3_agent
+
+        captured = {}
+
+        def _fake_write_text_artifact(prefix, content, **kwargs):
+            captured["prefix"] = prefix
+            captured["content"] = content
+            return "mock-artifact.md"
+
+        monkeypatch.setattr(p3_agent, "write_text_artifact", _fake_write_text_artifact)
+
+        items = p3_agent._parse_json_response(
+            "not-json-at-all",
+            bucket="jinnang_3",
+            grounding_sources=[],
+        )
+
+        assert items == []
+        assert captured["prefix"].startswith("P3_raw_response")
+        assert captured["content"] == "not-json-at-all"
+
+
 class TestP9Rendering:
     def test_build_report_markdown_renders_confidence_and_evidence(self):
         from p9_rendering import build_report_markdown

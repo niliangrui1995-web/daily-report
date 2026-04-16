@@ -1,54 +1,273 @@
-"""
-P3 机动搜索引擎 — Gemini 2.5 联网搜索三锦囊。
-
-设计原理：
-  - P3 是纯 AI 搜索引擎，100% 依赖 Gemini 的联网搜索能力（Google Search Grounding）
-  - 不使用任何传统爬虫（无 Scrapling、无 requests 正文抓取）
-  - 三个锦囊各自独立，锦囊二/三可与 P1 并行启动，锦囊一需等 P1 完成后获取阵亡名单
-  - 输出不经过 P5 审计层（AI 精炼后的情报无需"AI 审计 AI"）
-  - 走 P2 的"VIP 快车道"，直接拼入 P6 输入
-
-连接方式：
-  - 复用 settings.py 的 Gemini Search 配置（直连 Google / CF Worker 双通道）
-  - 复用 search_engine.py 的 Key 轮换 + 熔断器机制
-
-【⚠️核心维护规则 / Agent 指令】
-1. P3 是专属于 Gemini Search Grounding 的“纯机动搜索引擎”，修改时严禁混入传统的 requests/Scrapling 静态爬虫逻辑（这是 P1 的活）。
-2. P3（包括三大锦囊）的输出由于已经是经过大模型精炼的摘要情报，绝不能流入 P5 参与由另一个模型裁决的“二次审查”，必须直接放行进入 P6。
-3. _call_gemini_search 里的通道切换和熔断机制（channel_breaker 和 rotator）是防死锁保命机制，严禁为了强行死磕而关闭超时截断。
-"""
+"""P3 机动情报：基于 Gemini Search Grounding 的并行情报采集。"""
 
 import concurrent.futures
 import json
 import logging
+import re
 import time
 from datetime import datetime
 
+from artifact_store import write_text_artifact
 from intel_structuring import normalize_p3_structured_items, render_p3_structured_markdown
+from search_engine import raw_gemini_search
 from settings import SEARCH_API_KEY_POOL, load_prompt
 from utils import extract_json_from_llm_response, parse_backtrack_hours
-from search_engine import raw_gemini_search
 
 PRIORITY_KEYWORDS = [
-    'NVDA', 'NVIDIA', 'nvidia', 'HBM', 'hbm', 'CoWoS', 'cowos', 'COWOS', '涨价', 'shortage', '缺货', '价格上涨', 'price hike', 'price increase', '短缺', 'supply shortage', 'undersupply', '封装', 'packaging', 'advanced packaging', '先进封装', '光模块', 'optical module', 'transceiver', '800G', '1.6T', '液冷', 'liquid cooling', 'cold plate', 'CDU', '产能', 'capacity', 'fab', 'foundry', '产线', '扩产', 'expansion', 'ramp up', '量产', '良率', 'yield', 'defect rate', 'TSMC', '台积电', 'tsmc', 'ASML', 'asml', 'EUV', 'SK Hynix', 'SK海力士', '海力士', 'Samsung', '三星', 'Micron', '美光', 'Broadcom', '博通', 'AVGO', 'AMD', 'amd', 'Intel', 'intel', '英特尔', 'Qualcomm', '高通', 'Apple', '苹果', 'Microsoft', '微软', 'Google', '谷歌', 'Meta', 'meta', 'PCB', 'CCL', '覆铜板', '铜箔', '光刻胶', 'photoresist', '靶材', 'target material', '电子气体', 'electronic gas', 'NF3', 'WF6', '探针卡', 'probe card', '测试', 'test', 'CPO', 'silicon photonics', '硅光', 'chiplet', '异构集成', 'Hybrid Bonding', 'hybrid bonding', '混合键合', 'ABF', '载板', 'substrate', 'financial results', 'earnings', 'revenue', 'guidance', '财报', '营收', '指引'
+    "NVDA",
+    "NVIDIA",
+    "nvidia",
+    "HBM",
+    "hbm",
+    "CoWoS",
+    "cowos",
+    "COWOS",
+    "涨价",
+    "shortage",
+    "缺货",
+    "价格上涨",
+    "price hike",
+    "price increase",
+    "短缺",
+    "supply shortage",
+    "undersupply",
+    "封装",
+    "packaging",
+    "advanced packaging",
+    "先进封装",
+    "光模块",
+    "optical module",
+    "transceiver",
+    "800G",
+    "1.6T",
+    "液冷",
+    "liquid cooling",
+    "cold plate",
+    "CDU",
+    "产能",
+    "capacity",
+    "fab",
+    "foundry",
+    "产线",
+    "扩产",
+    "expansion",
+    "ramp up",
+    "量产",
+    "良率",
+    "yield",
+    "defect rate",
+    "TSMC",
+    "台积电",
+    "tsmc",
+    "ASML",
+    "asml",
+    "EUV",
+    "SK Hynix",
+    "SK海力士",
+    "海力士",
+    "Samsung",
+    "三星",
+    "Micron",
+    "美光",
+    "Broadcom",
+    "博通",
+    "AVGO",
+    "AMD",
+    "amd",
+    "Intel",
+    "intel",
+    "英特尔",
+    "Qualcomm",
+    "高通",
+    "Apple",
+    "苹果",
+    "Microsoft",
+    "微软",
+    "Google",
+    "谷歌",
+    "Meta",
+    "meta",
+    "PCB",
+    "CCL",
+    "覆铜板",
+    "铜箔",
+    "光刻胶",
+    "photoresist",
+    "靶材",
+    "target material",
+    "电子气体",
+    "electronic gas",
+    "NF3",
+    "WF6",
+    "探针卡",
+    "probe card",
+    "测试",
+    "test",
+    "CPO",
+    "silicon photonics",
+    "硅光",
+    "chiplet",
+    "异构集成",
+    "Hybrid Bonding",
+    "hybrid bonding",
+    "混合键合",
+    "ABF",
+    "载板",
+    "substrate",
+    "financial results",
+    "earnings",
+    "revenue",
+    "guidance",
+    "财报",
+    "营收",
+    "指引",
 ]
 
 
-def _call_gemini_search(prompt: str, max_retries: int = 3) -> str:
-    return raw_gemini_search(prompt, max_retries=max_retries)
+def _call_gemini_search(prompt: str, max_retries: int = 3) -> dict:
+    result = raw_gemini_search(prompt, max_retries=max_retries, return_dict=True)
+    if isinstance(result, dict):
+        return {
+            "text": result.get("text", "") or "",
+            "grounding_sources": result.get("grounding_sources", []) or [],
+        }
+    return {"text": result or "", "grounding_sources": []}
 
 
-def _parse_json_response(raw_text: str) -> list[dict]:
+def _normalize_text_key(value: str) -> str:
+    return re.sub(r"\s+", "", (value or "").strip()).lower()
+
+
+def _sanitize_source_url(url: str) -> str:
+    return re.sub(r"\s+", "", (url or "").strip())
+
+
+def _repair_source_url_fields(raw_text: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        cleaned_url = _sanitize_source_url(match.group(2))
+        return f'{match.group(1)}{cleaned_url}{match.group(3)}'
+
+    return re.sub(r'("source_url"\s*:\s*")([^"]*)(")', _replace, raw_text, flags=re.DOTALL)
+
+
+def _should_replace_source_url(url: str) -> bool:
+    if not url:
+        return True
+    return "vertexaisearch.cloud.google.com/grounding-api-redirect/" in url.lower()
+
+
+def _match_grounding_source_url(
+    item: dict,
+    grounding_sources: list[dict],
+    *,
+    index: int,
+    total_items: int,
+) -> str:
+    if not grounding_sources:
+        return ""
+
+    item_title = _normalize_text_key(item.get("title", ""))
+    if item_title:
+        for source in grounding_sources:
+            source_title = _normalize_text_key(source.get("title", ""))
+            if source_title and (
+                item_title == source_title
+                or item_title in source_title
+                or source_title in item_title
+            ):
+                return _sanitize_source_url(source.get("url", ""))
+
+    if len(grounding_sources) == 1:
+        return _sanitize_source_url(grounding_sources[0].get("url", ""))
+
+    if total_items == len(grounding_sources) and index < len(grounding_sources):
+        return _sanitize_source_url(grounding_sources[index].get("url", ""))
+
+    return ""
+
+
+def _apply_grounding_sources(items: list[dict], grounding_sources: list[dict]) -> list[dict]:
+    normalized_items: list[dict] = []
+    total_items = len(items)
+
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+
+        normalized_item = dict(item)
+        cleaned_url = _sanitize_source_url(normalized_item.get("source_url", ""))
+        if _should_replace_source_url(cleaned_url):
+            matched_url = _match_grounding_source_url(
+                normalized_item,
+                grounding_sources,
+                index=index,
+                total_items=total_items,
+            )
+            normalized_item["source_url"] = matched_url or cleaned_url
+        else:
+            normalized_item["source_url"] = cleaned_url
+
+        normalized_items.append(normalized_item)
+
+    return normalized_items
+
+
+def _persist_raw_response(bucket: str, raw_text: str) -> None:
+    artifact_prefix = f"P3_raw_response_{bucket}" if bucket else "P3_raw_response"
+    artifact_path = write_text_artifact(artifact_prefix, raw_text)
+    logging.warning(
+        "[P3] failed to parse Gemini JSON for %s; raw response saved to %s",
+        bucket or "unknown",
+        artifact_path,
+    )
+
+
+def _parse_json_response(
+    raw_text: str,
+    *,
+    bucket: str = "",
+    grounding_sources: list[dict] | None = None,
+) -> list[dict]:
     if not raw_text:
         return []
+
+    grounding_sources = grounding_sources or []
+
     try:
-        result = extract_json_from_llm_response(raw_text, expect_type='list')
-        if isinstance(result, list):
-            return result
-        return []
+        result = extract_json_from_llm_response(raw_text, expect_type="list")
     except json.JSONDecodeError:
-        logging.warning(f'[P3] 无法从 Gemini 响应中解析出 JSON 数组，头200字符: {raw_text[:200]}')
-        return []
+        repaired_text = _repair_source_url_fields(raw_text)
+        if repaired_text == raw_text:
+            _persist_raw_response(bucket, raw_text)
+            return []
+        try:
+            result = extract_json_from_llm_response(repaired_text, expect_type="list")
+        except json.JSONDecodeError:
+            _persist_raw_response(bucket, raw_text)
+            return []
+
+    if isinstance(result, list):
+        return _apply_grounding_sources(result, grounding_sources)
+    return []
+
+
+def _parse_search_result(search_result: dict, bucket: str) -> list[dict]:
+    return _parse_json_response(
+        search_result.get("text", ""),
+        bucket=bucket,
+        grounding_sources=search_result.get("grounding_sources", []),
+    )
+
+
+def _format_failed_article_lines(targets: list[dict]) -> str:
+    lines = []
+    for index, target in enumerate(targets, 1):
+        lines.append(
+            f"{index}. 标题: {target.get('title', '未知')}\n"
+            f"   URL: {target.get('url', '未知')}\n"
+            f"   来源: {target.get('source', '未知')}"
+        )
+    return "\n".join(lines)
 
 
 def _filter_priority_targets(failed_urls: list[dict], max_targets: int = 10) -> list[dict]:
@@ -57,20 +276,24 @@ def _filter_priority_targets(failed_urls: list[dict], max_targets: int = 10) -> 
 
     scored_targets = []
     for item in failed_urls:
-        title = item.get('title', '')
-        score = sum(1 for kw in PRIORITY_KEYWORDS if kw in title)
+        title = item.get("title", "")
+        score = sum(1 for keyword in PRIORITY_KEYWORDS if keyword in title)
         if score > 0:
             scored_targets.append((item, score))
 
-    scored_targets.sort(key=lambda x: x[1], reverse=True)
+    scored_targets.sort(key=lambda row: row[1], reverse=True)
     selected = [item for item, _ in scored_targets[:max_targets]]
 
     if selected:
-        logging.info(f'  [P3 锦囊一] 从 {len(failed_urls)} 个阵亡链接中筛选出 {len(selected)} 个高价值目标')
+        logging.info(
+            "[P3 jinnang_1] selected %s high-value targets from %s failed urls",
+            len(selected),
+            len(failed_urls),
+        )
         return selected
 
-    logging.info(f'  [P3 锦囊一] {len(failed_urls)} 个阵亡链接中无高价值目标（未命中优先级关键词），跳过空袭')
-    return selected
+    logging.info("[P3 jinnang_1] no high-value failed url matched the priority keyword set")
+    return []
 
 
 def run_jinnang_1(failed_urls: list[dict]) -> list[dict]:
@@ -78,155 +301,152 @@ def run_jinnang_1(failed_urls: list[dict]) -> list[dict]:
     if not targets:
         return []
 
-    logging.info(f'🎯 [P3 锦囊一] 启动动态空袭：{len(targets)} 个高价值目标')
-
-    template = load_prompt('p3_jinnang1.txt')
-
-    article_lines = []
-    for i, target in enumerate(targets, 1):
-        article_lines.append(f"{i}. 标题：{target.get('title', '未知')}\n   URL：{target.get('url', '未知')}\n   来源：{target.get('source', '未知')}")
-
-    now_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
-    prompt = template.format(failed_articles='\n'.join(article_lines), current_time=now_str)
+    logging.info("[P3 jinnang_1] start recovery search for %s targets", len(targets))
+    template = load_prompt("p3_jinnang1.txt")
+    now_str = datetime.now().strftime("%Y年%m月%d日 北京时间%H:%M")
 
     all_results = []
-
     if len(targets) <= 5:
-        raw_text = _call_gemini_search(prompt)
-        all_results.extend(_parse_json_response(raw_text))
+        prompt = template.format(
+            failed_articles=_format_failed_article_lines(targets),
+            current_time=now_str,
+        )
+        search_result = _call_gemini_search(prompt)
+        all_results.extend(_parse_search_result(search_result, "jinnang_1"))
     else:
         mid = len(targets) // 2
-        for batch_idx, batch in enumerate([targets[:mid], targets[mid:]], 1):
-            batch_lines = []
-            for i, target in enumerate(batch, 1):
-                batch_lines.append(f"{i}. 标题：{target.get('title', '未知')}\n   URL：{target.get('url', '未知')}\n   来源：{target.get('source', '未知')}")
-
-            now_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
-            batch_prompt = template.format(failed_articles='\n'.join(batch_lines), current_time=now_str)
-            logging.info(f'  [锦囊一] 第 {batch_idx}/2 批空袭中...')
-            raw_text = _call_gemini_search(batch_prompt)
-            all_results.extend(_parse_json_response(raw_text))
-
-            if batch_idx == 1:
+        for batch_index, batch in enumerate([targets[:mid], targets[mid:]], 1):
+            prompt = template.format(
+                failed_articles=_format_failed_article_lines(batch),
+                current_time=now_str,
+            )
+            logging.info("[P3 jinnang_1] running batch %s/2", batch_index)
+            search_result = _call_gemini_search(prompt)
+            all_results.extend(_parse_search_result(search_result, "jinnang_1"))
+            if batch_index == 1:
                 time.sleep(2)
 
-    logging.info(f'✅ [P3 锦囊一] 空袭完成：抢救回 {len(all_results)} 条情报')
+    logging.info("[P3 jinnang_1] recovered %s items", len(all_results))
     return all_results
 
 
 def run_jinnang_2(hours: int = 24) -> list[dict]:
-    logging.info('🔭 [P3 锦囊二] 启动极客圈非共识扫雷...')
-    template = load_prompt('p3_jinnang2.txt')
-    now_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
+    logging.info("[P3 jinnang_2] start search")
+    template = load_prompt("p3_jinnang2.txt")
+    now_str = datetime.now().strftime("%Y年%m月%d日 北京时间%H:%M")
     prompt = template.format(hours=hours, current_time=now_str)
-    raw_text = _call_gemini_search(prompt)
-    results = _parse_json_response(raw_text)
-    logging.info(f'✅ [P3 锦囊二] 扫雷完成：发现 {len(results)} 条非共识信号')
+    search_result = _call_gemini_search(prompt)
+    results = _parse_search_result(search_result, "jinnang_2")
+    logging.info("[P3 jinnang_2] captured %s items", len(results))
     return results
 
 
 def run_jinnang_3(hours: int = 24) -> list[dict]:
-    logging.info('🌋 [P3 锦囊三] 启动产业链异动侦测...')
-    template = load_prompt('p3_jinnang3.txt')
-    now_str = datetime.now().strftime('%Y年%m月%d日 北京时间%H:%M')
+    logging.info("[P3 jinnang_3] start search")
+    template = load_prompt("p3_jinnang3.txt")
+    now_str = datetime.now().strftime("%Y年%m月%d日 北京时间%H:%M")
     prompt = template.format(hours=hours, current_time=now_str)
-    raw_text = _call_gemini_search(prompt)
-    results = _parse_json_response(raw_text)
-    logging.info(f'✅ [P3 锦囊三] 侦测完成：捕获 {len(results)} 条异动信号')
+    search_result = _call_gemini_search(prompt)
+    results = _parse_search_result(search_result, "jinnang_3")
+    logging.info("[P3 jinnang_3] captured %s items", len(results))
     return results
 
 
-def render_p3_output(raw_results: dict[str, list[dict]] | None, *, collected_at: str | None = None) -> tuple[str, list[dict]]:
+def render_p3_output(
+    raw_results: dict[str, list[dict]] | None,
+    *,
+    collected_at: str | None = None,
+) -> tuple[str, list[dict]]:
     structured_items = normalize_p3_structured_items(raw_results)
     if not structured_items:
-        return '', []
+        return "", []
     return (
         render_p3_structured_markdown(structured_items, collected_at=collected_at),
         structured_items,
     )
 
 
-def collect_p3_parallel_only(backtrack: str = '24h') -> tuple[str, dict]:
+def collect_p3_parallel_only(backtrack: str = "24h") -> tuple[str, dict]:
     start_time = time.time()
     stats = {
-        'source': 'P3 Gemini Search (parallel: jinnang 2+3)',
-        'status': 'pending',
-        'jinnang_1_count': 0,
-        'jinnang_2_count': 0,
-        'jinnang_3_count': 0,
-        'duration_seconds': 0,
-        'content_length': 0,
-        'structured_items': 0,
+        "source": "P3 Gemini Search (parallel: jinnang 2+3)",
+        "status": "pending",
+        "jinnang_1_count": 0,
+        "jinnang_2_count": 0,
+        "jinnang_3_count": 0,
+        "duration_seconds": 0,
+        "content_length": 0,
+        "structured_items": 0,
     }
 
     if not SEARCH_API_KEY_POOL:
-        logging.warning('⚠️ [P3] GEMINI_SEARCH_API_KEYS 未配置，跳过并行锦囊')
-        stats['status'] = 'skipped_no_key'
-        return '', stats
+        logging.warning("[P3] GEMINI_SEARCH_API_KEYS not configured, skip parallel search")
+        stats["status"] = "skipped_no_key"
+        return "", stats
 
-    logging.info('🚀 [P3] 启动并行锦囊（锦囊二 + 锦囊三）')
-
+    logging.info("[P3] start parallel search: jinnang_2 + jinnang_3")
     hours = parse_backtrack_hours(backtrack)
-
-    # Why: 必须在 try 之前初始化，否则两个 future 都抛异常时 UnboundLocalError 崩溃
-    jinnang_2_results = []
-    jinnang_3_results = []
+    jinnang_2_results: list[dict] = []
+    jinnang_3_results: list[dict] = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         future_2 = pool.submit(run_jinnang_2, hours)
         future_3 = pool.submit(run_jinnang_3, hours)
 
-        # Why: 各自独立 try-except，避免一个锦囊超时把另一个已成功的结果也一起丢弃
         try:
             jinnang_2_results = future_2.result(timeout=300)
         except concurrent.futures.TimeoutError:
-            logging.warning('[P3] 锦囊二超时（300s），降级为空结果')
+            logging.warning("[P3] jinnang_2 timed out after 300s")
             jinnang_2_results = []
-        except Exception as e:
-            logging.warning(f'[P3] 锦囊二异常: {e}')
+        except Exception as exc:
+            logging.warning("[P3] jinnang_2 failed: %s", exc)
             jinnang_2_results = []
 
         try:
             jinnang_3_results = future_3.result(timeout=300)
         except concurrent.futures.TimeoutError:
-            logging.warning('[P3] 锦囊三超时（300s），降级为空结果')
+            logging.warning("[P3] jinnang_3 timed out after 300s")
             jinnang_3_results = []
-        except Exception as e:
-            logging.warning(f'[P3] 锦囊三异常: {e}')
+        except Exception as exc:
+            logging.warning("[P3] jinnang_3 failed: %s", exc)
             jinnang_3_results = []
 
-    stats['jinnang_2_count'] = len(jinnang_2_results)
-    stats['jinnang_3_count'] = len(jinnang_3_results)
-
+    stats["jinnang_2_count"] = len(jinnang_2_results)
+    stats["jinnang_3_count"] = len(jinnang_3_results)
     elapsed = time.time() - start_time
-    stats['duration_seconds'] = round(elapsed, 1)
+    stats["duration_seconds"] = round(elapsed, 1)
 
     raw_results = {
-        'jinnang_1': [],
-        'jinnang_2': jinnang_2_results,
-        'jinnang_3': jinnang_3_results,
+        "jinnang_1": [],
+        "jinnang_2": jinnang_2_results,
+        "jinnang_3": jinnang_3_results,
     }
-    total = stats['jinnang_2_count'] + stats['jinnang_3_count']
+    total = stats["jinnang_2_count"] + stats["jinnang_3_count"]
     if total == 0:
-        stats['status'] = 'empty'
-        stats['raw_results'] = raw_results
-        return '', stats
+        stats["status"] = "empty"
+        stats["raw_results"] = raw_results
+        return "", stats
 
     formatted, structured_items = render_p3_output(raw_results)
-    stats['status'] = 'success'
-    stats['content_length'] = len(formatted)
-    stats['structured_items'] = len(structured_items)
-    stats['raw_results'] = raw_results
+    stats["status"] = "success"
+    stats["content_length"] = len(formatted)
+    stats["structured_items"] = len(structured_items)
+    stats["raw_results"] = raw_results
 
-    logging.info(f"✅ [P3 并行] 锦囊二 {stats['jinnang_2_count']} + 锦囊三 {stats['jinnang_3_count']} = 共 {total} 条, 耗时 {elapsed:.1f}s")
-
+    logging.info(
+        "[P3 parallel] jinnang_2=%s, jinnang_3=%s, total=%s, duration=%.1fs",
+        stats["jinnang_2_count"],
+        stats["jinnang_3_count"],
+        total,
+        elapsed,
+    )
     return formatted, stats
 
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    print("测试 P3 机动情报三锦囊（仅内部收集）...")
-    text, stats = collect_p3_parallel_only(backtrack='24h')
-    print(f"\n===== P3 输出 ({len(text)} 字) =====\n")
-    print(text[:2000] if text else "(空)")
-    print(f"\n统计: {json.dumps(stats, ensure_ascii=False, indent=2)}")
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    print("Testing P3 parallel search...")
+    text, stats = collect_p3_parallel_only(backtrack="24h")
+    print(f"\n===== P3 output ({len(text)} chars) =====\n")
+    print(text[:2000] if text else "(empty)")
+    print(f"\nStats: {json.dumps(stats, ensure_ascii=False, indent=2)}")

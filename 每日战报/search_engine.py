@@ -366,7 +366,25 @@ def _post_search_request(
     )
 
 
-def raw_gemini_search(prompt: str, max_retries: int = 3) -> str:
+def _extract_gemini_text_and_sources(data: dict) -> tuple[str, list[dict[str, str]]]:
+    candidates = data.get("candidates") or []
+    if not candidates:
+        return "", []
+
+    candidate = candidates[0]
+    text = candidate.get("content", {}).get("parts", [{}])[0].get("text", "")
+    grounding = candidate.get("groundingMetadata", {}).get("groundingChunks", [])
+
+    sources: list[dict[str, str]] = []
+    for chunk in grounding:
+        web = chunk.get("web", {})
+        if web and web.get("uri"):
+            sources.append({"url": web.get("uri"), "title": web.get("title", "")})
+
+    return text, sources
+
+
+def raw_gemini_search(prompt: str, max_retries: int = 3, *, return_dict: bool = False):
     channels = [("direct", search_rotator_direct), ("cf_worker", search_rotator_cf)]
 
     for channel_name, rotator in channels:
@@ -395,15 +413,15 @@ def raw_gemini_search(prompt: str, max_retries: int = 3) -> str:
 
                     response.raise_for_status()
                     data = response.json()
-                    candidates = data.get("candidates") or []
-                    if not candidates:
+                    text, sources = _extract_gemini_text_and_sources(data)
+                    if not text.strip():
+                        logging.warning(f"[raw_search] empty Gemini response on {channel_name}")
+                        time.sleep(3)
                         continue
-                    text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                    if text.strip():
-                        channel_breaker.record_success(channel_name)
-                        return text
-                    logging.warning(f"[raw_search] empty Gemini response on {channel_name}")
-                    time.sleep(3)
+                    channel_breaker.record_success(channel_name)
+                    if return_dict:
+                        return {"text": text, "grounding_sources": sources}
+                    return text
                 except requests.exceptions.ConnectTimeout:
                     channel_breaker.record_failure(channel_name)
                     logging.warning(f"[raw_search] connect timeout on {channel_name}")
@@ -420,12 +438,12 @@ def raw_gemini_search(prompt: str, max_retries: int = 3) -> str:
                     )
                     time.sleep(wait)
 
-    result = _tavily_fallback(prompt, category="raw_search", return_dict=False)
+    result = _tavily_fallback(prompt, category="raw_search", return_dict=return_dict)
     if result:
         return result
 
     logging.error("[raw_search] all search routes failed")
-    return ""
+    return {} if return_dict else ""
 
 
 @sleep_and_retry
@@ -469,19 +487,9 @@ def gemini_search(
 
                     response.raise_for_status()
                     data = response.json()
-                    candidates = data.get("candidates") or []
-                    if not candidates:
+                    text, sources = _extract_gemini_text_and_sources(data)
+                    if not text.strip():
                         return {}
-
-                    candidate = candidates[0]
-                    text = candidate.get("content", {}).get("parts", [{}])[0].get("text", "")
-                    grounding = candidate.get("groundingMetadata", {}).get("groundingChunks", [])
-
-                    sources = []
-                    for chunk in grounding:
-                        web = chunk.get("web", {})
-                        if web and web.get("uri"):
-                            sources.append({"url": web.get("uri"), "title": web.get("title", "")})
 
                     channel_breaker.record_success(channel_name)
                     structured_payload = _parse_structured_payload(text, structured_mode)

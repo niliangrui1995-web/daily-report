@@ -4,7 +4,7 @@ import subprocess
 import sys
 from datetime import date
 
-from trading_calendar import is_trading_day
+from run_config import get_schedule_decision
 
 
 def _configure_stdio() -> None:
@@ -28,8 +28,12 @@ logging.basicConfig(
 
 def main() -> None:
     today = date.today()
-    if not is_trading_day(today):
+    schedule = get_schedule_decision(today)
+    if not schedule["is_trading_day"]:
         logging.info("today is not a trading day, skip scheduled run")
+        raise SystemExit(0)
+    if not schedule["should_run"]:
+        logging.info("today is a skipped trading day by alternate schedule, skip run | %s", schedule["reason"])
         raise SystemExit(0)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))

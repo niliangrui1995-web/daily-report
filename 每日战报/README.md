@@ -169,9 +169,11 @@ python -m pytest 每日战报/tests -q
 
 默认行为：
 
-- 自动定位项目内 `pipeline_cli.py`
+- 自动定位项目内 `scheduled_launcher.py` / `pipeline_cli.py`
 - 使用 `.venv\Scripts\python.exe`
 - merge 现有 `NO_PROXY`，并补齐 `127.0.0.1,localhost,::1`
+- 默认启动走 `scheduled_launcher.py`，与计划运行使用同一条调度链
+- 如果 `scheduled_launcher.py` 缺失，自动回退到 `pipeline_cli.py run`
 - 运行结束后按 `RUN_DAILY_HOLD_SECONDS` 保持窗口
 
 可选环境变量：

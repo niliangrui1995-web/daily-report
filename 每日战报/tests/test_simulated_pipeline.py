@@ -56,7 +56,15 @@ class TestScheduledLauncherSimulation:
 
         captured = {}
 
-        monkeypatch.setattr(scheduled_launcher, "is_trading_day", lambda d: True)
+        monkeypatch.setattr(
+            scheduled_launcher,
+            "get_schedule_decision",
+            lambda d: {
+                "is_trading_day": True,
+                "should_run": True,
+                "reason": "ok",
+            },
+        )
         monkeypatch.setattr(
             scheduled_launcher.subprocess,
             "run",
@@ -76,6 +84,33 @@ class TestScheduledLauncherSimulation:
         assert cmd[1].endswith("pipeline_cli.py")
         assert cmd[2] == "run"
         assert captured["result"].cwd.endswith("每日战报")
+
+    def test_launcher_skips_non_update_trading_day(self, monkeypatch):
+        import scheduled_launcher
+
+        captured = {}
+
+        monkeypatch.setattr(
+            scheduled_launcher,
+            "get_schedule_decision",
+            lambda d: {
+                "is_trading_day": True,
+                "should_run": False,
+                "reason": "week_trading_day_index=2, schedule_rule=run_on_odd_trading_days",
+            },
+        )
+        monkeypatch.setattr(
+            scheduled_launcher.subprocess,
+            "run",
+            lambda cmd, cwd=None: captured.setdefault("called", True),
+        )
+
+        try:
+            scheduled_launcher.main()
+        except SystemExit as exc:
+            assert exc.code == 0
+
+        assert "called" not in captured
 
 
 class TestRunDailyBatchSimulation:
@@ -97,6 +132,19 @@ class TestRunDailyBatchSimulation:
 
         app_dir = tmp_path / "app"
         app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "scheduled_launcher.py").write_text(
+            (
+                "import json\n"
+                "from pathlib import Path\n"
+                "\n"
+                "state = Path(__file__).with_name('calls.json')\n"
+                "calls = json.loads(state.read_text(encoding='utf-8')) if state.exists() else []\n"
+                "calls.append('run')\n"
+                "state.write_text(json.dumps(calls), encoding='utf-8')\n"
+                "raise SystemExit(1)\n"
+            ),
+            encoding="utf-8",
+        )
         (app_dir / "pipeline_cli.py").write_text(
             (
                 "import json\n"
@@ -229,6 +277,30 @@ class TestP8AndP9Simulation:
 
 
 class TestOrchestratorSimulation:
+    def test_orchestrator_skips_non_update_trading_day(self, monkeypatch):
+        import orchestrator
+
+        captured = {}
+
+        monkeypatch.setattr(
+            orchestrator,
+            "get_schedule_decision",
+            lambda day: {
+                "is_trading_day": True,
+                "should_run": False,
+                "reason": "week_trading_day_index=2, schedule_rule=run_on_odd_trading_days",
+            },
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "detect_checkpoint",
+            lambda: captured.setdefault("detect_checkpoint_called", True),
+        )
+
+        orchestrator.orchestrator_main([])
+
+        assert "detect_checkpoint_called" not in captured
+
     def test_orchestrator_main_runs_full_pipeline_offline(self, monkeypatch, tmp_path):
         out_dir = _patch_output_dir(monkeypatch, tmp_path)
         monkeypatch.setenv("VCP_STAGE_EXECUTION_MODE", "inline")
@@ -237,7 +309,15 @@ class TestOrchestratorSimulation:
         import orchestrator
         import p9_reporter
 
-        monkeypatch.setattr(orchestrator, "is_trading_day", lambda day: True)
+        monkeypatch.setattr(
+            orchestrator,
+            "get_schedule_decision",
+            lambda day: {
+                "is_trading_day": True,
+                "should_run": True,
+                "reason": "ok",
+            },
+        )
         monkeypatch.setattr(orchestrator, "detect_checkpoint", lambda: {"stage": "none", "files": {}, "run_timestamp": ""})
         monkeypatch.setattr(orchestrator, "get_run_config", lambda now: "24h")
         monkeypatch.setattr(

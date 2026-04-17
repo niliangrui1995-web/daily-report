@@ -28,8 +28,7 @@ from artifact_store import (
 from checkpoint import detect_checkpoint
 from contribution_metrics import build_layer_roi_report, render_layer_roi_markdown
 from pipeline_runtime import StageSpec, StageTimeoutError, run_stage_registry
-from run_config import get_run_config
-from trading_calendar import is_trading_day
+from run_config import get_run_config, get_schedule_decision
 
 from p1_rss import collect_from_rss
 from p1_web import collect_from_web
@@ -829,9 +828,14 @@ def orchestrator_main(argv: list[str] | None = None):
     logging.info("VCP Hunter orchestrator | %s", now.strftime("%Y-%m-%d %H:%M:%S"))
     logging.info("=" * 60)
 
-    if not force_run and not is_trading_day(now.date()):
-        logging.info("today is not a trading day, skip run")
-        return
+    if not force_run:
+        schedule = get_schedule_decision(now.date())
+        if not schedule["is_trading_day"]:
+            logging.info("today is not a trading day, skip run")
+            return
+        if not schedule["should_run"]:
+            logging.info("today is a skipped trading day by alternate schedule, skip run | %s", schedule["reason"])
+            return
 
     ckpt = {"stage": "none", "files": {}, "run_timestamp": ""}
     if not force_restart:

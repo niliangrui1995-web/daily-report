@@ -6,6 +6,8 @@ for %%I in ("%ROOT_DIR%.") do set "ROOT_DIR=%%~fI\"
 
 set "APP_DIR="
 set "PYTHON_EXE=%ROOT_DIR%.venv\Scripts\python.exe"
+set "SCHEDULED_LAUNCHER="
+set "PIPELINE_CLI="
 if not defined RUN_DAILY_HOLD_SECONDS set "RUN_DAILY_HOLD_SECONDS=15"
 if not defined RUN_DAILY_PREFLIGHT set "RUN_DAILY_PREFLIGHT=off"
 if not defined RUN_DAILY_AUTO_RESUME set "RUN_DAILY_AUTO_RESUME=on"
@@ -32,6 +34,9 @@ if not defined APP_DIR (
     goto :fail
 )
 
+set "PIPELINE_CLI=%APP_DIR%\pipeline_cli.py"
+set "SCHEDULED_LAUNCHER=%APP_DIR%\scheduled_launcher.py"
+
 pushd "%APP_DIR%"
 if errorlevel 1 (
     echo [ERROR] Failed to enter app dir: "%APP_DIR%"
@@ -50,10 +55,14 @@ if errorlevel 1 (
 
 set "PRIMARY_COMMAND=run"
 if "%~1"=="" (
-    "%PYTHON_EXE%" -u "%APP_DIR%\pipeline_cli.py" run
+    call :run_default_entry
 ) else (
     set "PRIMARY_COMMAND=%~1"
-    "%PYTHON_EXE%" -u "%APP_DIR%\pipeline_cli.py" %*
+    if /I "%PRIMARY_COMMAND%"=="run" (
+        call :run_default_entry
+    ) else (
+        "%PYTHON_EXE%" -u "%PIPELINE_CLI%" %*
+    )
 )
 set "EXIT_CODE=%errorlevel%"
 
@@ -114,7 +123,7 @@ if not "%RUN_DAILY_RESUME_DELAY_SECONDS%"=="0" (
     powershell -NoProfile -Command "Start-Sleep -Seconds %RUN_DAILY_RESUME_DELAY_SECONDS%" >nul 2>&1
 )
 
-"%PYTHON_EXE%" -u "%APP_DIR%\pipeline_cli.py" resume
+"%PYTHON_EXE%" -u "%PIPELINE_CLI%" resume
 set "RESUME_EXIT_CODE=%errorlevel%"
 if "%RESUME_EXIT_CODE%"=="0" (
     echo [OK] Auto-resume completed successfully.
@@ -124,6 +133,15 @@ if "%RESUME_EXIT_CODE%"=="0" (
     set "EXIT_CODE=%RESUME_EXIT_CODE%"
 )
 exit /b 0
+
+:run_default_entry
+if exist "%SCHEDULED_LAUNCHER%" (
+    "%PYTHON_EXE%" -u "%SCHEDULED_LAUNCHER%"
+    exit /b %errorlevel%
+)
+echo [WARN] scheduled_launcher.py not found, fallback to pipeline_cli.py run
+"%PYTHON_EXE%" -u "%PIPELINE_CLI%" run
+exit /b %errorlevel%
 
 :merge_no_proxy
 set "MERGED_NO_PROXY="

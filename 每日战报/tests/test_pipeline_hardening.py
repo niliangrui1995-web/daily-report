@@ -246,6 +246,38 @@ class TestPreflightChecks:
         assert any(item["name"] == "run_lock" and not item["ok"] for item in result["checks"])
 
 
+class TestPipelineLock:
+    def test_acquire_run_lock_clears_dead_windows_lock(self, monkeypatch, tmp_path):
+        import pipeline_lock
+
+        lock_dir = tmp_path / "_system"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / "run.lock"
+        lock_path.write_text(
+            json.dumps(
+                {
+                    "pid": 22016,
+                    "command": "run",
+                    "started_at": "2026-04-22T00:30:07.282288+00:00",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(pipeline_lock, "get_run_lock_path", lambda: str(lock_path))
+        monkeypatch.setattr(pipeline_lock.os, "name", "nt")
+        monkeypatch.setattr(pipeline_lock, "_pid_is_running_windows", lambda pid: False)
+
+        with pipeline_lock.acquire_run_lock(command="resume") as payload:
+            assert payload["command"] == "resume"
+            current = pipeline_lock.read_run_lock()
+            assert current is not None
+            assert current["command"] == "resume"
+
+        assert not lock_path.exists()
+
+
 class TestTradingCalendarStatus:
     def test_calendar_status_exposes_package_and_import_names(self):
         from trading_calendar import CALENDAR_IMPORT_NAME, CALENDAR_PACKAGE_NAME, get_calendar_status

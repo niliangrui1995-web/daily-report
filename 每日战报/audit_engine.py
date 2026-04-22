@@ -116,10 +116,20 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
 
     if not raw_content:
         logging.warning(f'[{layer_name} 审计] Pro 返回空结果')
+        failure_metrics = {
+            'input_chars': len(raw_data),
+            'elapsed_seconds': round(elapsed, 1),
+        }
+        last_error_category = getattr(pro_adapter, 'last_error_category', '')
+        last_error_message = getattr(pro_adapter, 'last_error_message', '')
+        if last_error_category:
+            failure_metrics['failure_category'] = last_error_category
+        if last_error_message:
+            failure_metrics['error'] = last_error_message[:500]
         update_run_manifest(
             stage_key,
             status='failed_empty_output',
-            metrics={'input_chars': len(raw_data), 'elapsed_seconds': round(elapsed, 1)},
+            metrics=failure_metrics,
         )
         return ''
 
@@ -274,10 +284,20 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
 
     if not raw_content or len(raw_content.strip()) < 100:
         logging.warning('[P7a 审计] Pro 返回空结果或过短，降级透传原始数据')
+        failure_metrics = {
+            'input_chars': len(raw_deep_research),
+            'elapsed_seconds': round(elapsed, 1),
+        }
+        last_error_category = getattr(pro_adapter, 'last_error_category', '')
+        last_error_message = getattr(pro_adapter, 'last_error_message', '')
+        if last_error_category:
+            failure_metrics['failure_category'] = last_error_category
+        if last_error_message:
+            failure_metrics['error'] = last_error_message[:500]
         update_run_manifest(
             'p7a',
             status='failed_empty_output',
-            metrics={'input_chars': len(raw_deep_research), 'elapsed_seconds': round(elapsed, 1)},
+            metrics=failure_metrics,
         )
         return raw_deep_research
 

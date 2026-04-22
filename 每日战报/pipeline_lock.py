@@ -19,15 +19,57 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _pid_is_running_windows(pid: int) -> bool:
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return False
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_ACCESS_DENIED = 5
+    ERROR_INVALID_PARAMETER = 87
+    STILL_ACTIVE = 259
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == ERROR_ACCESS_DENIED:
+            return True
+        if error == ERROR_INVALID_PARAMETER:
+            return False
+        return False
+
+    exit_code = wintypes.DWORD()
+    try:
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _pid_is_running(pid: int | None) -> bool:
     if not pid:
         return False
+    if os.name == "nt":
+        return _pid_is_running_windows(int(pid))
     try:
         os.kill(pid, 0)
+    except PermissionError:
+        return True
     except OSError:
         return False
     except Exception:
-        return True
+        return False
     return True
 
 

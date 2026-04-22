@@ -29,6 +29,63 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_PERMISSION_DENIED_MARKERS = (
+    'permission_denied',
+    'accessnotconfigured',
+    'api has not been used',
+    'has not been used in project',
+    'cloud code private api',
+    'service disabled',
+    'api disabled',
+    'consumer invalid',
+)
+
+_INPUT_TOO_LARGE_MARKERS = (
+    'maximum context length',
+    'context_length_exceeded',
+    'context length exceeded',
+    'request too large',
+    'payload too large',
+    'prompt is too long',
+    'input is too long',
+    'too many tokens',
+    'token limit',
+    'input token count',
+    'maximum number of input tokens',
+    'content too large',
+)
+
+
+def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in text for marker in markers)
+
+
+def _classify_provider_error(error: Exception) -> Dict[str, Any]:
+    err_text = str(error or '')
+    err_lower = err_text.lower()
+
+    if _contains_any(err_lower, _PERMISSION_DENIED_MARKERS):
+        return {'category': 'permission_denied', 'retryable': False}
+    if _contains_any(err_lower, _INPUT_TOO_LARGE_MARKERS):
+        return {'category': 'input_too_large', 'retryable': False}
+    if '401' in err_lower or '403' in err_lower or 'balance' in err_lower:
+        return {'category': 'risk_control', 'retryable': True}
+    if '429' in err_lower or '503' in err_lower or 'resource_exhausted' in err_lower:
+        return {'category': 'rate_limit', 'retryable': True}
+    if 'timeout' in err_lower or 'deadline' in err_lower:
+        return {'category': 'timeout', 'retryable': True}
+    if 'connection' in err_lower or 'ssl' in err_lower or 'proxy' in err_lower:
+        return {'category': 'network_error', 'retryable': True}
+    return {'category': 'unknown_error', 'retryable': True}
+
+
+def _should_use_openai_compat_proxy(model: str, base_url: str) -> bool:
+    model_lower = (model or '').lower()
+    base_url_lower = (base_url or '').rstrip('/').lower()
+    if 'gemini-3.1-pro' not in model_lower and 'claude-opus-4-6' not in model_lower:
+        return False
+    return 'antigravity/v1' in base_url_lower or base_url_lower.endswith('/v1')
+
 @dataclass
 class FakeAIMessage:
     """模拟 LangChain 的 AIMessage，支持 .content / .tool_calls / .thinking_content"""
@@ -136,6 +193,8 @@ class NativeLLMAdapter(RunnableSerializable):
     #       原先 `field(default_factory=dict) if not HAS_LANGCHAIN else None` 在
     #       HAS_LANGCHAIN=True 时 extra_kwargs 默认为 None，类型与 Dict 声明矛盾
     extra_kwargs: Dict[str, Any] = {}
+    last_error_category: str = ''
+    last_error_message: str = ''
     _bound_tools: List[Any] = None
     _tools_prompt: str = ''
 
@@ -159,7 +218,9 @@ class NativeLLMAdapter(RunnableSerializable):
         resolved_api_key = api_key or os.environ.get('ANTIGRAVITY_API_KEY', os.environ.get('OPENAI_API_KEY', ''))
 
         model_lower = model.lower()
-        if 'claude' in model_lower or 'opus' in model_lower:
+        if _should_use_openai_compat_proxy(model_lower, resolved_base_url):
+            provider = 'openai_compat'
+        elif 'claude' in model_lower or 'opus' in model_lower:
             provider = 'anthropic'
         elif 'gemini' in model_lower:
             provider = 'google'
@@ -200,6 +261,7 @@ class NativeLLMAdapter(RunnableSerializable):
     def invoke(self, messages: Any, config: Any = None) -> Any:
         system_prompt, user_prompt = self._parse_messages(messages)
         _ = config
+        self._reset_last_error()
 
         if self._tools_prompt:
             system_prompt = system_prompt + self._tools_prompt
@@ -215,7 +277,11 @@ class NativeLLMAdapter(RunnableSerializable):
         elif self.provider == 'google':
             text = self._call_gemini(f"{system_prompt}\n\n{user_prompt}")
         else:
-            text = self._call_openai_compat(system_prompt, user_prompt)
+            result = self._call_openai_compat(system_prompt, user_prompt)
+            if isinstance(result, tuple):
+                text, thinking_content = result
+            else:
+                text = result
 
         tool_calls = []
         if self._bound_tools:
@@ -324,6 +390,56 @@ class NativeLLMAdapter(RunnableSerializable):
 
         return '\n'.join(system_parts), '\n'.join(user_parts)
 
+    def _reset_last_error(self) -> None:
+        self.last_error_category = ''
+        self.last_error_message = ''
+
+    def _set_last_error(self, category: str, message: str) -> None:
+        self.last_error_category = category
+        self.last_error_message = message[:2000]
+
+    def _handle_provider_error(
+        self,
+        provider_label: str,
+        error: Exception,
+        attempt: int,
+        *,
+        risk_hint: str = '',
+    ) -> bool:
+        error_info = _classify_provider_error(error)
+        self._set_last_error(error_info['category'], str(error))
+        wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
+
+        if error_info['category'] == 'permission_denied':
+            logger.error(f"🚫 [{provider_label}] 权限/项目配置错误，停止重试: {error}")
+            return False
+        if error_info['category'] == 'input_too_large':
+            logger.error(f"📏 [{provider_label}] 请求过长或上下文超限，停止重试: {error}")
+            return False
+        if error_info['category'] == 'risk_control':
+            hint_text = f' {risk_hint}' if risk_hint else ''
+            logger.warning(
+                f"⚠️ [{provider_label}] 账号风控(401/403)，等待 {wait:.1f}s{hint_text}（{attempt + 1}/{self.max_retries}）"
+            )
+            time.sleep(wait)
+            return True
+        if error_info['category'] == 'rate_limit':
+            logger.warning(f"⏳ [{provider_label}] 触发限流，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+            time.sleep(wait)
+            return True
+        if error_info['category'] == 'timeout':
+            logger.warning(f"⏳ [{provider_label}] 超时，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+            time.sleep(wait)
+            return True
+        if error_info['category'] == 'network_error':
+            logger.error(f"❌ [{provider_label}] 网络连接异常，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）: {error}")
+            time.sleep(wait)
+            return True
+
+        logger.warning(f"⚠️ [{provider_label}] 异常: {error}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
+        time.sleep(wait)
+        return True
+
     def _call_anthropic(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
         if getattr(self, '_anthropic_client', None) is None:
             from anthropic import Anthropic
@@ -360,21 +476,10 @@ class NativeLLMAdapter(RunnableSerializable):
 
                 return text, thinking
             except Exception as e:
-                err_str = str(e).lower()
-                wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
+                if not self._handle_provider_error('Anthropic', e, attempt, risk_hint='让反代切换账号'):
+                    break
 
-                if '401' in err_str or '403' in err_str or 'balance' in err_str:
-                    logger.warning(f"⚠️ [Anthropic] 账号风控(401/403)，等待 {wait:.1f}s 让反代切换账号（{attempt + 1}/{self.max_retries}）")
-                elif '429' in err_str or '503' in err_str or 'resource_exhausted' in err_str:
-                    logger.warning(f"⏳ [Anthropic] 触发限流，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-                elif 'timeout' in err_str or 'deadline' in err_str:
-                    logger.warning(f"⏳ [Anthropic] 超时，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-                else:
-                    logger.warning(f"⚠️ [Anthropic] 异常: {e}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-
-                time.sleep(wait)
-
-        logger.error(f"❌ [Anthropic] {self.max_retries} 次重试全部失败")
+        logger.error(f"❌ [Anthropic] 调用失败，最后错误分类: {self.last_error_category or 'unknown_error'}")
         return '', ''
 
     def _call_gemini(self, prompt: str) -> str:
@@ -417,23 +522,10 @@ class NativeLLMAdapter(RunnableSerializable):
                 response = client.models.generate_content(**kwargs)
                 return response.text if response.text else ''
             except Exception as e:
-                err_str = str(e).lower()
-                if 'connection' in err_str or 'ssl' in err_str or 'proxy' in err_str:
-                    logger.error(f"❌ [Gemini SDK] 严重网络连接错误，需检查代理设置: {e}")
-                wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
-                
-                if '401' in err_str or '403' in err_str or 'balance' in err_str:
-                    logger.warning(f"⚠️ [Gemini SDK] 账号风控(401/403)，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-                elif '429' in err_str or '503' in err_str or 'resource_exhausted' in err_str:
-                    logger.warning(f"⏳ [Gemini SDK] 触发限流，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-                elif 'timeout' in err_str or 'deadline' in err_str:
-                    logger.warning(f"⏳ [Gemini SDK] 超时，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-                else:
-                    logger.warning(f"⚠️ [Gemini SDK] 异常: {e}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-                
-                time.sleep(wait)
+                if not self._handle_provider_error('Gemini SDK', e, attempt):
+                    break
 
-        logger.error(f"❌ [Gemini SDK] {self.max_retries} 次重试全部失败")
+        logger.error(f"❌ [Gemini SDK] 调用失败，最后错误分类: {self.last_error_category or 'unknown_error'}")
         return ''
 
     def _call_grok_native(self, system_prompt: str, user_prompt: str) -> str:
@@ -479,10 +571,10 @@ class NativeLLMAdapter(RunnableSerializable):
         logger.error(f"❌ [Grok Native] {self.max_retries} 次重试全部失败")
         return ""
 
-    def _call_openai_compat(self, system_prompt: str, user_prompt: str) -> str:
+    def _call_openai_compat(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
         # 如果是 Grok，挂载特种 Responses API 来支持原生 X_search
         if 'grok' in self.model.lower():
-            return self._call_grok_native(system_prompt, user_prompt)
+            return self._call_grok_native(system_prompt, user_prompt), ''
 
         # Why: 惰性缓存 OpenAI Client，与 _call_anthropic/_call_gemini 保持一致，避免每次调用都新建连接
         if getattr(self, '_openai_client', None) is None:
@@ -505,24 +597,20 @@ class NativeLLMAdapter(RunnableSerializable):
                     max_tokens=16000,
                     timeout=self.timeout
                 )
-                return response.choices[0].message.content or ''
+                message = response.choices[0].message
+                text = message.content or ''
+                reasoning = getattr(message, 'reasoning_content', '') or ''
+
+                if reasoning:
+                    logger.info(f"🧠 [OpenAI兼容] 捕获 reasoning_content 推理链: {len(reasoning)} 字符")
+
+                return text, reasoning
             except Exception as e:
-                err_str = str(e).lower()
-                wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
+                if not self._handle_provider_error('OpenAI兼容', e, attempt):
+                    break
 
-                if '401' in err_str or '403' in err_str or 'balance' in err_str:
-                    logger.warning(f"⚠️ [OpenAI兼容] 账号风控(401/403)，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-                elif '429' in err_str or '503' in err_str or 'resource_exhausted' in err_str:
-                    logger.warning(f"⏳ [OpenAI兼容] 触发限流，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-                elif 'timeout' in err_str or 'deadline' in err_str:
-                    logger.warning(f"⏳ [OpenAI兼容] 超时，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-                else:
-                    logger.warning(f"⚠️ [OpenAI兼容] 异常: {e}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-
-                time.sleep(wait)
-
-        logger.error(f"❌ [OpenAI兼容] {self.max_retries} 次重试全部失败")
-        return ''
+        logger.error(f"❌ [OpenAI兼容] 调用失败，最后错误分类: {self.last_error_category or 'unknown_error'}")
+        return '', ''
 
     def __repr__(self):
         return f"NativeLLMAdapter(model={self.model}, provider={self.provider})"

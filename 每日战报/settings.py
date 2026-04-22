@@ -87,6 +87,8 @@ ANTIGRAVITY_BASE_URL = os.environ.get('ANTIGRAVITY_BASE_URL', 'http://127.0.0.1:
 ANTIGRAVITY_API_KEY = os.environ.get('ANTIGRAVITY_API_KEY', '')
 if not ANTIGRAVITY_API_KEY:
     logging.warning('⚠️ ANTIGRAVITY_API_KEY 未配置！请检查 .env 文件。Pro/Opus 模型调用将鉴权失败。')
+PRO_OPUS_BASE_URL = os.environ.get('PRO_OPUS_BASE_URL', ANTIGRAVITY_BASE_URL)
+PRO_OPUS_API_KEY = os.environ.get('PRO_OPUS_API_KEY', ANTIGRAVITY_API_KEY)
 
 GEMINI_SEARCH_DIRECT_URL = 'https://generativelanguage.googleapis.com'
 GEMINI_SEARCH_CF_URL = os.environ.get('GEMINI_SEARCH_BASE_URL', 'https://api.niliangrui.cloud')
@@ -156,14 +158,14 @@ def _get_pro_adapter():
     global _pro_adapter
     if _pro_adapter is None:
         from native_llm_adapter import NativeLLMAdapter
-        _pro_adapter = NativeLLMAdapter(model=GEMINI_PRO_MODEL, base_url=ANTIGRAVITY_BASE_URL, api_key=ANTIGRAVITY_API_KEY, max_retries=5)
+        _pro_adapter = NativeLLMAdapter(model=GEMINI_PRO_MODEL, base_url=PRO_OPUS_BASE_URL, api_key=PRO_OPUS_API_KEY, max_retries=5)
     return _pro_adapter
 
 def _get_opus_adapter():
     global _opus_adapter
     if _opus_adapter is None:
         from native_llm_adapter import NativeLLMAdapter
-        _opus_adapter = NativeLLMAdapter(model=OPUS_MODEL, base_url=ANTIGRAVITY_BASE_URL, api_key=ANTIGRAVITY_API_KEY, timeout=600.0, max_retries=5)
+        _opus_adapter = NativeLLMAdapter(model=OPUS_MODEL, base_url=PRO_OPUS_BASE_URL, api_key=PRO_OPUS_API_KEY, timeout=600.0, max_retries=5)
     return _opus_adapter
 
 

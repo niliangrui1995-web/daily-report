@@ -140,9 +140,99 @@ class TestIndustryDict:
     """测试产业链字典完整性"""
 
     def test_oligarch_sectors(self):
-        """应有 15 个赛道"""
+        """应有 16 个赛道"""
         from industry_dict import OLIGARCH_DICT
-        assert len(OLIGARCH_DICT) == 15
+        assert len(OLIGARCH_DICT) == 16
+
+    def test_ai_pcb_equipment_sector(self):
+        """AI PCB 设备赛道应纳入真实海外设备/耗材寡头"""
+        from industry_dict import OLIGARCH_DICT, VANGUARD_TICKERS
+
+        sector = OLIGARCH_DICT["AI PCB生产设备"]
+        required_tickers = {
+            "KLA": "KLAC",
+            "MKS Instruments": "MKSI",
+            "SCREEN Holdings": "7735.T",
+            "Nidec": "6594.T",
+            "Mycronic": "MYCR.ST",
+            "AMADA": "6113.T",
+            "SCHMID Group": "SHMD",
+            "Union Tool": "6278.T",
+            "Ushio": "6925.T",
+        }
+
+        for name, ticker in required_tickers.items():
+            assert any(name in company for company in sector)
+            assert VANGUARD_TICKERS[name] == ticker
+
+    def test_ai_pcb_equipment_integrates_prompt_and_search_terms(self):
+        """AI PCB 设备赛道应进入主动检索词和各层 Prompt 口径"""
+        import p2_x_intel
+        import p3_agent
+
+        p2_keywords = " ".join(p2_x_intel.INDUSTRY_SCAN_KEYWORDS).lower()
+        for keyword in [
+            "ldi",
+            "laser drilling",
+            "vcp",
+            "aoi",
+            "electrical test",
+            "drill bits",
+            "atotech",
+            "esi",
+            "orbotech",
+        ]:
+            assert keyword in p2_keywords
+
+        p3_keywords = {keyword.lower() for keyword in p3_agent.PRIORITY_KEYWORDS}
+        for keyword in [
+            "ldi",
+            "laser drilling",
+            "vcp",
+            "aoi",
+            "electrical test",
+            "drill bit",
+            "atotech",
+            "esi",
+            "orbotech",
+        ]:
+            assert keyword in p3_keywords
+
+        prompt_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "prompts")
+        for prompt_name in [
+            "audit.txt",
+            "p3_jinnang1.txt",
+            "p3_jinnang2.txt",
+            "p3_jinnang3.txt",
+            "p6_mapping.txt",
+            "p9_report.txt",
+        ]:
+            prompt_text = open(os.path.join(prompt_dir, prompt_name), encoding="utf-8").read()
+            assert "AI PCB生产设备" in prompt_text
+            assert "AI PCB设备" not in prompt_text
+
+    def test_ai_pcb_equipment_a_share_code_guardrail(self):
+        """P6 代码纠错表应覆盖 AI PCB 设备常见 A 股映射"""
+        from p6_mapper import HALLUCINATION_MAP
+
+        assert HALLUCINATION_MAP["大族数控"] == "301200"
+        assert HALLUCINATION_MAP["芯碁微装"] == "688630"
+        assert HALLUCINATION_MAP["东威科技"] == "688700"
+        assert HALLUCINATION_MAP["鼎泰高科"] == "301377"
+
+    def test_ai_pcb_equipment_asian_kline_track_lookup(self):
+        """亚洲寡头行情脚本应能把新增亚洲标的反查到 AI PCB 设备赛道"""
+        import importlib.util
+
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        script_path = os.path.join(project_root, "亚洲寡头行情", "asian_kline_fetcher.py")
+        spec = importlib.util.spec_from_file_location("asian_kline_fetcher_test", script_path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+
+        for ticker in ["7735.T", "6113.T", "6278.T", "6925.T", "6594.T"]:
+            assert module._find_track(ticker) == "AI PCB生产设备"
 
     def test_oligarch_flat(self):
         """展平后应有 100+ 家公司"""

@@ -1,8 +1,8 @@
 """
-产业链 15 赛道全覆盖寡头监控字典 + 美股标的池。
+产业链 16 赛道全覆盖寡头监控字典 + 美股标的池。
 
 从 daily_report.py 拆分，包含：
-- OLIGARCH_DICT: 15 赛道寡头字典
+- OLIGARCH_DICT: 16 赛道寡头字典
 - ALL_OLIGARCHS_FLAT: 展平后的全量公司列表
 - VANGUARD_TICKERS: 核心标的池（用于 yfinance 行情注入）
 - SUPER_GIANTS: 万亿级市值超级巨头
@@ -24,6 +24,7 @@ OLIGARCH_DICT = {
     '网络交换与高速电互连': ['Broadcom (博通)', 'NVIDIA', 'Marvell (迈威尔)', 'Astera Labs', 'Credo', 'Amphenol (安费诺)', 'TE Connectivity'],
     '光模块/硅光/CPO': ['Intel', 'Innolight (中际旭创)', 'Coherent (高意)', 'Eoptolink (新易盛)', 'Lumentum (朗明特)', 'Sumitomo E (住友电工)', 'Ayar Labs', 'Lightmatter', 'Fabrinet', 'Granopt'],
     '高频PCB与覆铜板材料': ['Rogers (罗杰斯)', 'Panasonic MEGTRON', 'EMC (台光电)', 'Iteq (联茂)', 'Doosan (斗山)', 'Nan Ya (南亚)', 'Nittobo (日东纺)', 'Asahi Kasei (旭化成)', 'Resonac (力森诺科)', 'MGC (三菱瓦斯化学)', 'Mitsui Mining (三井金属)', 'Furukawa (古河电工)', 'Wus (华通)', 'Compeq (健鼎)'],
+    'AI PCB生产设备': ['KLA (Orbotech/LDI/AOI)', 'MKS Instruments (Atotech/ESI)', 'SCREEN Holdings (Ledia)', 'Nidec Advance Technology', 'Mycronic (atg Luther & Maelzer)', 'AMADA Via Mechanics', 'SCHMID Group', 'Union Tool', 'Ushio (ADTEC Engineering)'],
     'AI服务器基建与温控': ['nVent', 'Vertiv (维谛)', 'Eaton (伊顿)', 'Schneider (施耐德)', 'Delta (台达电)', 'MPS', 'CoolIT', 'Auras (奇鋐)', 'AVC (双鸿)', 'AGC (旭硝子)', 'Nidec (日本电产)'],
     '测试/老化与探针卡': ['Advantest', 'Teradyne', 'KYEC (京元电子)', 'FormFactor', 'Disco (迪思科)', 'MJC', 'Technoprobe', 'MPI'],
     '算力颠覆与主权生态': ['Groq', 'Cerebras', 'Tenstorrent', 'SMIC (中芯国际)', 'Huawei (华为)', 'NAURA (北方华创)', 'AMEC (中微)'],
@@ -91,6 +92,13 @@ VANGUARD_TICKERS = {
     'Furukawa': '5801.T',
     'Wus': '2313.TW',
     'Compeq': '3044.TW',
+    'MKS Instruments': 'MKSI',
+    'SCREEN Holdings': '7735.T',
+    'Mycronic': 'MYCR.ST',
+    'AMADA': '6113.T',
+    'SCHMID Group': 'SHMD',
+    'Union Tool': '6278.T',
+    'Ushio': '6925.T',
     'nVent': 'NVT',
     'Vertiv': 'VRT',
     'Eaton': 'ETN',

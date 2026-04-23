@@ -4,7 +4,7 @@ P2 X(Twitter) 产业链情报采集 — 使用 Grok API 抓取 X 平台 AI 产�
 设计原理：
   - Grok 天生拥有对 X 平台实时数据的原生访问能力，这是其他 LLM 不具备的独家优势
   - 通过精心设计的 system prompt 让 Grok 扮演产业链情报分析师，
-    在 X 上按 15 个核心赛道搜刮最新的产业链爆料、insider leak、供应链异动
+    在 X 上按 16 个核心赛道搜刮最新的产业链爆料、insider leak、供应链异动
   - P2 的输出不经过 P5 审计（因为 Grok 本身就是一手信源提取器，
     审计会损失 X 独有的即时性和爆料性信息）
   - P2 输出直接与 P5 审计后数据拼接，一起送给 Opus 做 P6 映射
@@ -45,6 +45,7 @@ INDUSTRY_SCAN_KEYWORDS = [
     'AI server datacenter cooling liquid cooling cold plate CDU manifold fluorinated coolant quick disconnect',
     'optical module CPO silicon photonics 800G 1.6T EML VCSEL Faraday isolator',
     'PCB CCL high frequency material AI server copper foil electronic glass fiber PTFE resin ABF substrate',
+    'AI PCB production equipment LDI laser direct imaging laser drilling VCP plating AOI AVI electrical test PCB micro drill bits Atotech ESI Orbotech',
     'advanced packaging hybrid bonding chiplet',
     'edge AI inference chip Qualcomm MediaTek',
     'AI infrastructure capex cloud hyperscaler',

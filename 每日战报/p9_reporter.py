@@ -194,7 +194,7 @@ def p9_risk_analysis(
     p75_section = _section_or_fallback(p75_supplement, "（本次运行无 P7.5 补充搜索数据）")
     p2_section = _section_or_fallback(p2_x_intel_data, "（本次运行无 P2 X 平台情报数据）")
     p3_section = _section_or_fallback(p3_intel_data, "（本次运行无 P3 机动情报数据）")
-    yfinance_section = _section_or_fallback(p4_yfinance, "（本次运行无 P4 海外行情数据）")
+    yfinance_section = _section_or_fallback(p4_yfinance, "（本次运行无 P4 核心标的行情数据）")
 
     try:
         prompt_template = require_prompt("p9_report.txt")

@@ -140,15 +140,87 @@ class TestIndustryDict:
     """测试产业链字典完整性"""
 
     def test_oligarch_sectors(self):
-        """应有 16 个赛道"""
+        """应有 23 个核心细分赛道"""
         from industry_dict import OLIGARCH_DICT
-        assert len(OLIGARCH_DICT) == 16
+        assert len(OLIGARCH_DICT) == 23
+
+    def test_refined_sector_taxonomy(self):
+        """新版寡头字典应拆清核心细分赛道边界"""
+        from industry_dict import OLIGARCH_DICT, VANGUARD_TICKERS
+
+        assert "EDA与底层IP" in OLIGARCH_DICT
+        assert "AI加速芯片与定制ASIC" in OLIGARCH_DICT
+        assert "先进制程代工" in OLIGARCH_DICT
+        assert "前道晶圆设备与量测" in OLIGARCH_DICT
+        assert "关键晶圆材料与特种工艺" in OLIGARCH_DICT
+        assert "数据中心电力与配电" in OLIGARCH_DICT
+        assert "液冷与散热材料" in OLIGARCH_DICT
+        assert "具身智能与机器人平台" in OLIGARCH_DICT
+        assert "光纤光缆与宽带接入" in OLIGARCH_DICT
+
+        assert "Disco (迪思科)" in OLIGARCH_DICT["先进封装与混合键合"]
+        assert "Disco (迪思科)" not in OLIGARCH_DICT["半导体测试设备与探针卡"]
+        assert "SKC (Absolics)" in OLIGARCH_DICT["IC载板与封装材料"]
+        assert "Vistance Networks (原CommScope ANS/RUCKUS)" in OLIGARCH_DICT["光纤光缆与宽带接入"]
+        assert VANGUARD_TICKERS["Arteris"] == "AIP"
+        assert VANGUARD_TICKERS["SKC"] == "011790.KS"
+        assert VANGUARD_TICKERS["TE Connectivity"] == "TEL"
+        assert VANGUARD_TICKERS["Vistance Networks"] == "VISN"
+        assert VANGUARD_TICKERS["Arista Networks"] == "ANET"
+        assert VANGUARD_TICKERS["Shin-Etsu"] == "4063.T"
+        assert VANGUARD_TICKERS["SUMCO"] == "3436.T"
+        assert VANGUARD_TICKERS["Accretech"] == "7729.T"
+
+    def test_optical_chain_is_split_by_value_source(self):
+        """光通信链条应拆清模块、光芯片、电芯片和无源器件"""
+        from industry_dict import OLIGARCH_DICT, VANGUARD_TICKERS
+
+        assert "光模块/硅光/CPO" not in OLIGARCH_DICT
+        assert "光模块与光引擎" in OLIGARCH_DICT
+        assert "光芯片与硅光" in OLIGARCH_DICT
+        assert "光模块电芯片" in OLIGARCH_DICT
+        assert "光通信无源器件与精密零部件" in OLIGARCH_DICT
+
+        assert "Coherent (高意)" in OLIGARCH_DICT["光模块与光引擎"]
+        assert "Lumentum (朗明特)" in OLIGARCH_DICT["光芯片与硅光"]
+        assert "Semtech" in OLIGARCH_DICT["光模块电芯片"]
+        assert "US Conec" in OLIGARCH_DICT["光通信无源器件与精密零部件"]
+        assert VANGUARD_TICKERS["Semtech"] == "SMTC"
+        assert VANGUARD_TICKERS["MACOM"] == "MTSI"
+        assert VANGUARD_TICKERS["MaxLinear"] == "MXL"
+        assert VANGUARD_TICKERS["Fujikura"] == "5803.T"
+
+    def test_mainland_china_companies_are_excluded_from_oligarch_dict(self):
+        """寡头字典排除中国大陆公司，但保留台湾公司"""
+        from industry_dict import OLIGARCH_DICT, VANGUARD_TICKERS
+
+        flattened = "\n".join(OLIGARCH_DICT) + "\n" + "\n".join(
+            company for companies in OLIGARCH_DICT.values() for company in companies
+        )
+        for forbidden in ["中国半导体国产替代", "SMIC", "Huawei", "NAURA", "AMEC", "Innolight", "Eoptolink"]:
+            assert forbidden not in flattened
+            assert forbidden not in VANGUARD_TICKERS
+        assert "TSMC" in VANGUARD_TICKERS
+        assert VANGUARD_TICKERS["Alchip"] == "3661.TW"
+        assert not any(ticker.endswith((".SZ", ".SS")) for ticker in VANGUARD_TICKERS.values())
+
+    def test_public_listed_oligarchs_have_p4_tickers(self):
+        """已上市寡头必须进入 P4 核心行情池，供 Opus 推理使用"""
+        from industry_dict import VANGUARD_TICKERS
+
+        expected = {
+            "Arteris": "AIP",
+            "MJC": "6871.T",
+            "SKC": "011790.KS",
+        }
+        for name, ticker in expected.items():
+            assert VANGUARD_TICKERS[name] == ticker
 
     def test_ai_pcb_equipment_sector(self):
         """AI PCB 设备赛道应纳入真实海外设备/耗材寡头"""
         from industry_dict import OLIGARCH_DICT, VANGUARD_TICKERS
 
-        sector = OLIGARCH_DICT["AI PCB生产设备"]
+        sector = OLIGARCH_DICT["AI PCB设备与关键耗材"]
         required_tickers = {
             "KLA": "KLAC",
             "MKS Instruments": "MKSI",
@@ -208,8 +280,7 @@ class TestIndustryDict:
             "p9_report.txt",
         ]:
             prompt_text = open(os.path.join(prompt_dir, prompt_name), encoding="utf-8").read()
-            assert "AI PCB生产设备" in prompt_text
-            assert "AI PCB设备" not in prompt_text
+            assert "AI PCB设备与关键耗材" in prompt_text
 
     def test_ai_pcb_equipment_a_share_code_guardrail(self):
         """P6 代码纠错表应覆盖 AI PCB 设备常见 A 股映射"""
@@ -232,7 +303,7 @@ class TestIndustryDict:
         spec.loader.exec_module(module)
 
         for ticker in ["7735.T", "6113.T", "6278.T", "6925.T", "6594.T"]:
-            assert module._find_track(ticker) == "AI PCB生产设备"
+            assert module._find_track(ticker) == "AI PCB设备与关键耗材"
 
     def test_oligarch_flat(self):
         """展平后应有 100+ 家公司"""

@@ -4,7 +4,7 @@ P2 X(Twitter) 产业链情报采集 — 使用 Grok API 抓取 X 平台 AI 产�
 设计原理：
   - Grok 天生拥有对 X 平台实时数据的原生访问能力，这是其他 LLM 不具备的独家优势
   - 通过精心设计的 system prompt 让 Grok 扮演产业链情报分析师，
-    在 X 上按 16 个核心赛道搜刮最新的产业链爆料、insider leak、供应链异动
+    在 X 上按新版核心细分赛道搜刮最新的产业链爆料、insider leak、供应链异动
   - P2 的输出不经过 P5 审计（因为 Grok 本身就是一手信源提取器，
     审计会损失 X 独有的即时性和爆料性信息）
   - P2 输出直接与 P5 审计后数据拼接，一起送给 Opus 做 P6 映射
@@ -37,22 +37,29 @@ GROK_BASE_URL = 'https://api.x.ai'
 GROK_MODEL = 'grok-4-1-fast-reasoning'
 
 INDUSTRY_SCAN_KEYWORDS = [
-    'NVIDIA GPU AI chip supply chain',
-    'TSMC advanced packaging CoWoS HBM',
-    'Broadcom ASIC custom chip',
-    'ASML EUV lithography semiconductor equipment',
-    'SK Hynix Samsung Micron HBM memory TSV TC-NCF MR-MUF ALD precursor EMC',
-    'AI server datacenter cooling liquid cooling cold plate CDU manifold fluorinated coolant quick disconnect',
-    'optical module CPO silicon photonics 800G 1.6T EML VCSEL Faraday isolator',
+    'Synopsys Cadence ARM Siemens EDA semiconductor IP',
+    'NVIDIA AMD Broadcom Marvell Alchip Qualcomm AI accelerator ASIC',
+    'TSMC Samsung Foundry Intel Foundry GlobalFoundries advanced node',
+    'ASML Applied Materials Lam Research Tokyo Electron KLA Onto semiconductor equipment metrology',
+    'Shin-Etsu SUMCO Soitec IQE Entegris silicon wafer specialty materials',
+    'SK Hynix Samsung Micron HBM memory TSV TC-NCF MR-MUF',
+    'Besi EV Group ASMPT Disco advanced packaging hybrid bonding chiplet',
+    'IC substrate ABF Ajinomoto Ibiden Unimicron glass substrate',
+    'Arista Broadcom NVIDIA Ethernet switching Astera Credo Amphenol TE Connectivity interconnect',
+    'optical module optical engine 800G 1.6T 3.2T Coherent Fabrinet Ciena',
+    'optical chip silicon photonics EML VCSEL laser photodiode modulator CPO Coherent Lumentum Intel Silicon Photonics Ayar Labs Lightmatter',
+    'optical module IC DSP TIA driver CDR SerDes PAM4 Broadcom Marvell Semtech MACOM MaxLinear Credo',
+    'optical passive components fiber array connector isolator lens ferrule FAU MPO MTP Amphenol TE Connectivity Corning Fujikura US Conec SENKO Molex',
     'PCB CCL high frequency material AI server copper foil electronic glass fiber PTFE resin ABF substrate',
-    'AI PCB production equipment LDI laser direct imaging laser drilling VCP plating AOI AVI electrical test PCB micro drill bits Atotech ESI Orbotech',
-    'advanced packaging hybrid bonding chiplet',
-    'edge AI inference chip Qualcomm MediaTek',
-    'AI infrastructure capex cloud hyperscaler',
-    'semiconductor test Advantest probe card',
-    'fiber optic cable telecom infrastructure',
-    'China semiconductor self-sufficiency SMIC Huawei',
-    'AI model training inference GPU shortage supply'
+    'AI PCB equipment LDI laser direct imaging laser drilling VCP plating AOI AVI electrical test PCB micro drill bits Atotech ESI Orbotech',
+    'datacenter power distribution Vertiv Eaton Schneider nVent Delta MPS',
+    'datacenter liquid cooling cold plate CDU manifold fluorinated coolant quick disconnect Auras AVC CoolIT',
+    'semiconductor test Advantest Teradyne FormFactor probe card Accretech MPI Technoprobe',
+    'non-GPU AI compute Groq Cerebras Tenstorrent',
+    'AI cloud capex hyperscaler CoreWeave Oracle AWS Azure Google Meta Scale AI',
+    'edge AI inference chip Apple Qualcomm MediaTek Intel',
+    'embodied AI robotics Tesla Figure NVIDIA robotics',
+    'fiber optic cable broadband access Ciena Calix ADTRAN Prysmian Corning Vistance'
 ]
 
 def _build_user_prompt(backtrack: str = '24h', keyword_chunk: list = None) -> str:

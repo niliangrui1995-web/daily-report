@@ -2,7 +2,7 @@
 P6 Opus A 股映射 — 产业链情报→A股标的映射。
 
 从 daily_report.py 拆分，包含：
-- format_evidence(): P1 数据格式化
+- format_evidence(): 搜索数据格式化
 - generate_report(): P6 Opus 映射（产业链情报→A股标的表格）
 
 已拆分至独立模块（此处不再包含）：

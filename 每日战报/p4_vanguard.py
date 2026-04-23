@@ -1,5 +1,5 @@
 """
-P4 海外行情层 — yfinance 产业链核心标的客观行情注入。
+P4 全球核心标的行情层 — yfinance 产业链核心标的客观行情注入。
 
 从 p6_mapper.py 拆分，原属"上帝模块"的一部分。
 
@@ -8,8 +8,8 @@ P4 海外行情层 — yfinance 产业链核心标的客观行情注入。
    用 A 股上一交易日的前一天锚定 baseline_date、长假自动累计区间涨跌）
    是经过反复验证的精密机制，严禁随意修改 `completed_hist` 过滤和
    `baseline_date` 计算公式。
-2. yfinance 是唯一允许的海外行情数据源。P8 是 A 股本地通达信数据，
-   严禁将 yfinance 逻辑混入 P8。
+2. yfinance 是唯一允许的全球核心标的行情数据源。P8 是 A 股本地通达信技术面数据，
+   严禁将 P4 的 yfinance 拉取逻辑混入 P8。
 """
 
 import concurrent.futures
@@ -45,7 +45,7 @@ def fetch_vanguard_prices() -> str:
             import yfinance as yf
             import pandas as pd
         except ImportError:
-            logging.warning('⚠️ yfinance/pandas 未安装，P4 海外行情不可用')
+            logging.warning('⚠️ yfinance/pandas 未安装，P4 核心行情不可用')
             update_run_manifest('p4', status='skipped_missing_dependency')
             return ''
 
@@ -56,8 +56,8 @@ def fetch_vanguard_prices() -> str:
         logging.info(f'[yfinance] 正在获取产业链 {len(VANGUARD_TICKERS)} 只核心标的自 {prev_day_str} 以来的区间客观股价行情...')
 
         lines = []
-        lines.append('==================== 客观行情数据 (yfinance) ====================')
-        lines.append(f'产业链核心标的客观行情（A股基准日: {prev_day_str}，显示自该日以来海外市场区间总涨跌）：')
+        lines.append('==================== 核心标的客观行情数据 (yfinance) ====================')
+        lines.append(f'产业链核心标的客观行情（A股基准日: {prev_day_str}，显示自该日以来全球核心标的区间总涨跌）：')
         lines.append('分类规则：超级巨头(万亿级)区间≥3%触发催化/≤-5%警惕 | 中型标的区间≥5%触发催化/≤-8%警惕\n')
 
         def _fetch_single(name: str, ticker: str) -> str:
@@ -93,9 +93,9 @@ def fetch_vanguard_prices() -> str:
                     if curr_close > 0 and prev_close > 0:
                         pct_change = (curr_close - prev_close) / prev_close * 100
                         signal = classify_vanguard_signal(name, pct_change)
-                        return f'- [{signal}] {name}({ticker}) [{tier}]: ${curr_close:.2f}, 区间涨跌 {pct_change:+.2f}%'
+                        return f'- [{signal}] {name}({ticker}) [{tier}]: 收盘价 {curr_close:.2f}, 区间涨跌 {pct_change:+.2f}%'
 
-                    return f'- [📈 正常] {name}({ticker}) [{tier}]: ${curr_close:.2f} (无足够历史对比)'
+                    return f'- [📈 正常] {name}({ticker}) [{tier}]: 收盘价 {curr_close:.2f} (无足够历史对比)'
 
                 except Exception as e:
                     if attempt < max_retries - 1:
@@ -130,9 +130,9 @@ def fetch_vanguard_prices() -> str:
         report = '\n'.join(lines)
 
         try:
-            md_body = f'# P4 海外客观行情\n\n> 生成时间: {datetime.now().isoformat()}\n\n{report}'
-            fname = write_text_artifact('P4_海外行情', md_body)
-            logging.info(f'💾 [yfinance] 海外客观行情已落盘: {fname}')
+            md_body = f'# P4 全球核心标的客观行情\n\n> 生成时间: {datetime.now().isoformat()}\n\n{report}'
+            fname = write_text_artifact('P4_核心行情', md_body)
+            logging.info(f'💾 [yfinance] 核心标的客观行情已落盘: {fname}')
         except Exception as e:
             logging.warning(f'⚠️ [yfinance] 行情落盘失败: {e}')
             fname = ''

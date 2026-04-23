@@ -17,10 +17,9 @@
 4. **美国亚利桑那州凤凰城**：TSMC Arizona Fab、Intel Chandler Fab
 5. **美国俄勒冈州波特兰/希尔斯伯勒**：Intel 技术开发总部、Lam Research 总部
 6. **美国纽约州/佛蒙特州**：GlobalFoundries Malta 工厂、IBM Albany 研究中心
-7. **中国大陆长三角（上海/无锡/合肥）**：中芯国际、长电科技、通富微电
-8. **马来西亚槟城/柔佛**：Intel 封测厂、Infineon 功率半导体、ASE 后段封装
-9. **爱尔兰利默里克/莱克斯利普**：Intel Leixlip Fab、Analog Devices 欧洲总部
-10. **以色列海法/耶路撒冷**：Intel IDC、Tower Semiconductor
+7. **马来西亚槟城/柔佛**：Intel 封测厂、Infineon 功率半导体、ASE 后段封装
+8. **爱尔兰利默里克/莱克斯利普**：Intel Leixlip Fab、Analog Devices 欧洲总部
+9. **以色列海法/耶路撒冷**：Intel IDC、Tower Semiconductor
 
 ## 重点搜索的异常信号类型
 🔴 **供应中断信号**
@@ -51,7 +50,7 @@
     "title": "异动信号标题（简洁概括事件）",
     "source_url": "发现该信息的真实 URL",
     "source_name": "来源地方媒体或产业媒体名称",
-    "track": "所属赛道（从以下选一个：HBM、光模块、液冷、先进封装、高频PCB、AI PCB生产设备、芯片设计、晶圆制造、测试探针、网络互连、边缘AI、算力颠覆、云巨头、光纤光缆、AI服务器、特种气体与材料）",
+    "track": "所属赛道（从以下选一个：EDA与底层IP、AI加速芯片与定制ASIC、先进制程代工、前道晶圆设备与量测、关键晶圆材料与特种工艺、HBM与先进存储、先进封装与混合键合、IC载板与封装材料、数据中心网络与高速电互连、光模块与光引擎、光芯片与硅光、光模块电芯片、光通信无源器件与精密零部件、高频PCB与覆铜板材料、AI PCB设备与关键耗材、数据中心电力与配电、液冷与散热材料、半导体测试设备与探针卡、非GPU计算架构、云巨头/算力租赁/数据基础设施、边缘AI芯片与终端平台、具身智能与机器人平台、光纤光缆与宽带接入）",
     "summary": "100字以内的核心摘要，必须包含具体地点和影响范围",
     "signal_type": "jinnang_3"
   }}

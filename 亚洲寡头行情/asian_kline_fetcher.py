@@ -2,7 +2,7 @@
 """亚洲寡头 250 日 K 线数据拉取器。
 
 从 industry_dict.py 自动读取 VANGUARD_TICKERS，
-筛选出亚洲市场标的（.TW / .KS / .T / .HK），
+筛选出亚洲市场标的（.TW / .TWO / .KS / .T / .HK），
 用 yfinance 拉取 250 个交易日的 OHLCV 日线数据，
 输出 JSON 文件供前端看板渲染 K 线图。
 
@@ -16,7 +16,9 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -36,6 +38,21 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
+
+
+def _ensure_yfinance_cert_bundle() -> None:
+    """为 yfinance/curl_cffi 设置稳定证书路径，避免 Windows venv certifi 路径失效。"""
+    try:
+        import certifi
+
+        cert_dir = os.path.join(tempfile.gettempdir(), "vcp_certs")
+        os.makedirs(cert_dir, exist_ok=True)
+        safe_cert_path = os.path.join(cert_dir, "cacert.pem")
+        if not os.path.exists(safe_cert_path):
+            shutil.copy2(certifi.where(), safe_cert_path)
+        os.environ.setdefault("CURL_CA_BUNDLE", safe_cert_path)
+    except (ImportError, OSError, PermissionError, shutil.Error) as exc:
+        logging.warning(f"⚠️ 无法初始化 yfinance 证书路径: {exc}")
 
 # ===================================================================
 # 亚洲市场后缀映射（与 p6_mapper.py 保持一致）
@@ -127,10 +144,10 @@ def fetch_single_kline(name: str, ticker: str, period: str = "1y") -> dict | Non
 
     Returns:
         {
-            "name": "TEL",
+            "name": "Tokyo Electron",
             "ticker": "8035.T",
             "market": "日本",
-            "track": "晶圆制造与材料设备",
+            "track": "前道晶圆设备与量测",
             "currency": "JPY",
             "klines": [
                 {"date": "2025-04-01", "open": 100, "high": 105, "low": 98, "close": 103, "volume": 12345},
@@ -139,6 +156,7 @@ def fetch_single_kline(name: str, ticker: str, period: str = "1y") -> dict | Non
         }
     """
     try:
+        _ensure_yfinance_cert_bundle()
         t = yf.Ticker(ticker)
         hist = t.history(period=period)
 

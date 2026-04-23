@@ -254,7 +254,7 @@ def _rss_name_to_category(name: str) -> str:
     if any(kw in name_lower for kw in ('lightwave', 'fierce_telecom', 'telecom', 'fiber', 'optical')):
         return '光通信产业链'
     if any(kw in name_lower for kw in ('datacenter', 'data_center')):
-        return 'AI服务器基建'
+        return '数据中心基建'
     if any(kw in name_lower for kw in ('elec_kr', 'thelec', 'hbm', 'hynix', 'samsung_semi')):
         return 'HBM与存储'
     if any(kw in name_lower for kw in ('fierceelectronics', 'fierce_electronics')):

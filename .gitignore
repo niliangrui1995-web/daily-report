@@ -14,6 +14,8 @@ build/
 # 环境变量
 .env
 .env.*
+!.env.example
+!**/.env.example
 
 # 虚拟环境
 .venv/
@@ -32,6 +34,7 @@ Thumbs.db
 # 缓存
 .pytest_cache/
 .ruff_cache/
+.agent/
 
 # 归档历史（已从 git 移除跟踪）
 _archive/

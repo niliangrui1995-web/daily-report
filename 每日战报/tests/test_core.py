@@ -170,6 +170,8 @@ class TestIndustryDict:
         assert VANGUARD_TICKERS["Shin-Etsu"] == "4063.T"
         assert VANGUARD_TICKERS["SUMCO"] == "3436.T"
         assert VANGUARD_TICKERS["Accretech"] == "7729.T"
+        assert "Murata (村田/MLCC)" in OLIGARCH_DICT["数据中心电力与配电"]
+        assert VANGUARD_TICKERS["Murata"] == "6981.T"
 
     def test_optical_chain_is_split_by_value_source(self):
         """光通信链条应拆清模块、光芯片、电芯片和无源器件"""
@@ -212,6 +214,7 @@ class TestIndustryDict:
             "Arteris": "AIP",
             "MJC": "6871.T",
             "SKC": "011790.KS",
+            "Murata": "6981.T",
         }
         for name, ticker in expected.items():
             assert VANGUARD_TICKERS[name] == ticker
@@ -304,6 +307,7 @@ class TestIndustryDict:
 
         for ticker in ["7735.T", "6113.T", "6278.T", "6925.T", "6594.T"]:
             assert module._find_track(ticker) == "AI PCB设备与关键耗材"
+        assert module._find_track("6981.T") == "数据中心电力与配电"
 
     def test_oligarch_flat(self):
         """展平后应有 100+ 家公司"""

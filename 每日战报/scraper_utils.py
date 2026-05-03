@@ -9,11 +9,14 @@ Scrapling 公共工具 — 统一的正文深挖和 URL 过滤逻辑。
 3. `enrich_search_urls()` 的分级深挖策略（HIGH_VALUE_DOMAINS 完整正文深挖 vs 普通域名仅 meta 提取）是在"深度 vs 速度"之间精心平衡的折中方案，修改排序权重或扩大深挖范围前必须评估总耗时影响。
 """
 
-import time
-import random
+import ipaddress
 import logging
+import random
+import socket
+import time
+from functools import lru_cache
 import requests
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from config import SUMMARY_LEN, SOURCE_CONTENT_SELECTORS, GENERIC_CONTENT_SELECTORS, CONTENT_NOISE_KEYWORDS, FAKE_UA, URL_BLACKLIST
 from http_security import get_tls_policy_for_url, log_tls_policy
 
@@ -43,15 +46,133 @@ HIGH_VALUE_DOMAINS: set[str] = frozenset({
     'techpowerup.com', 'micron.com', 'thelec.kr', 'anandtech.com'
 })
 
+ALLOWED_FETCH_SCHEMES = frozenset({'http', 'https'})
+BLOCKED_HOSTNAMES = frozenset({
+    'localhost',
+    'localhost.localdomain',
+    'ip6-localhost',
+    'ip6-loopback',
+})
+BLOCKED_HOST_SUFFIXES = ('.localhost', '.local', '.internal')
+MAX_SAFE_REDIRECTS = 5
+
+
+def _normalize_hostname(hostname: str) -> str:
+    return hostname.strip().strip('[]').rstrip('.').lower()
+
+
+def _parse_ip_address(hostname: str):
+    host = _normalize_hostname(hostname).split('%', 1)[0]
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
+
+
+def _is_blocked_ip_address(address) -> bool:
+    ip = address if isinstance(address, (ipaddress.IPv4Address, ipaddress.IPv6Address)) else ipaddress.ip_address(address)
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_unspecified
+        or ip.is_reserved
+        or not ip.is_global
+    )
+
+
+def _is_blocked_hostname(hostname: str) -> bool:
+    host = _normalize_hostname(hostname)
+    return host in BLOCKED_HOSTNAMES or host.endswith(BLOCKED_HOST_SUFFIXES)
+
+
+@lru_cache(maxsize=1024)
+def _host_resolves_to_public_addresses(hostname: str) -> bool:
+    try:
+        addr_infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        logging.debug(f'[Scrapling] blocked unresolved fetch host {hostname}: {exc}')
+        return False
+
+    if not addr_infos:
+        return False
+
+    for addr_info in addr_infos:
+        sockaddr = addr_info[4]
+        if not sockaddr:
+            return False
+        try:
+            if _is_blocked_ip_address(sockaddr[0]):
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def _is_safe_external_url(url: str, *, resolve_dns: bool = False) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+
+    if parsed.scheme.lower() not in ALLOWED_FETCH_SCHEMES:
+        return False
+    if not parsed.netloc or not parsed.hostname:
+        return False
+    if parsed.username or parsed.password:
+        return False
+
+    hostname = _normalize_hostname(parsed.hostname)
+    if _is_blocked_hostname(hostname):
+        return False
+
+    ip_address = _parse_ip_address(hostname)
+    if ip_address is not None:
+        return not _is_blocked_ip_address(ip_address)
+
+    if resolve_dns:
+        return _host_resolves_to_public_addresses(hostname)
+    return True
+
+
+def _safe_url_for_fetch(url: str) -> bool:
+    return bool(url) and is_article_url(url) and _is_safe_external_url(url, resolve_dns=True)
+
+
+def _safe_requests_get(url: str, **kwargs) -> requests.Response:
+    current_url = url
+    for _ in range(MAX_SAFE_REDIRECTS + 1):
+        if not _safe_url_for_fetch(current_url):
+            raise requests.exceptions.InvalidURL(f'Blocked unsafe fetch URL: {current_url}')
+
+        response = requests.get(current_url, allow_redirects=False, **kwargs)
+        if not response.is_redirect and not response.is_permanent_redirect:
+            return response
+
+        location = response.headers.get('Location')
+        if not location:
+            return response
+        current_url = urljoin(response.url or current_url, location)
+
+    raise requests.exceptions.TooManyRedirects(f'Too many redirects for URL: {url}')
+
+
 def _is_high_value_domain(url: str) -> bool:
     try:
-        domain = urlparse(url).netloc.lower().replace('www.', '')
-        return any(hv in domain for hv in HIGH_VALUE_DOMAINS)
+        hostname = _normalize_hostname(urlparse(url).hostname or '')
+        if hostname.startswith('www.'):
+            hostname = hostname[4:]
+        return any(hostname == hv or hostname.endswith(f'.{hv}') for hv in HIGH_VALUE_DOMAINS)
     except Exception as e:
         logging.debug(f'Ignored return False exception: {e}')
         return False
 
 def is_article_url(url: str) -> bool:
+    if not url:
+        return True
+    if not _is_safe_external_url(url):
+        return False
     url_lower = url.lower()
     for pattern in URL_BLACKLIST:
         if pattern in url_lower:
@@ -61,10 +182,12 @@ def is_article_url(url: str) -> bool:
 def _quick_meta_extract(url: str) -> str:
     if not scrapling_available or not _Selector:
         return ''
+    if not _safe_url_for_fetch(url):
+        return ''
     try:
         tls_policy = get_tls_policy_for_url(url)
         log_tls_policy('ScraperMeta', url, tls_policy)
-        resp = requests.get(url, headers=HEADERS, timeout=8, verify=tls_policy['verify'])
+        resp = _safe_requests_get(url, headers=HEADERS, timeout=8, verify=tls_policy['verify'])
         if resp.status_code >= 400:
             return ''
         page = _Selector(resp.text)
@@ -129,7 +252,7 @@ def enrich_article_url(url: str, source_name: str = '', return_meta: bool = Fals
          和 Cloudflare 保护站点命中率为 0%。增强策略：
          1. 直连原站 → 2. Google WebCache 镜像 → 3. og:description 降级
     """
-    if not scrapling_available or not url or not is_article_url(url):
+    if not scrapling_available or not _safe_url_for_fetch(url):
         return ''
     try:
         time.sleep(random.uniform(0.2, 0.5))
@@ -152,6 +275,8 @@ def enrich_article_url(url: str, source_name: str = '', return_meta: bool = Fals
         }
 
         for fetch_url in fetch_urls:
+            if not _safe_url_for_fetch(fetch_url):
+                continue
             try:
                 tls_policy = get_tls_policy_for_url(fetch_url)
                 log_tls_policy('ScraperFetch', fetch_url, tls_policy)
@@ -161,7 +286,7 @@ def enrich_article_url(url: str, source_name: str = '', return_meta: bool = Fals
                     'tls_mode': tls_policy['tls_mode'],
                     'insecure_fetch': tls_policy['insecure_fetch'],
                 }
-                resp = requests.get(fetch_url, headers=HEADERS, timeout=12, verify=tls_policy['verify'])
+                resp = _safe_requests_get(fetch_url, headers=HEADERS, timeout=12, verify=tls_policy['verify'])
                 if resp.status_code >= 400:
                     continue
                 content = extract_content_from_html(resp.text, source_name=source_name, url=url)

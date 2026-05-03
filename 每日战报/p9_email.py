@@ -3,18 +3,63 @@
 from __future__ import annotations
 
 import smtplib
+import html as html_lib
 from datetime import datetime
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
 
+ALLOWED_EMAIL_TAGS = frozenset({
+    'a',
+    'blockquote',
+    'br',
+    'code',
+    'em',
+    'h1',
+    'h2',
+    'h3',
+    'h4',
+    'hr',
+    'li',
+    'ol',
+    'p',
+    'pre',
+    'strong',
+    'table',
+    'tbody',
+    'td',
+    'th',
+    'thead',
+    'tr',
+    'ul',
+})
+ALLOWED_EMAIL_ATTRIBUTES = {
+    'a': ['href', 'title'],
+    'td': ['colspan', 'rowspan'],
+    'th': ['colspan', 'rowspan'],
+}
+ALLOWED_EMAIL_PROTOCOLS = ['http', 'https', 'mailto']
+
+
+def _render_safe_report_html(content: str) -> str:
+    import bleach
+    import markdown
+
+    rendered = markdown.markdown(content, extensions=['tables', 'fenced_code'])
+    return bleach.clean(
+        rendered,
+        tags=ALLOWED_EMAIL_TAGS,
+        attributes=ALLOWED_EMAIL_ATTRIBUTES,
+        protocols=ALLOWED_EMAIL_PROTOCOLS,
+        strip=True,
+    )
+
+
 def build_report_email_message(content: str, *, sender_email: str, receiver_email: str, now: datetime | None = None) -> MIMEText:
     now = now or datetime.now()
     try:
-        import markdown
-
-        html = markdown.markdown(content, extensions=['tables', 'fenced_code'])
+        html = _render_safe_report_html(content)
         today_fmt = now.strftime('%Y年%m月%d日 %H:%M')
         html_full = f'''<html><head><meta charset="utf-8"><style>
             * {{margin:0;padding:0;box-sizing:border-box}}
@@ -48,7 +93,7 @@ def build_report_email_message(content: str, *, sender_email: str, receiver_emai
         </body></html>'''
         msg = MIMEText(html_full, 'html', 'utf-8')
     except ImportError:
-        msg = MIMEText(f"<pre>{content}</pre>", 'html', 'utf-8')
+        msg = MIMEText(f"<pre>{html_lib.escape(content)}</pre>", 'html', 'utf-8')
 
     msg['From'] = formataddr(('VCP Hunter', sender_email))
     msg['To'] = receiver_email

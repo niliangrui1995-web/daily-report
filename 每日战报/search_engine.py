@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import threading
 import time
 from datetime import datetime
@@ -118,6 +119,11 @@ search_rotator_cf = SearchKeyRotator(SEARCH_API_KEY_POOL, GEMINI_SEARCH_CF_URL)
 channel_breaker = ChannelCircuitBreaker(threshold=2)
 _http_session = requests.Session()
 GEMINI_CONCURRENCY = max(search_rotator_direct.total, 1)
+_GEMINI_KEY_QUERY_RE = re.compile(r"([?&]key=)[^&\s]+", re.IGNORECASE)
+
+
+def _redact_sensitive_log_text(value: object) -> str:
+    return _GEMINI_KEY_QUERY_RE.sub(r"\1<redacted>", str(value))
 
 P7_STRUCTURED_MODE = "p7"
 _P7_STRUCTURED_RESPONSE_SCHEMA = {
@@ -345,7 +351,7 @@ def _post_search_request(
     temperature: float,
     response_json_schema: dict | None = None,
 ) -> requests.Response:
-    url = f"{base_url}/v1beta/models/{GEMINI_SEARCH_MODEL}:generateContent?key={key}"
+    url = f"{base_url}/v1beta/models/{GEMINI_SEARCH_MODEL}:generateContent"
     generation_config = {
         "temperature": temperature,
         "maxOutputTokens": 8192,
@@ -360,6 +366,7 @@ def _post_search_request(
     }
     return _http_session.post(
         url,
+        params={"key": key},
         json=payload,
         headers={"Content-Type": "application/json"},
         timeout=180,
@@ -427,14 +434,15 @@ def raw_gemini_search(prompt: str, max_retries: int = 3, *, return_dict: bool = 
                     logging.warning(f"[raw_search] connect timeout on {channel_name}")
                     break
                 except Exception as exc:
-                    err_str = str(exc).lower()
-                    if "429" in err_str or "403" in err_str or "quota" in err_str:
+                    err_str = _redact_sensitive_log_text(exc)
+                    err_lower = err_str.lower()
+                    if "429" in err_lower or "403" in err_lower or "quota" in err_lower:
                         logging.warning(f"[raw_search] quota exhausted for key ...{key_last4}")
                         rotator.mark_exhausted(key_idx)
                         break
                     wait = 3 * (2**attempt) + random.uniform(0, 2)
                     logging.warning(
-                        f"[raw_search] exception on {channel_name}: {exc}; retry in {wait:.0f}s ({attempt + 1}/{max_retries})"
+                        f"[raw_search] exception on {channel_name}: {err_str}; retry in {wait:.0f}s ({attempt + 1}/{max_retries})"
                     )
                     time.sleep(wait)
 
@@ -508,14 +516,15 @@ def gemini_search(
                     logging.warning(f"[{category}] connect timeout on {channel_name}")
                     break
                 except Exception as exc:
-                    err_str = str(exc).lower()
-                    if "429" in err_str or "403" in err_str or "quota" in err_str:
+                    err_str = _redact_sensitive_log_text(exc)
+                    err_lower = err_str.lower()
+                    if "429" in err_lower or "403" in err_lower or "quota" in err_lower:
                         logging.warning(f"[{category}] quota exhausted for key ...{key_last4}")
                         rotator.mark_exhausted(key_idx)
                         break
                     wait = 3 * (2**attempt) + random.uniform(0, 2)
                     logging.warning(
-                        f"[{category}] exception on {channel_name}: {exc}; retry in {wait:.0f}s ({attempt + 1}/{max_retries})"
+                        f"[{category}] exception on {channel_name}: {err_str}; retry in {wait:.0f}s ({attempt + 1}/{max_retries})"
                     )
                     time.sleep(wait)
 

@@ -23,6 +23,7 @@ ratelimit>=2.2.1              # API 调速
 
 # === 邮件 ===
 markdown>=3.5.0               # 战报 HTML 渲染
+bleach>=6.2.0                 # sanitize report email HTML
 
 # === 开发与验证 ===
 pytest>=8.0.0                # 单元测试

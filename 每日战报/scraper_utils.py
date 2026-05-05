@@ -22,6 +22,7 @@ from http_security import get_tls_policy_for_url, log_tls_policy
 
 scrapling_available = False
 _Selector = None
+DEFAULT_FETCH_TIMEOUT = 12
 
 try:
     from scrapling import Selector as _Selector
@@ -142,11 +143,12 @@ def _safe_url_for_fetch(url: str) -> bool:
 
 def _safe_requests_get(url: str, **kwargs) -> requests.Response:
     current_url = url
+    timeout = kwargs.pop('timeout', DEFAULT_FETCH_TIMEOUT)
     for _ in range(MAX_SAFE_REDIRECTS + 1):
         if not _safe_url_for_fetch(current_url):
             raise requests.exceptions.InvalidURL(f'Blocked unsafe fetch URL: {current_url}')
 
-        response = requests.get(current_url, allow_redirects=False, **kwargs)
+        response = requests.get(current_url, allow_redirects=False, timeout=timeout, **kwargs)
         if not response.is_redirect and not response.is_permanent_redirect:
             return response
 

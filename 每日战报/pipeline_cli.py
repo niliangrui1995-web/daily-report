@@ -104,15 +104,21 @@ def configure_run_logging() -> None:
 
 
 def _run_orchestrator(flags: list[str], *, command_name: str) -> int:
-    from orchestrator import orchestrator_main
-
-    preflight_result = _collect_preflight(strict=False)
+    preflight_result = _collect_preflight(strict=True)
     set_preflight_summary(preflight_result["summary"])
     try:
         explain_preflight_and_record(preflight_result)
     except Exception:
         pass
+
+    preflight_exit_code = int(preflight_result.get("summary", {}).get("exit_code", EXIT_CHECK_FAILED))
+    if preflight_exit_code != EXIT_OK:
+        _print_preflight(preflight_result)
+        return preflight_exit_code
+
     configure_run_logging()
+    from orchestrator import orchestrator_main
+
     try:
         with acquire_run_lock(command=command_name):
             orchestrator_main(flags)

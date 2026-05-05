@@ -120,10 +120,69 @@ channel_breaker = ChannelCircuitBreaker(threshold=2)
 _http_session = requests.Session()
 GEMINI_CONCURRENCY = max(search_rotator_direct.total, 1)
 _GEMINI_KEY_QUERY_RE = re.compile(r"([?&]key=)[^&\s]+", re.IGNORECASE)
+_SEARCH_PERMISSION_MARKERS = (
+    "permission_denied",
+    "service_disabled",
+    "cloud code private api",
+    "cloudcode-pa.googleapis.com",
+    "api has not been used",
+)
+_SEARCH_QUOTA_MARKERS = (
+    "resource_exhausted",
+    "quota",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+)
 
 
 def _redact_sensitive_log_text(value: object) -> str:
     return _GEMINI_KEY_QUERY_RE.sub(r"\1<redacted>", str(value))
+
+
+def _search_response_text(response: requests.Response) -> str:
+    return _redact_sensitive_log_text(getattr(response, "text", ""))
+
+
+def _classify_search_http_response(response: requests.Response) -> str:
+    status_code = getattr(response, "status_code", 0)
+    if status_code == 429:
+        return "quota_exhausted"
+    if status_code != 403:
+        return ""
+
+    text = _search_response_text(response).lower()
+    if any(marker in text for marker in _SEARCH_PERMISSION_MARKERS):
+        return "permission_denied"
+    if any(marker in text for marker in _SEARCH_QUOTA_MARKERS):
+        return "quota_exhausted"
+    return "forbidden"
+
+
+def _handle_search_limited_response(
+    *,
+    category: str,
+    channel_name: str,
+    rotator: SearchKeyRotator,
+    key_idx: int,
+    key_last4: str,
+    response: requests.Response,
+) -> bool:
+    classification = _classify_search_http_response(response)
+    if not classification:
+        return False
+
+    if classification == "quota_exhausted":
+        logging.warning(f"[{category}] key ...{key_last4} limited on {channel_name}")
+        rotator.mark_exhausted(key_idx)
+        return True
+
+    channel_breaker.record_failure(channel_name)
+    logging.warning(
+        f"[{category}] {classification} on {channel_name}; keep key ...{key_last4} available | "
+        f"{_search_response_text(response)[:240]}"
+    )
+    return True
 
 P7_STRUCTURED_MODE = "p7"
 _P7_STRUCTURED_RESPONSE_SCHEMA = {
@@ -413,9 +472,14 @@ def raw_gemini_search(prompt: str, max_retries: int = 3, *, return_dict: bool = 
                         prompt=prompt,
                         temperature=0.7,
                     )
-                    if response.status_code in (429, 403):
-                        logging.warning(f"[raw_search] key ...{key_last4} limited on {channel_name}")
-                        rotator.mark_exhausted(key_idx)
+                    if _handle_search_limited_response(
+                        category="raw_search",
+                        channel_name=channel_name,
+                        rotator=rotator,
+                        key_idx=key_idx,
+                        key_last4=key_last4,
+                        response=response,
+                    ):
                         break
 
                     response.raise_for_status()
@@ -488,9 +552,14 @@ def gemini_search(
                         temperature=1.0,
                         response_json_schema=response_json_schema,
                     )
-                    if response.status_code in (429, 403):
-                        logging.warning(f"[{category}] key ...{key_last4} limited on {channel_name}")
-                        rotator.mark_exhausted(key_idx)
+                    if _handle_search_limited_response(
+                        category=category,
+                        channel_name=channel_name,
+                        rotator=rotator,
+                        key_idx=key_idx,
+                        key_last4=key_last4,
+                        response=response,
+                    ):
                         break
 
                     response.raise_for_status()

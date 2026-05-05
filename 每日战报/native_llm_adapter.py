@@ -553,16 +553,25 @@ class NativeLLMAdapter(RunnableSerializable):
                 resp.raise_for_status()
                 data = resp.json()
 
-                # 尝试从 Responses API 解析最终回答内容
                 text = ""
-                # 如果模型决定先执行搜索，Responses API 通常会自动完成后台隐式调用并在最终 content 输出，或需要自己追溯
                 if "output" in data:
-                    # 遍历 output 取文本，跳过 tool_call （除非需要手动处理）
                     for block in data["output"]:
-                        if isinstance(block, dict) and "text" in block:
-                            text += block["text"] + "\n"
-                        elif isinstance(block, str):
+                        if isinstance(block, str):
                             text += block + "\n"
+                            continue
+                        if not isinstance(block, dict):
+                            continue
+                        if "text" in block:
+                            text += str(block["text"]) + "\n"
+                        content_blocks = block.get("content")
+                        if isinstance(content_blocks, str):
+                            text += content_blocks + "\n"
+                        elif isinstance(content_blocks, list):
+                            for content_block in content_blocks:
+                                if isinstance(content_block, str):
+                                    text += content_block + "\n"
+                                elif isinstance(content_block, dict) and "text" in content_block:
+                                    text += str(content_block.get("text") or "") + "\n"
                 return text.strip()
             except Exception as e:
                 wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)

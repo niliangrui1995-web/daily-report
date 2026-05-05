@@ -8,6 +8,8 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -211,6 +213,51 @@ class TestReportStage:
 
 
 class TestPreflightChecks:
+    def test_run_blocks_before_orchestrator_when_strict_preflight_fails(self, monkeypatch):
+        import pipeline_cli
+
+        calls = []
+        failing_result = {
+            "strict": True,
+            "checks": [
+                {
+                    "name": "antigravity_key",
+                    "ok": False,
+                    "detail": "missing",
+                    "severity": "error",
+                }
+            ],
+            "summary": {
+                "total": 1,
+                "failed": 1,
+                "warnings": 0,
+                "exit_code": pipeline_cli.EXIT_CHECK_FAILED,
+            },
+        }
+
+        @contextmanager
+        def fake_lock(**_kwargs):
+            calls.append("lock")
+            yield {}
+
+        monkeypatch.setattr(pipeline_cli, "_collect_preflight", lambda strict: failing_result)
+        monkeypatch.setattr(pipeline_cli, "_print_preflight", lambda result: result["summary"]["exit_code"])
+        monkeypatch.setattr(pipeline_cli, "set_preflight_summary", lambda summary: calls.append(("summary", summary)))
+        monkeypatch.setattr(pipeline_cli, "explain_preflight_and_record", lambda result: calls.append("agent"))
+        monkeypatch.setattr(pipeline_cli, "configure_run_logging", lambda: calls.append("logging"))
+        monkeypatch.setattr(pipeline_cli, "acquire_run_lock", fake_lock)
+        monkeypatch.setitem(
+            sys.modules,
+            "orchestrator",
+            SimpleNamespace(orchestrator_main=lambda flags: calls.append(("orchestrator", flags))),
+        )
+
+        result = pipeline_cli._run_orchestrator([], command_name="run")
+
+        assert result == pipeline_cli.EXIT_CHECK_FAILED
+        assert "lock" not in calls
+        assert not any(call[0] == "orchestrator" for call in calls if isinstance(call, tuple))
+
     def test_preflight_strict_returns_lock_exit_code(self, monkeypatch, tmp_path):
         import pipeline_cli
 

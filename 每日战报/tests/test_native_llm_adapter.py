@@ -124,6 +124,34 @@ class TestProviderErrorClassification:
         assert result.content == "OK"
         assert result.thinking_content == "trace"
 
+    def test_grok_native_parses_responses_message_output_text(self, monkeypatch):
+        import requests
+
+        from native_llm_adapter import NativeLLMAdapter
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "Grok answer"},
+                            ],
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(requests, "post", lambda *args, **kwargs: FakeResponse())
+
+        adapter = NativeLLMAdapter(model="grok-4-1-fast-reasoning", api_key="secret", max_retries=1)
+
+        assert adapter._call_grok_native("system", "user") == "Grok answer"
+
 
 class TestAuditFailureTelemetry:
     def test_p5_empty_output_includes_last_error_details(self, monkeypatch):

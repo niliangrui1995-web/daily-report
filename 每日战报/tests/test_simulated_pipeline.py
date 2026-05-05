@@ -114,6 +114,13 @@ class TestScheduledLauncherSimulation:
 
 
 class TestRunDailyBatchSimulation:
+    def test_run_daily_defaults_to_strict_preflight(self):
+        source_batch = Path(__file__).resolve().parents[2] / "run_daily.bat"
+
+        assert 'if not defined RUN_DAILY_PREFLIGHT set "RUN_DAILY_PREFLIGHT=strict"' in source_batch.read_text(
+            encoding="utf-8"
+        )
+
     def test_run_daily_auto_resumes_once_after_failed_run(self, tmp_path):
         if os.name != "nt":
             return

@@ -109,6 +109,35 @@ def test_safe_requests_get_rejects_redirect_to_private_host(monkeypatch):
     assert calls == [("https://example.com/start", False)]
 
 
+def test_safe_requests_get_applies_default_timeout(monkeypatch):
+    import scraper_utils
+
+    scraper_utils._host_resolves_to_public_addresses.cache_clear()
+    calls = []
+
+    def fake_getaddrinfo(host, port, type=0):
+        assert host == "example.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+
+    class OkResponse:
+        status_code = 200
+        headers = {}
+        url = "https://example.com/news"
+        is_redirect = False
+        is_permanent_redirect = False
+
+    def fake_get(url, **kwargs):
+        calls.append(kwargs)
+        return OkResponse()
+
+    monkeypatch.setattr(scraper_utils.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(scraper_utils.requests, "get", fake_get)
+
+    scraper_utils._safe_requests_get("https://example.com/news", headers={}, verify=True)
+
+    assert calls[0]["timeout"] == 12
+
+
 def test_search_exception_logging_redacts_gemini_key(monkeypatch, caplog):
     import search_engine
 
@@ -134,6 +163,37 @@ def test_search_exception_logging_redacts_gemini_key(monkeypatch, caplog):
     assert search_engine.raw_gemini_search("test prompt", max_retries=1) == ""
     assert secret not in caplog.text
     assert "key=<redacted>" in caplog.text
+
+
+def test_search_permission_denied_403_does_not_exhaust_gemini_key(monkeypatch, caplog):
+    import search_engine
+
+    secret = "SECRETKEY123"
+
+    class PermissionDeniedResponse:
+        status_code = 403
+        url = "https://api.niliangrui.cloud/v1beta/models/test:generateContent"
+        text = (
+            "403 PERMISSION_DENIED: Cloud Code Private API has not been used. "
+            "SERVICE_DISABLED cloudcode-pa.googleapis.com"
+        )
+
+        def raise_for_status(self):
+            raise requests.HTTPError(self.text, response=self)
+
+    direct_rotator = search_engine.SearchKeyRotator([secret], "https://example.invalid")
+    monkeypatch.setattr(search_engine, "search_rotator_direct", direct_rotator)
+    monkeypatch.setattr(search_engine, "search_rotator_cf", search_engine.SearchKeyRotator([], "https://example.invalid"))
+    monkeypatch.setattr(search_engine, "channel_breaker", search_engine.ChannelCircuitBreaker(threshold=99))
+    monkeypatch.setattr(search_engine, "_post_search_request", lambda **kwargs: PermissionDeniedResponse())
+    monkeypatch.setattr(search_engine, "_tavily_fallback", lambda *args, **kwargs: {})
+    monkeypatch.setattr(search_engine.time, "sleep", lambda seconds: None)
+
+    caplog.set_level(logging.WARNING)
+
+    assert search_engine.raw_gemini_search("test prompt", max_retries=1) == ""
+    assert direct_rotator.available == 1
+    assert "permission_denied" in caplog.text
 
 
 def test_report_email_sanitizes_html_and_unsafe_links():

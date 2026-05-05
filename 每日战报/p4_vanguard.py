@@ -20,7 +20,7 @@ import traceback
 from datetime import date, datetime
 
 from artifact_store import update_run_manifest, write_text_artifact
-from industry_dict import VANGUARD_TICKERS, SUPER_GIANTS, classify_vanguard_signal
+from industry_dict import VANGUARD_TICKERS, SUPER_GIANTS, STRATEGIC_GIANTS, classify_vanguard_signal
 from run_config import _get_prev_trading_day
 
 def fetch_vanguard_prices() -> str:
@@ -62,7 +62,12 @@ def fetch_vanguard_prices() -> str:
 
         def _fetch_single(name: str, ticker: str) -> str:
             time.sleep(0.3)
-            tier = '超级巨头' if name in SUPER_GIANTS else '中型标的'
+            if name in SUPER_GIANTS:
+                tier = '超级巨头'
+            elif name in STRATEGIC_GIANTS:
+                tier = '战略核心'
+            else:
+                tier = '中型标的'
             max_retries = 3
 
             for attempt in range(max_retries):

@@ -31,7 +31,7 @@ from artifact_store import update_run_manifest, write_json_artifact, write_text_
 from intel_structuring import parse_p2_structured_items, render_p2_structured_markdown
 from utils import parse_backtrack_hours
 from settings import require_prompt, GROK_API_KEY
-from industry_dict import OLIGARCH_DICT, SUPER_GIANTS
+from industry_dict import OLIGARCH_DICT, SUPER_GIANTS, STRATEGIC_GIANTS
 
 GROK_BASE_URL = 'https://api.x.ai'
 GROK_MODEL = 'grok-4-1-fast-reasoning'
@@ -106,11 +106,13 @@ def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, d
         track_lines.append(f'{i}. {track} ({companies_str})')
 
     industry_tracks = '\n'.join(track_lines)
-    super_giants_str = ', '.join(SUPER_GIANTS)
+    super_giants_str = ', '.join(sorted(SUPER_GIANTS))
+    strategic_giants_str = ', '.join(sorted(STRATEGIC_GIANTS))
 
     system_prompt_content = raw_system_prompt.replace('{{track_count}}', str(len(OLIGARCH_DICT)))
     system_prompt_content = system_prompt_content.replace('{{industry_tracks}}', industry_tracks)
     system_prompt_content = system_prompt_content.replace('{{super_giants}}', super_giants_str)
+    system_prompt_content = system_prompt_content.replace('{{strategic_giants}}', strategic_giants_str)
 
     headers = {
         'Authorization': f'Bearer {GROK_API_KEY}',

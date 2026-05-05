@@ -325,8 +325,30 @@ class TestIndustryDict:
     def test_super_giants(self):
         """超级巨头名单应包含核心标的"""
         from industry_dict import SUPER_GIANTS
-        for name in ["NVIDIA", "TSMC", "Apple", "Microsoft"]:
+        for name in ["NVIDIA", "TSMC", "Apple", "Microsoft", "Samsung", "ASML"]:
             assert name in SUPER_GIANTS
+
+    def test_strategic_giants_are_second_tier_watchlist(self):
+        """战略核心观察池不应享受超级巨头低阈值"""
+        from industry_dict import STRATEGIC_GIANTS, SUPER_GIANTS, VANGUARD_TICKERS
+        expected = {
+            "SK Hynix",
+            "Micron",
+            "AMD",
+            "Oracle",
+            "Intel",
+            "Applied Materials",
+            "Lam Research",
+            "KLA",
+            "ARM",
+            "Arista Networks",
+            "Qualcomm",
+            "TE Connectivity",
+            "Marvell",
+        }
+        assert expected <= STRATEGIC_GIANTS
+        assert STRATEGIC_GIANTS.isdisjoint(SUPER_GIANTS)
+        assert all(name in VANGUARD_TICKERS for name in STRATEGIC_GIANTS)
 
     def test_classify_giant_surge(self):
         """超级巨头 +5% 应触发大涨催化"""
@@ -342,6 +364,11 @@ class TestIndustryDict:
         """中型标的 +3% 应为正常"""
         from industry_dict import classify_vanguard_signal
         assert "正常" in classify_vanguard_signal("Credo", 3.0)
+
+    def test_classify_strategic_giant_keeps_normal_threshold(self):
+        """战略核心 +3% 仍按常规阈值处理"""
+        from industry_dict import classify_vanguard_signal
+        assert "正常" in classify_vanguard_signal("AMD", 3.0)
 
     def test_classify_midcap_surge(self):
         """中型标的 +5% 应触发大涨催化"""

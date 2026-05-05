@@ -6,13 +6,14 @@
 - ALL_OLIGARCHS_FLAT: 展平后的全量公司列表
 - VANGUARD_TICKERS: 核心标的池（用于 yfinance 行情注入）
 - SUPER_GIANTS: 万亿级市值超级巨头
+- STRATEGIC_GIANTS: 二级超大盘/关键链主观察池
 - classify_vanguard_signal(): 信号分级函数
 
 【⚠️核心维护规则 / Agent 指令】
 1. 凡向 OLIGARCH_DICT 新增公司时，必须查询其是否为独立上市企业。若已上市，**必须同步加入 VANGUARD_TICKERS**，并严格带上 yfinance 要求的国家后缀（.T=日本 .TW=台湾 .TWO=台湾上柜 .KS=韩国 .HK=香港 .AS=阿姆斯特丹 .PA=巴黎 .L=伦敦 .DE=法兰克福 .MI=米兰，美股无后缀）。若未上市（子公司/被收购），仅保留在 OLIGARCH_DICT；若核心业务由上市母公司承载，OLIGARCH_DICT 必须写成“上市母公司 (核心资产)”口径。
 2. 中国大陆注册或核心经营主体位于中国大陆的公司，不进入 OLIGARCH_DICT/VANGUARD_TICKERS；台湾公司保留。
 3. 当公司被收购或退市时，必须从 VANGUARD_TICKERS 中移除其 Ticker（可在 OLIGARCH_DICT 中用注释标注退市原因留档），参考 Shinko 退市处理的先例。
-4. `classify_vanguard_signal()` 的信号阈值（超级巨头 ±3%/±5%，中型 ±5%/±8%）和 SUPER_GIANTS 名单是核心商业判断，修改前必须与策略决策者确认，不可凭直觉随意调整。
+4. `classify_vanguard_signal()` 的信号阈值（超级巨头 ±3%/±5%，中型 ±5%/±8%）和 SUPER_GIANTS 名单是核心商业判断，修改前必须与策略决策者确认，不可凭直觉随意调整；STRATEGIC_GIANTS 只用于观察池强调，不享受超级巨头低阈值。
 """
 
 OLIGARCH_DICT = {
@@ -29,7 +30,7 @@ OLIGARCH_DICT = {
     '光芯片与硅光': ['Coherent (高意)', 'Lumentum (朗明特)', 'Intel Silicon Photonics', 'Ayar Labs', 'Lightmatter', 'Sumitomo E (住友电工)'],
     '光模块电芯片': ['Broadcom (博通)', 'Marvell (迈威尔)', 'Semtech', 'MACOM', 'MaxLinear', 'Credo'],
     '光通信无源器件与精密零部件': ['Amphenol (安费诺)', 'TE Connectivity', 'Corning Optical (康宁光纤)', 'Fujikura (藤仓)', 'US Conec', 'SENKO', 'Molex'],
-    '高频PCB与覆铜板材料': ['Rogers (罗杰斯)', 'Panasonic MEGTRON', 'EMC (台光电)', 'Iteq (联茂)', 'Doosan (斗山)', 'Nan Ya (南亚)', 'Nittobo (日东纺)', 'Asahi Kasei (旭化成)', 'Resonac (力森诺科)', 'MGC (三菱瓦斯化学)', 'Mitsui Mining (三井金属)', 'Furukawa (古河电工)', 'Wus (华通)', 'Compeq (健鼎)'],
+    '高频PCB与覆铜板材料': ['Rogers (罗杰斯)', 'Panasonic MEGTRON', 'EMC (台光电)', 'Iteq (联茂)', 'Kingboard Laminates (建滔积层板)', 'Doosan (斗山)', 'Nan Ya (南亚)', 'Nittobo (日东纺)', 'Asahi Kasei (旭化成)', 'Resonac (力森诺科)', 'MGC (三菱瓦斯化学)', 'Mitsui Mining (三井金属)', 'Furukawa (古河电工)', 'Wus (华通)', 'Compeq (健鼎)'],
     'AI PCB设备与关键耗材': ['KLA (Orbotech/LDI/AOI)', 'MKS Instruments (Atotech/ESI)', 'SCREEN Holdings (Ledia)', 'Nidec Advance Technology', 'Mycronic (atg Luther & Maelzer)', 'AMADA Via Mechanics', 'SCHMID Group', 'Union Tool', 'Ushio (ADTEC Engineering)'],
     '数据中心电力与配电': ['Vertiv (维谛)', 'Eaton (伊顿)', 'Schneider (施耐德)', 'nVent', 'Delta (台达电)', 'MPS', 'Murata (村田/MLCC)'],
     '液冷与散热材料': ['CoolIT', 'Auras (奇鋐)', 'AVC (双鸿)', 'Delta (台达电)', 'Nidec (日本电产)', 'AGC (旭硝子)'],
@@ -103,6 +104,7 @@ VANGUARD_TICKERS = {
     'Panasonic': '6752.T',
     'EMC': '2383.TW',
     'Iteq': '6213.TW',
+    'Kingboard Laminates': '1888.HK',
     'Doosan': '000150.KS',
     'Nan Ya': '1303.TW',
     'Nittobo': '3110.T',
@@ -157,7 +159,23 @@ VANGUARD_TICKERS = {
     'Prysmian': 'PRY.MI'
 }
 
-SUPER_GIANTS = set(['Meta', 'Apple', 'Broadcom', 'NVIDIA', 'Google', 'Tesla', 'TSMC', 'Microsoft', 'ASML', 'Amazon'])
+SUPER_GIANTS = set(['Meta', 'Apple', 'Broadcom', 'NVIDIA', 'Google', 'Tesla', 'TSMC', 'Microsoft', 'ASML', 'Amazon', 'Samsung'])
+
+STRATEGIC_GIANTS = set([
+    'SK Hynix',
+    'Micron',
+    'AMD',
+    'Oracle',
+    'Intel',
+    'Applied Materials',
+    'Lam Research',
+    'KLA',
+    'ARM',
+    'Arista Networks',
+    'Qualcomm',
+    'TE Connectivity',
+    'Marvell',
+])
 
 def classify_vanguard_signal(name: str, pct_change: float) -> str:
     if name in SUPER_GIANTS:

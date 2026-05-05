@@ -10,6 +10,9 @@
 ## 超级巨头特别监控（极低信号阈值）
 {{super_giants}}
 
+## 战略核心观察池（二级超大盘/关键链主，常规信号阈值）
+{{strategic_giants}}
+
 ## 重点关注的 X 账号类型
 - 产业链 insider / leaker（如 @kopite7kimi, @dylan522p, @harukaze5719）
 - 半导体分析师和记者

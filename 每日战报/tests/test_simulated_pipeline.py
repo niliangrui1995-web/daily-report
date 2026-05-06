@@ -51,6 +51,26 @@ def _write_day_file(path: Path, prices: list[float]) -> None:
 
 
 class TestScheduledLauncherSimulation:
+    def test_launcher_help_does_not_start_pipeline(self, monkeypatch, capsys):
+        import scheduled_launcher
+
+        def fail_schedule(_day):
+            raise AssertionError("help should exit before schedule evaluation")
+
+        def fail_run(*_args, **_kwargs):
+            raise AssertionError("help should exit before launching pipeline")
+
+        monkeypatch.setattr(scheduled_launcher, "get_schedule_decision", fail_schedule)
+        monkeypatch.setattr(scheduled_launcher.subprocess, "run", fail_run)
+
+        try:
+            scheduled_launcher.main(["--help"])
+        except SystemExit as exc:
+            assert exc.code == 0
+
+        captured = capsys.readouterr()
+        assert "usage:" in captured.out
+
     def test_launcher_invokes_pipeline_cli_on_trading_day(self, monkeypatch):
         import scheduled_launcher
 

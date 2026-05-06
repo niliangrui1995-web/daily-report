@@ -1,3 +1,4 @@
+import argparse
 import logging
 import os
 import subprocess
@@ -26,7 +27,16 @@ logging.basicConfig(
 )
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="VCP Hunter scheduled launcher")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    if argv is None:
+        argv = []
+    build_parser().parse_args(argv)
+
     today = date.today()
     schedule = get_schedule_decision(today)
     if not schedule["is_trading_day"]:
@@ -51,4 +61,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

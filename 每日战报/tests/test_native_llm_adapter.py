@@ -41,6 +41,18 @@ class TestProviderErrorClassification:
         assert info["category"] == "risk_control"
         assert info["retryable"] is True
 
+    def test_proxy_eof_500_maps_to_network_error(self):
+        from native_llm_adapter import _classify_provider_error
+
+        info = _classify_provider_error(
+            RuntimeError(
+                """Error code: 500 - {'error': {'message': 'Post "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:generateContent": EOF', 'type': 'server_error', 'code': 'internal_server_error'}}"""
+            )
+        )
+
+        assert info["category"] == "network_error"
+        assert info["retryable"] is True
+
     def test_antigravity_v1_routes_gemini_31_pro_to_openai_compat(self):
         from native_llm_adapter import NativeLLMAdapter
 
@@ -103,9 +115,11 @@ class TestProviderErrorClassification:
 
         fake_message = SimpleNamespace(content="OK", reasoning_content="trace")
         fake_response = SimpleNamespace(choices=[SimpleNamespace(message=fake_message)])
+        client_kwargs = {}
 
         class FakeOpenAI:
             def __init__(self, *args, **kwargs):
+                client_kwargs.update(kwargs)
                 self.chat = SimpleNamespace(
                     completions=SimpleNamespace(create=lambda **create_kwargs: fake_response)
                 )
@@ -123,6 +137,7 @@ class TestProviderErrorClassification:
 
         assert result.content == "OK"
         assert result.thinking_content == "trace"
+        assert client_kwargs["max_retries"] == 0
 
     def test_grok_native_parses_responses_message_output_text(self, monkeypatch):
         import requests

@@ -158,7 +158,7 @@ def _get_pro_adapter():
     global _pro_adapter
     if _pro_adapter is None:
         from native_llm_adapter import NativeLLMAdapter
-        _pro_adapter = NativeLLMAdapter(model=GEMINI_PRO_MODEL, base_url=PRO_OPUS_BASE_URL, api_key=PRO_OPUS_API_KEY, max_retries=5)
+        _pro_adapter = NativeLLMAdapter(model=GEMINI_PRO_MODEL, base_url=PRO_OPUS_BASE_URL, api_key=PRO_OPUS_API_KEY, max_retries=3)
     return _pro_adapter
 
 def _get_opus_adapter():

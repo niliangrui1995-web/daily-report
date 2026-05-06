@@ -74,7 +74,14 @@ def _classify_provider_error(error: Exception) -> Dict[str, Any]:
         return {'category': 'rate_limit', 'retryable': True}
     if 'timeout' in err_lower or 'deadline' in err_lower:
         return {'category': 'timeout', 'retryable': True}
-    if 'connection' in err_lower or 'ssl' in err_lower or 'proxy' in err_lower:
+    if (
+        'connection' in err_lower
+        or 'ssl' in err_lower
+        or 'proxy' in err_lower
+        or 'eof' in err_lower
+        or 'internal_server_error' in err_lower
+        or 'server_error' in err_lower
+    ):
         return {'category': 'network_error', 'retryable': True}
     return {'category': 'unknown_error', 'retryable': True}
 
@@ -409,6 +416,9 @@ class NativeLLMAdapter(RunnableSerializable):
         error_info = _classify_provider_error(error)
         self._set_last_error(error_info['category'], str(error))
         wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
+        if attempt >= self.max_retries - 1:
+            logger.error(f"[{provider_label}] final attempt failed: {error}")
+            return False
 
         if error_info['category'] == 'permission_denied':
             logger.error(f"🚫 [{provider_label}] 权限/项目配置错误，停止重试: {error}")
@@ -589,7 +599,8 @@ class NativeLLMAdapter(RunnableSerializable):
         if getattr(self, '_openai_client', None) is None:
             from openai import OpenAI
             base_url = self.base_url + '/v1' if not self.base_url.endswith('/v1') else self.base_url
-            client = OpenAI(api_key=self.api_key, base_url=base_url)
+            # Keep retry budgeting in this adapter instead of the SDK's hidden retry loop.
+            client = OpenAI(api_key=self.api_key, base_url=base_url, max_retries=0)
             object.__setattr__(self, '_openai_client', client)
         client = getattr(self, '_openai_client')
 

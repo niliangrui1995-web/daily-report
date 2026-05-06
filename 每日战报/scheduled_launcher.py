@@ -43,7 +43,7 @@ def main(argv: list[str] | None = None) -> None:
         logging.info("today is not a trading day, skip scheduled run")
         raise SystemExit(0)
     if not schedule["should_run"]:
-        logging.info("today is a skipped trading day by alternate schedule, skip run | %s", schedule["reason"])
+        logging.info("scheduled rule skipped today's run | %s", schedule["reason"])
         raise SystemExit(0)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))

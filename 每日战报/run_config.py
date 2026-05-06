@@ -4,7 +4,7 @@
 从 p6_mapper.py 拆分，原属"上帝模块"的一部分。
 
 【⚠️核心维护规则 / Agent 指令】
-1. get_run_config() 的回溯窗口计算依赖统一交易日历与“周内隔一个交易日更新”规则，
+1. get_run_config() 的回溯窗口计算依赖统一交易日历与“每个交易日更新”规则，
    修改时必须确保与
    scheduled_launcher.py 的交易日判断完全一致。
 """
@@ -15,11 +15,9 @@ import os
 from datetime import date, datetime
 
 from trading_calendar import (
-    get_prev_alternate_update_trading_day,
     get_prev_trading_day,
     get_trading_day_index_in_week,
     get_week_trading_days,
-    is_alternate_update_trading_day,
     is_trading_day as _is_td,
 )
 
@@ -43,16 +41,15 @@ def get_schedule_decision(today: date) -> dict:
 
     trading_day_index = get_trading_day_index_in_week(today)
     week_trading_days = get_week_trading_days(today)
-    should_run = is_alternate_update_trading_day(today)
-    anchor_day = get_prev_alternate_update_trading_day(today)
+    anchor_day = get_prev_trading_day(today)
     reason = (
         f"week_trading_day_index={trading_day_index}, "
         f"week_trading_days={[day.isoformat() for day in week_trading_days]}, "
-        f"schedule_rule=run_on_odd_trading_days"
+        f"schedule_rule=run_every_trading_day"
     )
     return {
         "is_trading_day": True,
-        "should_run": should_run,
+        "should_run": True,
         "reason": reason,
         "trading_day_index_in_week": trading_day_index,
         "week_trading_days": week_trading_days,

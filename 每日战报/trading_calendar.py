@@ -111,20 +111,6 @@ def get_trading_day_index_in_week(d: date) -> int:
     return 0
 
 
-def is_alternate_update_trading_day(d: date) -> bool:
-    trading_day_index = get_trading_day_index_in_week(d)
-    return trading_day_index > 0 and trading_day_index % 2 == 1
-
-
-def get_prev_alternate_update_trading_day(d: date) -> date:
-    current = d
-    for _ in range(MAX_TRADING_DAY_LOOKBACK):
-        current = get_prev_trading_day(current)
-        if is_alternate_update_trading_day(current):
-            return current
-    return get_prev_trading_day(d)
-
-
 def get_calendar_mode() -> str:
     return 'chinese_calendar' if _HAS_CALENDAR_LIB else 'weekend_only_fallback'
 

@@ -116,7 +116,7 @@ class TestScheduledLauncherSimulation:
             lambda d: {
                 "is_trading_day": True,
                 "should_run": False,
-                "reason": "week_trading_day_index=2, schedule_rule=run_on_odd_trading_days",
+                "reason": "schedule_rule=test_skip",
             },
         )
         monkeypatch.setattr(
@@ -315,7 +315,7 @@ class TestOrchestratorSimulation:
             lambda day: {
                 "is_trading_day": True,
                 "should_run": False,
-                "reason": "week_trading_day_index=2, schedule_rule=run_on_odd_trading_days",
+                "reason": "schedule_rule=test_skip",
             },
         )
         monkeypatch.setattr(

@@ -68,35 +68,28 @@ class TestTradingCalendar:
             include_end=True,
         ) == 2
 
-    def test_weekly_alternate_schedule_uses_odd_trading_days(self):
-        """周内按第 1/3/5 个交易日更新"""
-        from trading_calendar import get_trading_day_index_in_week, is_alternate_update_trading_day
+    def test_week_trading_day_index_is_available_for_reporting(self):
+        """周内交易日序号保留给日志与 manifest 使用"""
+        from trading_calendar import get_trading_day_index_in_week
 
         assert get_trading_day_index_in_week(date(2026, 4, 20)) == 1
-        assert is_alternate_update_trading_day(date(2026, 4, 20)) is True
         assert get_trading_day_index_in_week(date(2026, 4, 21)) == 2
-        assert is_alternate_update_trading_day(date(2026, 4, 21)) is False
         assert get_trading_day_index_in_week(date(2026, 4, 22)) == 3
-        assert is_alternate_update_trading_day(date(2026, 4, 22)) is True
         assert get_trading_day_index_in_week(date(2026, 4, 24)) == 5
-        assert is_alternate_update_trading_day(date(2026, 4, 24)) is True
 
     def test_holiday_short_week_starts_from_first_trading_day(self):
         """如果周一休市，则从本周第一个交易日重新开始计数"""
-        from trading_calendar import get_trading_day_index_in_week, is_alternate_update_trading_day
+        from trading_calendar import get_trading_day_index_in_week
 
         assert get_trading_day_index_in_week(date(2024, 10, 8)) == 1
-        assert is_alternate_update_trading_day(date(2024, 10, 8)) is True
         assert get_trading_day_index_in_week(date(2024, 10, 9)) == 2
-        assert is_alternate_update_trading_day(date(2024, 10, 9)) is False
         assert get_trading_day_index_in_week(date(2024, 10, 10)) == 3
-        assert is_alternate_update_trading_day(date(2024, 10, 10)) is True
 
 
 class TestRunSchedule:
-    """测试隔一个交易日更新与动态窗口"""
+    """测试每个交易日更新与动态窗口"""
 
-    def test_alternate_schedule_skips_second_trading_day_of_week(self):
+    def test_daily_schedule_runs_on_each_trading_day(self):
         import run_config
 
         decision = run_config.get_schedule_decision(date(2026, 4, 20))
@@ -105,21 +98,21 @@ class TestRunSchedule:
         assert decision["trading_day_index_in_week"] == 1
         assert decision["window_anchor_day"] == date(2026, 4, 17)
 
-    def test_alternate_schedule_runs_on_third_trading_day_of_week(self):
+    def test_daily_schedule_uses_previous_trading_day_as_window_anchor(self):
         import run_config
 
         decision = run_config.get_schedule_decision(date(2026, 4, 21))
 
-        assert decision["should_run"] is False
+        assert decision["should_run"] is True
         assert decision["trading_day_index_in_week"] == 2
         assert decision["window_anchor_day"] == date(2026, 4, 20)
 
         decision = run_config.get_schedule_decision(date(2026, 4, 22))
         assert decision["should_run"] is True
         assert decision["trading_day_index_in_week"] == 3
-        assert decision["window_anchor_day"] == date(2026, 4, 20)
+        assert decision["window_anchor_day"] == date(2026, 4, 21)
 
-    def test_run_config_uses_previous_scheduled_update_day_as_dynamic_window_anchor(self):
+    def test_run_config_uses_previous_trading_day_as_dynamic_window_anchor(self):
         import run_config
 
         backtrack = run_config.get_run_config(datetime(2026, 4, 20, 8, 50))
@@ -129,7 +122,7 @@ class TestRunSchedule:
         assert backtrack == "24h"
 
         backtrack = run_config.get_run_config(datetime(2026, 4, 22, 8, 50))
-        assert backtrack == "48h"
+        assert backtrack == "24h"
 
 
 # =====================================================================

@@ -1,103 +1,119 @@
 # VCP Hunter 北美 AI 产业链情报战报系统
 
-> 一个按交易日运行的多阶段情报流水线：采集、审计、映射、研究、战报生成与邮件分发。
+> 按 A 股交易日运行的多阶段情报流水线：采集北美 AI 产业链信息，审计证据，映射 A 股受益方向，生成战报并邮件分发。
+
+Last verified: 2026-05-09
 
 ---
 
-## 当前状态
+## 项目定位
 
-截至 2026-04-13，项目已经补上这一轮工程化硬化：
+本仓库是本地 Python 版每日战报流水线，主要通过 API、RSS、网页抓取和本地调度运行。
 
-- 控制层 `timeout_seconds` 已真正生效，超时会把阶段标记为 `failed_timeout`
-- HTTPS 默认严格校验，只有白名单域名允许降级为不安全 TLS
-- 时间解析失败不再默认放行，新增 `parse_failed` / `unknown_time` 标记
-- `doctor` / `preflight` 可做运行前自检，并返回稳定退出码
-- `run_manifest.json` 新增运行时上下文与自检摘要，便于审计
-- `NO_PROXY` 改为 merge，不再直接覆盖现有环境
+它和 `每日战报_浏览器自动化` 是两个不同工作流：本仓库不要求 Browser Use / Gemini 网页 / Grok 网页作为硬门槛；浏览器采集型自动化应放在对应浏览器自动化项目里维护。
 
 ---
 
-## 架构概览
+## 当前运行事实
+
+- 根目录 `run_daily.bat` 是 Windows 手工运行和计划任务入口。
+- 项目主体位于 `每日战报/` 子目录，控制面入口是 `pipeline_cli.py`。
+- `run_daily.bat` 默认先跑严格预检：`RUN_DAILY_PREFLIGHT=strict`。
+- `run_daily.bat` 默认失败后自动 `resume` 一次：`RUN_DAILY_AUTO_RESUME=on`，延迟 `10` 秒。
+- 无参数或参数为 `run` 时，`run_daily.bat` 优先进入 `scheduled_launcher.py`。
+- `scheduled_launcher.py` 会先判断当天是否为 A 股交易日；当前代码规则是 `schedule_rule=run_every_trading_day`，交易日运行，非交易日跳过。
+- `pipeline_cli.py run/resume/force-run/restart` 内部都会执行严格 preflight，通过后才进入 orchestrator。
+- `pipeline_lock.py` 使用全局 run lock 防止重复启动。
+- `run_manifest.json` 固定写入当日输出目录根部，记录阶段状态、运行上下文和 preflight 摘要。
+
+---
+
+## 目录结构
 
 ```text
-pipeline_cli.py
-  ├── doctor / preflight / run / resume / restart / clean / prune
-  ├── preflight 结果写入环境，供 orchestrator 落盘
-  └── run lock 保护，防止重复执行
-
-orchestrator.py
-  ├── 编排 P1 → P9 主流程
-  ├── 汇总阶段指标与上下文
-  └── 统一写 manifest / checkpoint / 输出目录
-
-pipeline_runtime.py
-  ├── StageSpec / run_stage_registry
-  ├── 子进程级阶段执行
-  └── timeout / failed_timeout / metrics 落盘
-
-数据采集与处理
-  ├── p1_rss.py / p1_web.py / scraper_utils.py
-  ├── search_engine.py / p2_x_intel.py / p3_agent.py / p4_vanguard.py
-  ├── audit_engine.py / p6_mapper.py / p7_deep_research.py
-  └── p8_technical.py / p9_reporter.py / p9_email.py
-
-运行基础设施
-  ├── settings.py / trading_calendar.py / pipeline_lock.py
-  ├── artifact_store.py / checkpoint.py / pipeline_maintenance.py
-  └── native_llm_adapter.py / http_security.py
+D:\vcp_hunter\每日战报\
+├── run_daily.bat                 # Windows 入口：计划任务/双击/手工命令
+├── .venv\                        # 本地虚拟环境
+├── 每日战报\                     # Python 流水线源码
+│   ├── pipeline_cli.py            # 控制面：run/resume/status/doctor/preflight/clean/prune
+│   ├── scheduled_launcher.py      # 交易日门禁后再启动 pipeline_cli.py run
+│   ├── run_config.py              # 调度决策和回溯窗口计算
+│   ├── orchestrator.py            # P1-P9 主流程编排
+│   ├── pipeline_runtime.py        # 阶段执行、子进程隔离、超时落盘
+│   ├── settings.py                # .env 加载、模型/API/SMTP/TLS/NO_PROXY 配置
+│   ├── prompts\                   # 各阶段提示词模板
+│   └── tests\                     # 离线回归与控制面测试
+└── 每日热点输出\                 # 每日运行产物
 ```
-
----
-
-## 关键模块
-
-| 文件 | 作用 |
-| --- | --- |
-| `orchestrator.py` | 主流程编排、阶段衔接、全局异常收口 |
-| `pipeline_cli.py` | 控制面入口，自检、运行、清理、状态查看 |
-| `pipeline_runtime.py` | 阶段执行框架、超时控制、阶段级 manifest 写入 |
-| `pipeline_lock.py` | 运行锁，防止并发重复启动 |
-| `artifact_store.py` | manifest、日志目录、输出目录、上下文落盘 |
-| `settings.py` | 环境变量、模型 key、TLS 白名单、NO_PROXY 合并 |
-| `trading_calendar.py` | 交易日判断与日历模式探测 |
-| `p1_web.py` | 网页发现、时效窗口判定、来源元数据标记 |
-| `scraper_utils.py` | 正文抓取、URL 过滤、TLS 安全策略应用 |
-| `audit_engine.py` | 审计与清洗 |
-| `search_engine.py` | 搜索、限流、降级与 key 轮换 |
-| `native_llm_adapter.py` | 多模型统一适配 |
-| `p9_reporter.py` | 战报总装配 |
-| `p9_email.py` | HTML 邮件渲染与发送 |
 
 ---
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 进入项目根目录
 
-```bash
-cd 每日战报
-pip install -r 每日战报/requirements.txt
+```powershell
+cd D:\vcp_hunter\每日战报
 ```
 
-### 2. 配置 `.env`
+### 2. 安装依赖
 
-复制 `每日战报/.env.example` 为 `每日战报/.env`，填入实际密钥。
+优先使用根目录虚拟环境：
 
-至少建议检查：
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r .\每日战报\requirements.txt
+```
 
-- `ANTIGRAVITY_API_KEY`
-- `GEMINI_SEARCH_API_KEYS`
-- `GROK_API_KEY`
-- `EMAIL_ADDRESS`
-- `EMAIL_PASSWORD`
-- `RECEIVER_EMAIL`
+如果虚拟环境不存在，先创建：
 
-### 3. 先跑自检
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r .\每日战报\requirements.txt
+```
 
-```bash
-python 每日战报/pipeline_cli.py doctor
-python 每日战报/pipeline_cli.py doctor --strict
-python 每日战报/pipeline_cli.py preflight
+### 3. 配置 `.env`
+
+复制模板：
+
+```powershell
+Copy-Item .\每日战报\.env.example .\每日战报\.env
+notepad .\每日战报\.env
+```
+
+常用变量：
+
+| 变量 | 用途 |
+| --- | --- |
+| `ANTIGRAVITY_BASE_URL` | 本地/远端 OpenAI 兼容模型服务地址，默认 `http://127.0.0.1:8045` |
+| `ANTIGRAVITY_API_KEY` | Pro/Opus/Agent 兼容模型鉴权 |
+| `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 覆盖 Pro/Opus 模型服务；未配置时沿用 Antigravity 配置 |
+| `GEMINI_SEARCH_API_KEYS` | Gemini 搜索 key 池，逗号分隔 |
+| `GEMINI_SEARCH_BASE_URL` | Gemini 搜索代理地址 |
+| `TAVILY_API_KEY` | Tavily 备用搜索 |
+| `GROK_API_KEY` | P2 X/Grok 情报采集 |
+| `EMAIL_ADDRESS` / `EMAIL_PASSWORD` | SMTP 发件账号和授权码 |
+| `RECEIVER_EMAIL` | 收件人，多个邮箱用逗号分隔 |
+| `INSECURE_TLS_ALLOWLIST` | 允许降级为不安全 TLS 的域名白名单，默认空 |
+| `AGENT_ASSIST_ENABLED` / `AGENT_ASSIST_MODEL` | 可选 Agent 诊断/审校助手 |
+
+所有密钥只应写入 `.env` 或外部环境变量，不要写进代码。
+
+---
+
+## 常用命令
+
+### 查看运行状态
+
+```powershell
+.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py status
+```
+
+### 自检
+
+```powershell
+.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py doctor
+.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py doctor --strict
+.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py preflight
 ```
 
 退出码约定：
@@ -106,184 +122,183 @@ python 每日战报/pipeline_cli.py preflight
 - `1`：检查失败
 - `2`：发现活动 run lock
 
-### 4. 启动主流程
+### 按计划任务路径运行
 
-```bash
-python 每日战报/pipeline_cli.py run
-python 每日战报/pipeline_cli.py resume
-python 每日战报/pipeline_cli.py force-run
-python 每日战报/pipeline_cli.py restart
-python 每日战报/pipeline_cli.py status
+```powershell
+.\run_daily.bat
 ```
 
-仍需兼容旧入口时，也可以直接运行：
+这会走 `scheduled_launcher.py`，先判断交易日，再按当前调度规则决定是否启动主流程。
 
-```bash
-python 每日战报/orchestrator.py
+### 直接运行控制面
+
+```powershell
+.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py run
+.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py resume
+.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py force-run
+.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py restart
 ```
 
-但推荐统一走 `pipeline_cli.py`。
+命令含义：
 
-### 5. 清理缓存与历史瞬态产物
+| 命令 | 用途 |
+| --- | --- |
+| `run` | 正常从头运行 |
+| `resume` | 基于 checkpoint 尝试恢复 |
+| `force-run` | 传入 `--force-run`，跳过 orchestrator 内部的交易日跳过逻辑 |
+| `restart` | 传入 `--force-restart`，清理恢复状态后重跑 |
+| `status` | 查看当日输出、manifest、run lock 和阶段状态 |
 
-```bash
-python 每日战报/pipeline_cli.py clean
-python 每日战报/pipeline_cli.py prune --keep-days 7
+### 清理
+
+```powershell
+.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py clean
+.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py prune --keep-days 7
 ```
 
-### 6. 测试
-
-```bash
-python -m compileall 每日战报
-python -m pytest 每日战报/tests -q
-```
+`clean` 清理源码树内的瞬态缓存；`prune` 清理旧输出目录，默认保留 7 天。
 
 ---
 
-## Preflight / Doctor 检查项
+## `run_daily.bat` 行为
 
-当前控制面会检查以下项目：
+`run_daily.bat` 会自动定位包含 `pipeline_cli.py` 的项目子目录，并使用根目录 `.venv\Scripts\python.exe`。
 
-- 输出根目录、当日目录、日志目录
-- `prompts/` 与关键 prompt 文件
-- `ANTIGRAVITY_API_KEY` / `GROK_API_KEY`
-- 搜索 key 池数量
-- 关键依赖可导入状态
-- 日历库模式与探测结果
-- TLS 白名单配置
-- run lock 是否占用
-
-`doctor` 为普通检查。
-
-`doctor --strict` / `preflight` 为严格检查：
-
-- warnings 会升级为失败
-- 活动 run lock 会返回退出码 `2`
-- 更适合计划任务和外层调度器
-
----
-
-## `run_daily.bat`
-
-根目录的 `run_daily.bat` 用于 Windows 计划任务或手工双击运行。
-
-默认行为：
-
-- 自动定位项目内 `scheduled_launcher.py` / `pipeline_cli.py`
-- 使用 `.venv\Scripts\python.exe`
-- merge 现有 `NO_PROXY`，并补齐 `127.0.0.1,localhost,::1`
-- 默认启动走 `scheduled_launcher.py`，与计划运行使用同一条调度链
-- 如果 `scheduled_launcher.py` 缺失，自动回退到 `pipeline_cli.py run`
-- 运行结束后按 `RUN_DAILY_HOLD_SECONDS` 保持窗口
-
-可选环境变量：
+默认环境变量：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RUN_DAILY_PREFLIGHT` | `off` | `off`/`0` 跳过；`doctor` 先跑普通自检；`strict` 或 `preflight` 先跑严格自检 |
-| `RUN_DAILY_HOLD_SECONDS` | `15` | 运行结束后保留窗口秒数，设为 `0` 可立即退出 |
+| `RUN_DAILY_PREFLIGHT` | `strict` | `strict`/`preflight` 跑严格预检；`doctor` 跑普通自检；`off`/`0`/`false`/`skip` 跳过 |
+| `RUN_DAILY_AUTO_RESUME` | `on` | `run` 失败且退出码不是 `2` 时，自动 `resume` 一次 |
+| `RUN_DAILY_RESUME_DELAY_SECONDS` | `10` | 自动恢复前等待秒数 |
+| `RUN_DAILY_HOLD_SECONDS` | `15` | 命令结束后保留窗口秒数，设为 `0` 可立即退出 |
 
 示例：
 
 ```bat
-set RUN_DAILY_PREFLIGHT=strict
-run_daily.bat
+set RUN_DAILY_PREFLIGHT=off
+set RUN_DAILY_HOLD_SECONDS=0
+run_daily.bat status
 ```
 
----
+传参规则：
 
-## TLS / 抓取安全策略
-
-默认策略：
-
-- 所有 `requests` 抓取默认 `verify=True`
-- 不再全局关闭 `InsecureRequestWarning`
-- 只有白名单域名允许不安全 TLS
-
-相关配置：
-
-- 环境变量：`INSECURE_TLS_ALLOWLIST`
-- 代码入口：`settings.py` / `http_security.py`
-
-抓取结果和日志中会带：
-
-- `tls_mode`
-- `insecure_fetch`
+- `run_daily.bat` 或 `run_daily.bat run`：走 `scheduled_launcher.py`。
+- `run_daily.bat status` / `resume` / `force-run` / `restart` / `preflight`：直接转发给 `pipeline_cli.py`。
 
 ---
 
-## manifest 与可审计性
+## 调度逻辑
 
-`run_manifest.json` 继续兼容原有 `stages` 结构，同时增加了根级上下文：
+外层调度器可以每天固定时间唤醒 `run_daily.bat`，项目内层再决定是否真正运行。
 
-- `manifest_version`
-- `runtime_context.python_version`
-- `runtime_context.platform`
-- `runtime_context.cwd`
-- `runtime_context.calendar_mode`
-- `runtime_context.search_keys_count`
-- `runtime_context.tls_policy`
-- `preflight`
+当前内层规则：
 
-阶段级状态现在可以区分：
+1. `scheduled_launcher.py` 调用 `get_schedule_decision(date.today())`。
+2. 非 A 股交易日：记录 skip，退出码 `0`。
+3. A 股交易日：启动 `pipeline_cli.py run`。
+4. `run_config.py` 用上一个交易日 09:00 作为回溯窗口锚点，并按实际间隔计算 `24h`/`72h` 等动态窗口。
 
-- `completed`
-- `failed_exception`
-- `failed_timeout`
-
----
-
-## 时间窗口策略
-
-`p1_web.py` 当前对发布时间分三类处理：
-
-- `recent`：解析成功且在时间窗内，允许进入下游
-- `unknown_time`：缺失时间字段，会保留但显式标记
-- `parse_failed`：时间解析失败，默认不放行
-
-这保证了旧闻和脏时间字段不会再静默混入。
-
----
-
-## 日历依赖命名说明
-
-这里有三个名字，含义不同：
+日历依赖：
 
 - PyPI 包名：`chinesecalendar`
 - Python import 名：`chinese_calendar`
-- manifest / 运行模式字段：`chinese_calendar`
+- 缺失或不支持当年数据时，会降级为仅排除周末的保守策略
 
-安装时请使用：
+---
 
-```bash
-pip install chinesecalendar
-```
+## 流水线阶段
 
-代码中使用：
+控制层当前阶段：
 
-```python
-import chinese_calendar
-```
+| 控制阶段 | 主要内容 | 默认超时 |
+| --- | --- | --- |
+| `collect_intel` | P1 RSS/Web、P2 X/Grok、P3 机动搜索与 checkpoint 恢复 | 900s |
+| `audit_evidence` | P5 证据审计与 checkpoint 复用 | 480s |
+| `market_mapping` | P4 海外龙头行情快照、P6 A 股映射 | 600s |
+| `research` | P7 深度研究、P7a 审计、P7.5 补充搜索 | 900s |
+| `technical` | P8 技术面/股价/弹性层 | 300s |
+| `report` | P9 战报生成、Agent 审校、邮件发送 | 600s |
+| `roi` | Layer ROI 贡献评估 | 180s |
+
+阶段由 `pipeline_runtime.py` 在子进程中执行。超时会写入 `failed_timeout`，异常会写入 `failed_exception`，成功写入 `completed`。
 
 ---
 
 ## 输出目录
 
-当前输出布局如下：
+当日输出写入：
 
 ```text
-每日热点输出/
-  └── YYYYMMDD/
-      ├── run_manifest.json
-      ├── logs/
-      ├── agent/
-      ├── meta/
-      └── 各阶段 md/json 产物
+每日热点输出\
+└── YYYYMMDD\
+    ├── run_manifest.json
+    ├── logs\
+    │   ├── pipeline.log
+    │   └── error.log
+    ├── agent\
+    ├── meta\
+    └── 各阶段 md/json 产物
 ```
 
 说明：
 
-- `run_manifest.json` 固定在日期根目录
-- `logs/` 存放流水日志
-- `agent/` 存放预检解释、失败诊断、终稿审校等 Agent 产物
-- `meta/` 存放 `Layer_ROI` 等辅助元数据
+- `run_manifest.json` 是排查运行状态的第一入口。
+- `logs/pipeline.log` 记录主流程日志。
+- `logs/error.log` 记录错误日志。
+- `agent/` 存放预检解释、失败诊断和终稿审校产物。
+- `meta/` 存放 `Layer_ROI` 等辅助元数据。
+
+---
+
+## Preflight / Doctor 检查项
+
+控制面会检查：
+
+- 输出根目录、当日目录和日志目录
+- `prompts/` 目录和关键 prompt 文件
+- `ANTIGRAVITY_API_KEY`
+- `GROK_API_KEY`
+- Gemini 搜索 key 池数量
+- 关键依赖可导入状态
+- 日历库模式和版本
+- TLS 白名单配置
+- run lock 是否占用
+
+`doctor --strict` 和 `preflight` 会把 warning 升级为失败，更适合计划任务与发布前检查。
+
+---
+
+## 抓取与网络安全
+
+默认策略：
+
+- `requests` 默认 `verify=True`。
+- 不全局关闭 `InsecureRequestWarning`。
+- 只有 `INSECURE_TLS_ALLOWLIST` 命中的域名允许不安全 TLS。
+- `NO_PROXY` 会合并现有值，并补齐 `127.0.0.1,localhost,::1`，避免本地反代被代理误拦。
+
+相关入口：
+
+- `settings.py`
+- `http_security.py`
+- `scraper_utils.py`
+
+---
+
+## 验证
+
+代码级验证：
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall .\每日战报
+.\.venv\Scripts\python.exe -m pytest .\每日战报\tests -q
+```
+
+快速离线回归可优先跑：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest .\每日战报\tests\test_simulated_pipeline.py -q
+```
+
+这些测试不依赖真实邮件发送、真实网页采集或 live 模型调用，适合验证控制面、调度、输出和关键拼接逻辑。

@@ -93,6 +93,20 @@ def _should_use_openai_compat_proxy(model: str, base_url: str) -> bool:
         return False
     return 'antigravity/v1' in base_url_lower or base_url_lower.endswith('/v1')
 
+def _openai_compat_max_tokens(model: str) -> int:
+    override = os.environ.get('OPENAI_COMPAT_MAX_TOKENS', '').strip()
+    if override:
+        try:
+            value = int(override)
+            if value > 0:
+                return value
+        except ValueError:
+            logger.warning("OPENAI_COMPAT_MAX_TOKENS is not a positive integer: %s", override)
+
+    if 'thinking' in (model or '').lower():
+        return 128000
+    return 16000
+
 @dataclass
 class FakeAIMessage:
     """模拟 LangChain 的 AIMessage，支持 .content / .tool_calls / .thinking_content"""
@@ -614,7 +628,7 @@ class NativeLLMAdapter(RunnableSerializable):
                 response = client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    max_tokens=16000,
+                    max_tokens=_openai_compat_max_tokens(self.model),
                     timeout=self.timeout
                 )
                 message = response.choices[0].message

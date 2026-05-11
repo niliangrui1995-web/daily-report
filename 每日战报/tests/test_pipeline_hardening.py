@@ -187,6 +187,34 @@ class TestManifestContext:
 
 
 class TestReportStage:
+    def test_p5_empty_audit_uses_raw_p1_fallback(self, monkeypatch):
+        import orchestrator
+
+        manifest_updates = []
+
+        monkeypatch.setattr(orchestrator, "gemini_pro_audit", lambda *args, **kwargs: "")
+        monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *args, **kwargs: "fallback.md")
+        monkeypatch.setattr(
+            orchestrator,
+            "update_run_manifest",
+            lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+        )
+
+        context = {
+            "resume_from": "none",
+            "ckpt": {"files": {}},
+            "evidence_raw": "raw P1 evidence",
+            "backtrack": "24h",
+            "now": None,
+        }
+
+        orchestrator._stage_audit_evidence(context)
+
+        assert "未经 P5 Pro 清洗" in context["p5_evidence"]
+        assert "raw P1 evidence" in context["p5_evidence"]
+        assert manifest_updates[-1][0] == ("p5",)
+        assert manifest_updates[-1][1]["status"] == "failed_empty_output_raw_p1_fallback"
+
     def test_stage_report_raises_when_report_is_empty(self, monkeypatch):
         import orchestrator
 

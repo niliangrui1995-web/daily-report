@@ -347,6 +347,24 @@ def _stage_audit_evidence(context: dict[str, Any]) -> None:
                 audit_type="p5",
                 backtrack=context["backtrack"] or get_run_config(context["now"]),
             )
+        if not context["p5_evidence"].strip() and context.get("evidence_raw", "").strip():
+            fallback_text = (
+                "## P5 Pro 审计失败兜底\n\n"
+                "> Gemini Pro 审计层未返回有效结果。以下内容是未经 P5 Pro 清洗的 P1 原始情报，"
+                "仅用于保持后续 P6/P9 链路不断流；下游必须按未审计数据降权处理。\n\n"
+                + context["evidence_raw"].strip()
+            )
+            context["p5_evidence"] = fallback_text
+            fallback_path = write_text_artifact("P5_审计_RAW_P1_FALLBACK", fallback_text)
+            update_run_manifest(
+                "p5",
+                status="failed_empty_output_raw_p1_fallback",
+                files={"md": fallback_path},
+                metrics={
+                    "fallback": "raw_p1_unreviewed",
+                    "fallback_chars": len(fallback_text),
+                },
+            )
         return
 
     context["p5_evidence"] = _read_text_checkpoint(ckpt["files"].get("p5", ""), "P5 audit result")

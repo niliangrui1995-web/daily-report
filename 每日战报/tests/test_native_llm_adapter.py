@@ -116,12 +116,13 @@ class TestProviderErrorClassification:
         fake_message = SimpleNamespace(content="OK", reasoning_content="trace")
         fake_response = SimpleNamespace(choices=[SimpleNamespace(message=fake_message)])
         client_kwargs = {}
+        create_kwargs = {}
 
         class FakeOpenAI:
             def __init__(self, *args, **kwargs):
                 client_kwargs.update(kwargs)
                 self.chat = SimpleNamespace(
-                    completions=SimpleNamespace(create=lambda **create_kwargs: fake_response)
+                    completions=SimpleNamespace(create=lambda **kwargs: create_kwargs.update(kwargs) or fake_response)
                 )
 
         monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
@@ -138,6 +139,7 @@ class TestProviderErrorClassification:
         assert result.content == "OK"
         assert result.thinking_content == "trace"
         assert client_kwargs["max_retries"] == 0
+        assert create_kwargs["max_tokens"] == 128000
 
     def test_grok_native_parses_responses_message_output_text(self, monkeypatch):
         import requests

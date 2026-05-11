@@ -275,14 +275,26 @@ def p9_risk_analysis(
 
         return result, run_ts
     except Exception as exc:
-        logging.error("[P9] failed to parse model output as JSON, falling back to raw text: %s", exc)
+        logging.error("[P9] failed to parse model output as JSON; raw output will not be delivered as report: %s", exc)
+        raw_path = ""
+        try:
+            raw_path = write_text_artifact("P9_raw_invalid_output", raw_content)
+        except Exception as write_exc:
+            logging.error("[P9] failed to save invalid raw output: %s", write_exc)
         update_run_manifest(
             "p9",
-            status="fallback_raw_llm",
-            files={"thinking": out_fn} if out_fn else None,
+            status="failed_parse",
+            files={
+                key: value
+                for key, value in {
+                    "raw": raw_path,
+                    "thinking": out_fn,
+                }.items()
+                if value
+            } or None,
             metrics={"raw_output_chars": len(raw_content), "error": str(exc)},
         )
-        return raw_content, run_ts
+        return "", run_ts
 
 
 def send_report_email(content, now_str: str = "") -> dict[str, Any]:

@@ -158,3 +158,45 @@ def test_p9_risk_analysis_applies_guardrails_before_rendering(monkeypatch):
     assert payload["today_advice"][0]["confidence"] == 0.68
     assert "置信度 60%" in report
     assert "| ★★☆ | **生益科技** | 600183 | 补充搜索与传闻共振。 | 只做观察 | 68% |" in report
+
+
+def test_p9_risk_analysis_blocks_raw_delivery_on_invalid_json(monkeypatch):
+    import p9_reporter
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        p9_reporter,
+        "require_prompt",
+        lambda name: "{today_str}\n{p5_evidence}\n{p7_section}\n{p6_mapping}\n{p75_section}\n{price_data}\n{p2_section}\n{p3_section}\n{yfinance_section}",
+    )
+    monkeypatch.setattr(
+        p9_reporter.opus_adapter,
+        "invoke",
+        lambda prompt: SimpleNamespace(content='```json\n{"core_signals": [', thinking_content=""),
+    )
+    monkeypatch.setattr(
+        p9_reporter,
+        "write_text_artifact",
+        lambda prefix, content, **kwargs: captured.setdefault("raw_artifact", (prefix, content)) and "raw.md",
+    )
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: captured.setdefault("manifest_updates", []).append((args, kwargs)),
+    )
+
+    report, _ = p9_reporter.p9_risk_analysis(
+        p5_evidence="P5 evidence",
+        p7_deep="P7 evidence",
+        p75_supplement="P7.5 evidence",
+        p6_mapping="P6 mapping",
+        price_data="P8 price data",
+        p2_x_intel_data="P2 data",
+        p3_intel_data="P3 data",
+        p4_yfinance="P4 data",
+    )
+
+    assert report == ""
+    assert captured["raw_artifact"][0] == "P9_raw_invalid_output"
+    assert captured["manifest_updates"][-1][1]["status"] == "failed_parse"

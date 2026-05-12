@@ -187,6 +187,85 @@ def _build_context(now: datetime, run_ts: str, ckpt: dict, resume_from: str) -> 
     }
 
 
+def _build_p1_stats(
+    rss_stats: dict[str, Any],
+    web_stats: dict[str, Any],
+    p1_failed_urls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "rss_success_sources": len(rss_stats.get("success", [])),
+        "web_success_sources": len(web_stats.get("success", [])),
+        "rss_failed_sources": len(rss_stats.get("failed", [])),
+        "web_failed_sources": len(web_stats.get("failed", [])),
+        "enrich_ok": int(rss_stats.get("enrich_ok", 0)) + int(web_stats.get("enrich_ok", 0)),
+        "enrich_fail": int(rss_stats.get("enrich_fail", 0)) + int(web_stats.get("enrich_fail", 0)),
+        "failed_urls": len(p1_failed_urls),
+        "web_time_recent": int(web_stats.get("time_recent", 0)),
+        "web_time_unknown": int(web_stats.get("time_unknown", 0)),
+        "web_time_stale": int(web_stats.get("time_stale", 0)),
+        "web_time_parse_failed": int(web_stats.get("time_parse_failed", 0)),
+    }
+
+
+def _persist_p1_artifacts(
+    p1_results: list[dict[str, Any]],
+    evidence_raw: str,
+    p1_failed_urls: list[dict[str, Any]],
+    p1_duration: float,
+    p1_stats: dict[str, Any],
+) -> None:
+    if not p1_results:
+        return
+
+    p1_json_path = write_json_artifact("P1_RSS原始数据", p1_results)
+    p1_md_path = write_text_artifact("P1_RSS原始数据", evidence_raw)
+    update_run_manifest(
+        "p1",
+        status="completed",
+        files={"json": p1_json_path, "md": p1_md_path},
+        metrics={
+            "records": len(p1_results),
+            "failed_urls": len(p1_failed_urls),
+            "evidence_chars": len(evidence_raw),
+            "duration_seconds": round(p1_duration, 1),
+            **p1_stats,
+        },
+    )
+
+
+def _persist_p3_artifacts(p3_data: str, p3_stats: dict[str, Any]) -> None:
+    if not p3_data:
+        return
+
+    p3_path = write_text_artifact("P3_机动情报", p3_data)
+    p3_files = {"md": p3_path}
+    raw_results = p3_stats.get("raw_results") if isinstance(p3_stats, dict) else {}
+    if isinstance(raw_results, dict) and raw_results:
+        _, p3_structured_items = render_p3_output(raw_results)
+        p3_json_path = write_json_artifact(
+            "P3_机动情报",
+            {
+                "generated_at": datetime.now().isoformat(),
+                "items": p3_structured_items,
+                "raw_results": raw_results,
+            },
+        )
+        p3_files["json"] = p3_json_path
+    update_run_manifest(
+        "p3",
+        status="completed",
+        files=p3_files,
+        metrics={
+            "content_chars": len(p3_data),
+            "duration_seconds": p3_stats.get("duration_seconds", 0),
+            "jinnang_1_count": p3_stats.get("jinnang_1_count", 0),
+            "jinnang_2_count": p3_stats.get("jinnang_2_count", 0),
+            "jinnang_3_count": p3_stats.get("jinnang_3_count", 0),
+            "structured_items": p3_stats.get("structured_items", 0),
+        },
+    )
+
+
 def _stage_collect_intel(context: dict[str, Any]) -> None:
     resume_from = context["resume_from"]
     ckpt = context["ckpt"]
@@ -213,7 +292,7 @@ def _stage_collect_intel(context: dict[str, Any]) -> None:
     p2_data = ""
     p3_data = ""
     p3_stats: dict[str, Any] = {}
-    p1_failed_urls: list[str] = []
+    p1_failed_urls: list[dict[str, Any]] = []
     collect_started = time.time()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -246,37 +325,9 @@ def _stage_collect_intel(context: dict[str, Any]) -> None:
         except Exception as exc:
             logging.warning("P3 collection failed: %s", exc)
 
-    if p1_failed_urls:
-        try:
-            jinnang_1_results = run_jinnang_1(p1_failed_urls)
-            if jinnang_1_results:
-                raw_results = p3_stats.get("raw_results")
-                if not isinstance(raw_results, dict):
-                    raw_results = {}
-                raw_results["jinnang_1"] = jinnang_1_results
-                p3_stats["raw_results"] = raw_results
-                p3_stats["jinnang_1_count"] = len(jinnang_1_results)
-                p3_data, p3_structured_items = render_p3_output(raw_results)
-                p3_stats["structured_items"] = len(p3_structured_items)
-                p3_stats["content_length"] = len(p3_data)
-        except Exception as exc:
-            logging.warning("jinnang_1 recovery failed: %s", exc)
-
     evidence_raw = format_evidence(p1_results) if p1_results else ""
     p1_duration = time.time() - collect_started
-    p1_stats = {
-        "rss_success_sources": len(rss_stats.get("success", [])),
-        "web_success_sources": len(web_stats.get("success", [])),
-        "rss_failed_sources": len(rss_stats.get("failed", [])),
-        "web_failed_sources": len(web_stats.get("failed", [])),
-        "enrich_ok": int(rss_stats.get("enrich_ok", 0)) + int(web_stats.get("enrich_ok", 0)),
-        "enrich_fail": int(rss_stats.get("enrich_fail", 0)) + int(web_stats.get("enrich_fail", 0)),
-        "failed_urls": len(p1_failed_urls),
-        "web_time_recent": int(web_stats.get("time_recent", 0)),
-        "web_time_unknown": int(web_stats.get("time_unknown", 0)),
-        "web_time_stale": int(web_stats.get("time_stale", 0)),
-        "web_time_parse_failed": int(web_stats.get("time_parse_failed", 0)),
-    }
+    p1_stats = _build_p1_stats(rss_stats, web_stats, p1_failed_urls)
 
     context.update(
         {
@@ -290,50 +341,27 @@ def _stage_collect_intel(context: dict[str, Any]) -> None:
         }
     )
 
-    if p1_results:
-        p1_json_path = write_json_artifact("P1_RSS原始数据", p1_results)
-        p1_md_path = write_text_artifact("P1_RSS原始数据", evidence_raw)
-        update_run_manifest(
-            "p1",
-            status="completed",
-            files={"json": p1_json_path, "md": p1_md_path},
-            metrics={
-                "records": len(p1_results),
-                "failed_urls": len(p1_failed_urls),
-                "evidence_chars": len(evidence_raw),
-                "duration_seconds": round(p1_duration, 1),
-                **p1_stats,
-            },
-        )
+    _persist_p1_artifacts(p1_results, evidence_raw, p1_failed_urls, p1_duration, p1_stats)
+    _persist_p3_artifacts(p3_data, p3_stats)
 
-    if p3_data:
-        p3_path = write_text_artifact("P3_机动情报", p3_data)
-        p3_files = {"md": p3_path}
-        raw_results = p3_stats.get("raw_results") if isinstance(p3_stats, dict) else {}
-        if isinstance(raw_results, dict) and raw_results:
-            _, p3_structured_items = render_p3_output(raw_results)
-            p3_json_path = write_json_artifact(
-                "P3_机动情报",
-                {
-                    "generated_at": datetime.now().isoformat(),
-                    "items": p3_structured_items,
-                    "raw_results": raw_results,
-                },
-            )
-            p3_files["json"] = p3_json_path
-        update_run_manifest(
-            "p3",
-            status="completed",
-            files=p3_files,
-            metrics={
-                "content_chars": len(p3_data),
-                "duration_seconds": p3_stats.get("duration_seconds", 0),
-                "jinnang_1_count": p3_stats.get("jinnang_1_count", 0),
-                "jinnang_2_count": p3_stats.get("jinnang_2_count", 0),
-                "jinnang_3_count": p3_stats.get("jinnang_3_count", 0),
-                "structured_items": p3_stats.get("structured_items", 0),
-            },
-        )
+    if p1_failed_urls:
+        try:
+            jinnang_1_results = run_jinnang_1(p1_failed_urls)
+            if jinnang_1_results:
+                raw_results = p3_stats.get("raw_results")
+                if not isinstance(raw_results, dict):
+                    raw_results = {}
+                raw_results["jinnang_1"] = jinnang_1_results
+                p3_stats["raw_results"] = raw_results
+                p3_stats["jinnang_1_count"] = len(jinnang_1_results)
+                p3_data, p3_structured_items = render_p3_output(raw_results)
+                p3_stats["structured_items"] = len(p3_structured_items)
+                p3_stats["content_length"] = len(p3_data)
+                context["p3_data"] = p3_data
+                context["p3_stats"] = p3_stats
+                _persist_p3_artifacts(p3_data, p3_stats)
+        except Exception as exc:
+            logging.warning("jinnang_1 recovery failed: %s", exc)
 
 
 def _stage_audit_evidence(context: dict[str, Any]) -> None:

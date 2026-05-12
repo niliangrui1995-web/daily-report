@@ -143,6 +143,163 @@ DEF",
         assert captured["content"] == "not-json-at-all"
 
 
+class TestP2BudgetGuardrail:
+    def test_collect_from_x_returns_partial_content_when_budget_is_exhausted(self, monkeypatch):
+        import p2_x_intel
+
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "usage": {"total_tokens": 123, "reasoning_tokens": 0, "input_tokens_details": {"cached_tokens": 12}},
+                    "output": [
+                        {
+                            "role": "assistant",
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": (
+                                        "<x_leaks>\n"
+                                        "### [HBM] SK 海力士扩产传导\n"
+                                        "- **信源**: @supplychainwatch\n"
+                                        "- **核心内容**: HBM 基板交期再次拉长\n"
+                                        "- **产业链影响**: 上游覆铜板和载板报价有望跟涨\n"
+                                        "- **原文摘要**: 渠道称排产继续吃紧\n"
+                                        "- **真实链接**: https://x.com/example/status/1983746519203847561\n"
+                                        "- **可信度**: 高\n"
+                                        "</x_leaks>"
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                }
+
+        clock = {"now": 0.0}
+        calls = []
+        manifest_updates = []
+
+        def fake_post(*args, **kwargs):
+            calls.append(kwargs)
+            clock["now"] = 95.0
+            return FakeResponse()
+
+        def fake_require_prompt(name):
+            if name == "p2_user.txt":
+                return "hours={hours}\n{keyword_section}\n{current_time}"
+            return "system {{track_count}} {{industry_tracks}} {{super_giants}} {{strategic_giants}}"
+
+        monkeypatch.setattr(p2_x_intel, "GROK_API_KEY", "test-key")
+        monkeypatch.setattr(p2_x_intel, "INDUSTRY_SCAN_KEYWORDS", ["kw1", "kw2", "kw3", "kw4", "kw5", "kw6"])
+        monkeypatch.setattr(p2_x_intel, "require_prompt", fake_require_prompt)
+        monkeypatch.setattr(p2_x_intel.requests, "post", fake_post)
+        monkeypatch.setattr(p2_x_intel.time, "time", lambda: clock["now"])
+        monkeypatch.setattr(p2_x_intel.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(p2_x_intel.random, "uniform", lambda _start, _end: 0)
+        monkeypatch.setattr(p2_x_intel, "write_text_artifact", lambda prefix, content: f"{prefix}.md")
+        monkeypatch.setattr(p2_x_intel, "write_json_artifact", lambda prefix, data: f"{prefix}.json")
+        monkeypatch.setattr(
+            p2_x_intel,
+            "update_run_manifest",
+            lambda stage, status, files=None, metrics=None: manifest_updates.append(
+                {"stage": stage, "status": status, "files": files, "metrics": metrics or {}}
+            ),
+        )
+
+        content, stats = p2_x_intel.collect_from_x(
+            "24h",
+            max_retries=3,
+            max_total_seconds=100,
+            request_timeout_seconds=75,
+        )
+
+        assert len(calls) == 1
+        assert "HBM 基板交期再次拉长" in content
+        assert stats["status"] == "partial_timeout"
+        assert stats["attempted_chunks"] == 1
+        assert stats["successful_chunks"] == 1
+        assert stats["total_chunks"] == 2
+        assert manifest_updates[-1]["status"] == "completed"
+        assert manifest_updates[-1]["metrics"]["stop_reason"] == "budget_exhausted"
+
+
+class TestCollectIntelPersistence:
+    def test_stage_collect_intel_persists_p1_and_p3_before_jinnang_1(self, monkeypatch):
+        from datetime import datetime
+
+        import orchestrator
+
+        events = []
+
+        monkeypatch.setattr(orchestrator, "get_run_config", lambda now: "24h")
+        monkeypatch.setattr(orchestrator, "format_evidence", lambda results: "evidence")
+        monkeypatch.setattr(
+            orchestrator,
+            "collect_from_rss",
+            lambda backtrack: (
+                [{"title": "rss item", "text": "HBM"}],
+                {
+                    "success": ["rss"],
+                    "failed": [],
+                    "enrich_ok": 0,
+                    "enrich_fail": 1,
+                    "failed_urls": [{"title": "HBM failed url", "url": "https://example.com/a"}],
+                },
+            ),
+        )
+        monkeypatch.setattr(orchestrator, "collect_from_web", lambda backtrack: ([], {"success": [], "failed": []}))
+        monkeypatch.setattr(orchestrator, "collect_from_x", lambda backtrack: ("", {"status": "failed_empty"}))
+        monkeypatch.setattr(
+            orchestrator,
+            "collect_p3_parallel_only",
+            lambda backtrack: (
+                "p3 parallel data",
+                {
+                    "duration_seconds": 1,
+                    "jinnang_1_count": 0,
+                    "jinnang_2_count": 1,
+                    "jinnang_3_count": 0,
+                    "structured_items": 1,
+                    "raw_results": {},
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "write_json_artifact",
+            lambda prefix, data: events.append(f"json:{prefix}") or f"{prefix}.json",
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "write_text_artifact",
+            lambda prefix, content: events.append(f"text:{prefix}") or f"{prefix}.md",
+        )
+        monkeypatch.setattr(orchestrator, "update_run_manifest", lambda *args, **kwargs: None)
+
+        def fake_run_jinnang_1(failed_urls):
+            events.append("jinnang_1")
+            return []
+
+        monkeypatch.setattr(orchestrator, "run_jinnang_1", fake_run_jinnang_1)
+
+        context = {
+            "resume_from": "none",
+            "ckpt": {"files": {}},
+            "now": datetime(2026, 5, 12, 8, 30),
+        }
+
+        orchestrator._stage_collect_intel(context)
+
+        assert events.index("json:P1_RSS原始数据") < events.index("jinnang_1")
+        assert events.index("text:P3_机动情报") < events.index("jinnang_1")
+        assert context["evidence_raw"] == "evidence"
+
+
 class TestP9Rendering:
     def test_build_report_markdown_renders_confidence_and_evidence(self):
         from p9_rendering import build_report_markdown

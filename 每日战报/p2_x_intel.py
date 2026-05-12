@@ -35,6 +35,9 @@ from industry_dict import OLIGARCH_DICT, SUPER_GIANTS, STRATEGIC_GIANTS
 
 GROK_BASE_URL = 'https://api.x.ai'
 GROK_MODEL = 'grok-4-1-fast-reasoning'
+P2_TOTAL_BUDGET_SECONDS = 420
+P2_REQUEST_TIMEOUT_SECONDS = 75
+P2_MIN_REMAINING_SECONDS = 10
 
 INDUSTRY_SCAN_KEYWORDS = [
     'Synopsys Cadence ARM Siemens EDA semiconductor IP',
@@ -72,7 +75,42 @@ def _build_user_prompt(backtrack: str = '24h', keyword_chunk: list = None) -> st
     return template.format(hours=hours, keyword_section=keyword_section, current_time=datetime.now().strftime('%Y-%m-%d %H:%M'))
 
 
-def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, dict]:
+def _remaining_budget_seconds(start_time: float, max_total_seconds: int | float) -> float:
+    if max_total_seconds <= 0:
+        return float('inf')
+    return max_total_seconds - (time.time() - start_time)
+
+
+def _bounded_request_timeout(
+    start_time: float,
+    max_total_seconds: int | float,
+    request_timeout_seconds: int | float,
+) -> float:
+    remaining = _remaining_budget_seconds(start_time, max_total_seconds)
+    if remaining == float('inf'):
+        return float(request_timeout_seconds)
+    if remaining <= P2_MIN_REMAINING_SECONDS:
+        return 0
+    return max(5.0, min(float(request_timeout_seconds), remaining - P2_MIN_REMAINING_SECONDS))
+
+
+def _sleep_with_budget(wait: float, start_time: float, max_total_seconds: int | float) -> bool:
+    remaining = _remaining_budget_seconds(start_time, max_total_seconds)
+    if remaining != float('inf'):
+        wait = min(wait, max(0.0, remaining - P2_MIN_REMAINING_SECONDS))
+    if wait <= 0:
+        return False
+    time.sleep(wait)
+    return True
+
+
+def collect_from_x(
+    backtrack: str = '24h',
+    max_retries: int = 3,
+    *,
+    max_total_seconds: int = P2_TOTAL_BUDGET_SECONDS,
+    request_timeout_seconds: int = P2_REQUEST_TIMEOUT_SECONDS,
+) -> tuple[str, dict]:
     stats = {
         'source': 'X(Twitter) via Grok',
         'model': GROK_MODEL,
@@ -125,8 +163,23 @@ def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, d
     all_filtered_leaks = []
     seen_tweet_ids = set()
     overall_start_time = time.time()
+    attempted_chunks = 0
+    successful_chunks = 0
+    stop_reason = ''
 
     for c_idx, chunk in enumerate(chunks, 1):
+        remaining = _remaining_budget_seconds(overall_start_time, max_total_seconds)
+        if remaining <= P2_MIN_REMAINING_SECONDS:
+            stop_reason = 'budget_exhausted'
+            logging.warning(
+                '[P2] 总耗时预算即将耗尽，停止后续 Grok 分批: attempted=%s/%s remaining=%.1fs',
+                attempted_chunks,
+                len(chunks),
+                max(0.0, remaining),
+            )
+            break
+
+        attempted_chunks = c_idx
         logging.info(f'📦 [P2] 开始处理检索分批 {c_idx}/{len(chunks)}，包含 {len(chunk)} 个赛道词...')
         user_prompt = _build_user_prompt(backtrack, chunk)
 
@@ -143,24 +196,39 @@ def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, d
 
         for attempt in range(max_retries):
             try:
+                request_timeout = _bounded_request_timeout(
+                    overall_start_time,
+                    max_total_seconds,
+                    request_timeout_seconds,
+                )
+                if request_timeout <= 0:
+                    stop_reason = 'budget_exhausted'
+                    logging.warning('[P2] 剩余预算不足，跳过当前 Grok 请求')
+                    break
                 logging.info(f'🔄   -> 正在请求 Grok API (第 {attempt+1}/{max_retries} 次尝试)...')
                 response = requests.post(
                     f'{GROK_BASE_URL}/v1/responses',
                     json=payload,
                     headers=headers,
-                    timeout=180
+                    timeout=request_timeout
                 )
 
                 if response.status_code in (401, 403):
                     logging.error(f'❌   -> API 鉴权失败 (HTTP {response.status_code})')
-                    stats['status'] = f'auth_failed_{response.status_code}'
-                    return '', stats
+                    stop_reason = f'auth_failed_{response.status_code}'
+                    if not all_filtered_leaks:
+                        stats['status'] = stop_reason
+                        update_run_manifest('p2', status=stop_reason, metrics=stats)
+                        return '', stats
+                    break
 
                 if response.status_code == 429:
                     # Why: 渐进退避，从 15s 起步，上限 120s，而非第一次就等 120s
                     wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
                     logging.warning(f'⏳   -> 触发限流(429)，等待 {wait:.1f}s')
-                    time.sleep(wait)
+                    if not _sleep_with_budget(wait, overall_start_time, max_total_seconds):
+                        stop_reason = 'budget_exhausted'
+                        break
                     continue
 
                 response.raise_for_status()
@@ -224,6 +292,7 @@ def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, d
                 chunk_final = '\n'.join(filtered_content)
                 if chunk_final.strip():
                     all_filtered_leaks.append(chunk_final)
+                    successful_chunks += 1
                     logging.info(f'✅   -> 本批次获取有效爆料，长度: {len(chunk_final)}')
 
                 break
@@ -231,28 +300,55 @@ def collect_from_x(backtrack: str = '24h', max_retries: int = 3) -> tuple[str, d
             except requests.exceptions.Timeout:
                 wait = 3
                 logging.warning(f'⚠️   -> 请求超时，等待 {wait}s ({attempt+1}/{max_retries})')
-                time.sleep(wait)
+                if not _sleep_with_budget(wait, overall_start_time, max_total_seconds):
+                    stop_reason = 'budget_exhausted'
+                    break
             except Exception as e:
                 wait = 3
                 logging.error(f'❌   -> 未知错误 ({e})，等待 {wait}s ({attempt+1}/{max_retries})')
-                time.sleep(wait)
+                if not _sleep_with_budget(wait, overall_start_time, max_total_seconds):
+                    stop_reason = 'budget_exhausted'
+                    break
+
+        if stop_reason:
+            break
 
     content = '\n\n'.join(all_filtered_leaks)
+    elapsed = time.time() - overall_start_time
+    stats['duration_seconds'] = round(elapsed, 1)
+    stats['attempted_chunks'] = attempted_chunks
+    stats['successful_chunks'] = successful_chunks
+    stats['total_chunks'] = len(chunks)
+    stats['max_total_seconds'] = max_total_seconds
 
     if not content.strip() or '<x_leaks>' not in content:
         logging.warning('⚠️ [P2] 所有批次均未获取到有效情报（全部作废）。')
-        stats['status'] = 'failed_empty'
-        update_run_manifest('p2', status='failed_empty', metrics=stats)
+        stats['status'] = 'failed_timeout' if stop_reason == 'budget_exhausted' else 'failed_empty'
+        if stop_reason:
+            stats['stop_reason'] = stop_reason
+        update_run_manifest('p2', status=stats['status'], metrics=stats)
         return '', stats
 
     structured_items = parse_p2_structured_items(content)
-    elapsed = time.time() - overall_start_time
-    stats['status'] = 'success'
-    stats['duration_seconds'] = round(elapsed, 1)
+    if stop_reason == 'budget_exhausted':
+        stats['status'] = 'partial_timeout'
+    elif stop_reason:
+        stats['status'] = f'partial_{stop_reason}'
+    else:
+        stats['status'] = 'success'
+    if stop_reason:
+        stats['stop_reason'] = stop_reason
     stats['content_length'] = len(content)
     stats['structured_items'] = len(structured_items)
 
-    logging.info(f'✅ [P2] X 平台情报分批采集完成: 共 {len(chunks)} 批, 总计 {len(content)} 字, 总耗时 {elapsed:.1f}s')
+    logging.info(
+        '✅ [P2] X 平台情报分批采集完成: 成功 %s/%s 批, 总计 %s 字, 总耗时 %.1fs, status=%s',
+        successful_chunks,
+        len(chunks),
+        len(content),
+        elapsed,
+        stats['status'],
+    )
 
     formatted = f'============================================================\n以下数据来自 X(Twitter) 平台实时分批采集（Grok {GROK_MODEL}）\n信息来源: X平台产业链insider/leaker/分析师/官方账号\n采集时间: {datetime.now().strftime("%Y-%m-%d %H:%M")}\n⚠️ 注意: X平台信息未经 P5 审计，可信度参差不齐，需结合其他数据源交叉验证\n============================================================\n\n{content}'
 

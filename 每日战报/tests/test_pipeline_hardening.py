@@ -28,6 +28,76 @@ def _reload_module(name: str):
 
 
 class TestPipelineRuntimeTimeout:
+    def test_fast_subprocess_result_is_read_before_queue_close(self, monkeypatch, tmp_path):
+        import pipeline_runtime
+
+        class FakeQueue:
+            def __init__(self):
+                self.closed = False
+                self.signal = {"status": "success"}
+
+            def get(self, timeout=None):
+                raise AssertionError("fast process should skip blocking queue read")
+
+            def get_nowait(self):
+                if self.closed:
+                    raise ValueError("queue is closed")
+                if self.signal is None:
+                    raise RuntimeError("empty queue")
+                signal = self.signal
+                self.signal = None
+                return signal
+
+            def close(self):
+                self.closed = True
+
+            def join_thread(self):
+                return None
+
+        class FakeProcess:
+            pid = 12345
+            exitcode = 0
+
+            def __init__(self, target, args, name):
+                self.args = args
+
+            def start(self):
+                result_file_path = self.args[3]
+                assert not os.path.exists(result_file_path)
+                with open(result_file_path, "w", encoding="utf-8") as handle:
+                    json.dump({"value": "child"}, handle)
+
+            def is_alive(self):
+                return False
+
+            def join(self, timeout=None):
+                return None
+
+            def terminate(self):
+                return None
+
+            def kill(self):
+                return None
+
+        class FakeMpContext:
+            def Queue(self, maxsize=0):
+                return FakeQueue()
+
+            def Process(self, target, args, name):
+                return FakeProcess(target, args, name)
+
+        monkeypatch.setattr(pipeline_runtime.multiprocessing, "get_context", lambda method: FakeMpContext())
+        monkeypatch.setattr(pipeline_runtime.tempfile, "gettempdir", lambda: str(tmp_path))
+        stale_path = tmp_path / f"vcp_stage_fast_stage_{os.getpid()}.json"
+        stale_path.write_text(json.dumps({"value": "stale"}), encoding="utf-8")
+
+        result = pipeline_runtime._run_stage_in_subprocess(
+            pipeline_runtime.StageSpec(name="fast_stage", handler=lambda context: None, timeout_seconds=5),
+            {"value": "parent"},
+        )
+
+        assert result == {"status": "success", "context": {"value": "child"}}
+
     def test_stage_timeout_marks_manifest(self, monkeypatch, tmp_path):
         monkeypatch.setenv("VCP_STAGE_EXECUTION_MODE", "process")
 

@@ -56,6 +56,7 @@ BLOCKED_HOSTNAMES = frozenset({
 })
 BLOCKED_HOST_SUFFIXES = ('.localhost', '.local', '.internal')
 MAX_SAFE_REDIRECTS = 5
+PROXY_FAKE_IP_NETWORKS = (ipaddress.ip_network('198.18.0.0/15'),)
 
 
 def _normalize_hostname(hostname: str) -> str:
@@ -83,6 +84,11 @@ def _is_blocked_ip_address(address) -> bool:
     )
 
 
+def _is_proxy_fake_ip_address(address) -> bool:
+    ip = address if isinstance(address, (ipaddress.IPv4Address, ipaddress.IPv6Address)) else ipaddress.ip_address(address)
+    return any(ip in network for network in PROXY_FAKE_IP_NETWORKS)
+
+
 def _is_blocked_hostname(hostname: str) -> bool:
     host = _normalize_hostname(hostname)
     return host in BLOCKED_HOSTNAMES or host.endswith(BLOCKED_HOST_SUFFIXES)
@@ -104,7 +110,10 @@ def _host_resolves_to_public_addresses(hostname: str) -> bool:
         if not sockaddr:
             return False
         try:
-            if _is_blocked_ip_address(sockaddr[0]):
+            ip = ipaddress.ip_address(sockaddr[0])
+            if _is_proxy_fake_ip_address(ip):
+                continue
+            if _is_blocked_ip_address(ip):
                 return False
         except ValueError:
             return False

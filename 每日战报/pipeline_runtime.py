@@ -195,6 +195,7 @@ def _run_stage_in_subprocess(stage: StageSpec, context: dict[str, Any]) -> dict[
     # Why: 在主进程侧创建临时文件路径，子进程往里写，主进程从里读
     tmp_dir = tempfile.gettempdir()
     result_file_path = os.path.join(tmp_dir, f"vcp_stage_{stage.name}_{os.getpid()}.json")
+    _cleanup_temp_file(result_file_path)
 
     process = mp_context.Process(
         target=_stage_process_entrypoint,
@@ -233,12 +234,6 @@ def _run_stage_in_subprocess(stage: StageSpec, context: dict[str, Any]) -> dict[
         _cleanup_temp_file(result_file_path)
         return {"status": "timeout"}
 
-    try:
-        result_queue.close()
-        result_queue.join_thread()
-    except Exception:
-        pass
-
     # Why: 如果循环中没读到信号，再做一次最终尝试
     if result_signal is None:
         try:
@@ -246,10 +241,19 @@ def _run_stage_in_subprocess(stage: StageSpec, context: dict[str, Any]) -> dict[
         except Exception:
             result_signal = None
 
+    try:
+        result_queue.close()
+        result_queue.join_thread()
+    except Exception:
+        pass
+
     if result_signal is None:
-        _cleanup_temp_file(result_file_path)
         if process.exitcode == 0:
+            updated_context = _read_context_from_file(result_file_path)
+            if updated_context is not None:
+                return {"status": "success", "context": updated_context}
             return {"status": "success", "context": context}
+        _cleanup_temp_file(result_file_path)
         return {
             "status": "error",
             "error": f"stage subprocess exited unexpectedly with code={process.exitcode}",

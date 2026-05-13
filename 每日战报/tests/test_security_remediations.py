@@ -27,6 +27,7 @@ def test_is_article_url_rejects_unsafe_targets():
         "http://10.0.0.2/latest",
         "http://172.16.0.2/latest",
         "http://192.168.1.2/latest",
+        "http://198.18.0.182/news",
         "http://169.254.169.254/latest/meta-data",
         "https://example.com@127.0.0.1/admin",
         "http://printer.local/status",
@@ -44,6 +45,20 @@ def test_safe_fetch_url_allows_public_dns_resolution(monkeypatch):
     def fake_getaddrinfo(host, port, type=0):
         assert host == "example.com"
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+
+    monkeypatch.setattr(scraper_utils.socket, "getaddrinfo", fake_getaddrinfo)
+
+    assert scraper_utils._safe_url_for_fetch("https://example.com/news/article") is True
+
+
+def test_safe_fetch_url_allows_proxy_fake_ip_dns_resolution(monkeypatch):
+    import scraper_utils
+
+    scraper_utils._host_resolves_to_public_addresses.cache_clear()
+
+    def fake_getaddrinfo(host, port, type=0):
+        assert host == "example.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.182", 443))]
 
     monkeypatch.setattr(scraper_utils.socket, "getaddrinfo", fake_getaddrinfo)
 

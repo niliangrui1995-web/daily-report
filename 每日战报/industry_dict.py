@@ -19,7 +19,7 @@
 OLIGARCH_DICT = {
     'EDA与底层IP': ['Synopsys', 'Cadence', 'ARM', 'Siemens EDA', 'Arteris', 'Alphawave (被Qualcomm收购已退市)'],
     'AI加速芯片与定制ASIC': ['NVIDIA', 'AMD', 'Broadcom (博通)', 'Marvell (迈威尔)', 'Alchip (世芯)', 'Qualcomm'],
-    '先进制程代工': ['TSMC (台积电)', 'Samsung Foundry', 'Intel Foundry Services', 'GlobalFoundries'],
+    '先进制程代工': ['TSMC (台积电)', 'Samsung Foundry', 'Intel Foundry Services', 'GlobalFoundries', 'Tower Semiconductor'],
     '前道晶圆设备与量测': ['ASML', 'Applied Materials (应材)', 'Lam Research (泛林)', 'Tokyo Electron (TEL/东京电子)', 'KLA', 'Onto Innovation'],
     '关键晶圆材料与特种工艺': ['Shin-Etsu (信越化学)', 'SUMCO', 'Soitec', 'IQE', 'AXT', 'PVA TePla', 'Entegris'],
     'HBM与先进存储': ['SK Hynix (SK海力士)', 'Samsung Memory', 'Micron (美光)'],
@@ -57,6 +57,7 @@ VANGUARD_TICKERS = {
     'AMD': 'AMD',
     'TSMC': 'TSM',
     'GlobalFoundries': 'GFS',
+    'Tower Semiconductor': 'TSEM',
     'Broadcom': 'AVGO',
     'Marvell': 'MRVL',
     'Alchip': '3661.TW',

@@ -163,11 +163,50 @@ class TestProviderErrorClassification:
                     ]
                 }
 
-        monkeypatch.setattr(requests, "post", lambda *args, **kwargs: FakeResponse())
+        monkeypatch.delenv("GROK_NATIVE_ENABLE_X_SEARCH", raising=False)
+        monkeypatch.delenv("GROK_NATIVE_REASONING_EFFORT", raising=False)
+        monkeypatch.delenv("GROK_NATIVE_MAX_OUTPUT_TOKENS", raising=False)
+        monkeypatch.delenv("GROK_REASONING_EFFORT", raising=False)
+        calls = []
 
-        adapter = NativeLLMAdapter(model="grok-4-1-fast-reasoning", api_key="secret", max_retries=1)
+        def fake_post(*args, **kwargs):
+            calls.append(kwargs)
+            return FakeResponse()
+
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        adapter = NativeLLMAdapter(model="grok-4.3", api_key="secret", max_retries=1)
 
         assert adapter._call_grok_native("system", "user") == "Grok answer"
+        assert calls[0]["json"]["model"] == "grok-4.3"
+        assert calls[0]["json"]["reasoning"] == {"effort": "none"}
+        assert calls[0]["json"]["max_output_tokens"] == 4096
+        assert "tools" not in calls[0]["json"]
+
+    def test_grok_native_x_search_is_opt_in(self, monkeypatch):
+        import requests
+
+        from native_llm_adapter import NativeLLMAdapter
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"output": ["ok"]}
+
+        calls = []
+        monkeypatch.setenv("GROK_NATIVE_ENABLE_X_SEARCH", "true")
+        monkeypatch.setenv("GROK_NATIVE_REASONING_EFFORT", "off")
+        monkeypatch.setenv("GROK_NATIVE_MAX_OUTPUT_TOKENS", "1024")
+        monkeypatch.setattr(requests, "post", lambda *args, **kwargs: calls.append(kwargs) or FakeResponse())
+
+        adapter = NativeLLMAdapter(model="grok-4.3", api_key="secret", max_retries=1)
+
+        assert adapter._call_grok_native("", "user") == "ok"
+        assert calls[0]["json"]["tools"] == [{"type": "x_search"}]
+        assert calls[0]["json"]["max_output_tokens"] == 1024
+        assert "reasoning" not in calls[0]["json"]
 
 
 class TestAuditFailureTelemetry:

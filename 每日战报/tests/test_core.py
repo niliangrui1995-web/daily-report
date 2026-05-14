@@ -155,7 +155,9 @@ class TestIndustryDict:
         assert "Disco (迪思科)" not in OLIGARCH_DICT["半导体测试设备与探针卡"]
         assert "SKC (Absolics)" in OLIGARCH_DICT["IC载板与封装材料"]
         assert "Vistance Networks (原CommScope ANS/RUCKUS)" in OLIGARCH_DICT["光纤光缆与宽带接入"]
+        assert "Tower Semiconductor" in OLIGARCH_DICT["先进制程代工"]
         assert VANGUARD_TICKERS["Arteris"] == "AIP"
+        assert VANGUARD_TICKERS["Tower Semiconductor"] == "TSEM"
         assert VANGUARD_TICKERS["SKC"] == "011790.KS"
         assert VANGUARD_TICKERS["TE Connectivity"] == "TEL"
         assert VANGUARD_TICKERS["Vistance Networks"] == "VISN"

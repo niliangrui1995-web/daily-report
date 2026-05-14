@@ -91,6 +91,12 @@ notepad .\每日战报\.env
 | `GEMINI_SEARCH_BASE_URL` | Gemini 搜索代理地址 |
 | `TAVILY_API_KEY` | Tavily 备用搜索 |
 | `GROK_API_KEY` | P2 X/Grok 情报采集 |
+| `GROK_MODEL` | P2 Grok 模型，默认 `grok-4.3` |
+| `GROK_REASONING_EFFORT` | P2 Grok 推理强度，默认 `none` 降低推理 token 成本 |
+| `GROK_MAX_OUTPUT_TOKENS` | P2 Grok 单批输出上限，默认 `4096` |
+| `GROK_NATIVE_REASONING_EFFORT` | 通用 Grok adapter 推理强度覆盖，默认沿用 `GROK_REASONING_EFFORT` |
+| `GROK_NATIVE_MAX_OUTPUT_TOKENS` | 通用 Grok adapter 输出上限，默认 `4096` |
+| `GROK_NATIVE_ENABLE_X_SEARCH` | 通用 Grok adapter 是否挂载 `x_search`，默认 `false` |
 | `EMAIL_ADDRESS` / `EMAIL_PASSWORD` | SMTP 发件账号和授权码 |
 | `RECEIVER_EMAIL` | 收件人，多个邮箱用逗号分隔 |
 | `INSECURE_TLS_ALLOWLIST` | 允许降级为不安全 TLS 的域名白名单，默认空 |

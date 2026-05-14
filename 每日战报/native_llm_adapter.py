@@ -107,6 +107,37 @@ def _openai_compat_max_tokens(model: str) -> int:
         return 128000
     return 16000
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(name, '').strip().lower()
+    if not raw_value:
+        return default
+    return raw_value in {'1', 'true', 'yes', 'on'}
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw_value = os.environ.get(name, '').strip()
+    if not raw_value:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning("%s is not a positive integer: %s", name, raw_value)
+        return default
+    if value <= 0:
+        logger.warning("%s must be positive: %s", name, raw_value)
+        return default
+    return value
+
+
+def _grok_native_reasoning_effort() -> str:
+    return (
+        os.environ.get('GROK_NATIVE_REASONING_EFFORT')
+        or os.environ.get('GROK_REASONING_EFFORT')
+        or 'none'
+    ).strip().lower()
+
+
 @dataclass
 class FakeAIMessage:
     """模拟 LangChain 的 AIMessage，支持 .content / .tool_calls / .thinking_content"""
@@ -568,8 +599,13 @@ class NativeLLMAdapter(RunnableSerializable):
         payload = {
             "model": self.model,
             "input": input_messages,
-            "tools": [{"type": "x_search"}]
+            "max_output_tokens": _env_positive_int("GROK_NATIVE_MAX_OUTPUT_TOKENS", 4096),
         }
+        reasoning_effort = _grok_native_reasoning_effort()
+        if reasoning_effort not in {"", "0", "false", "off", "disabled"}:
+            payload["reasoning"] = {"effort": reasoning_effort}
+        if _env_flag("GROK_NATIVE_ENABLE_X_SEARCH", default=False):
+            payload["tools"] = [{"type": "x_search"}]
 
         for attempt in range(self.max_retries):
             try:

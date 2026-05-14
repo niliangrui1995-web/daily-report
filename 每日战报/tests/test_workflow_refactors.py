@@ -155,7 +155,13 @@ class TestP2BudgetGuardrail:
 
             def json(self):
                 return {
-                    "usage": {"total_tokens": 123, "reasoning_tokens": 0, "input_tokens_details": {"cached_tokens": 12}},
+                    "usage": {
+                        "total_tokens": 123,
+                        "input_tokens": 80,
+                        "output_tokens": 43,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "input_tokens_details": {"cached_tokens": 12},
+                    },
                     "output": [
                         {
                             "role": "assistant",
@@ -195,6 +201,9 @@ class TestP2BudgetGuardrail:
             return "system {{track_count}} {{industry_tracks}} {{super_giants}} {{strategic_giants}}"
 
         monkeypatch.setattr(p2_x_intel, "GROK_API_KEY", "test-key")
+        monkeypatch.setattr(p2_x_intel, "GROK_MODEL", "grok-4.3")
+        monkeypatch.setattr(p2_x_intel, "GROK_REASONING_EFFORT", "none")
+        monkeypatch.setattr(p2_x_intel, "GROK_MAX_OUTPUT_TOKENS", 2048)
         monkeypatch.setattr(p2_x_intel, "INDUSTRY_SCAN_KEYWORDS", ["kw1", "kw2", "kw3", "kw4", "kw5", "kw6"])
         monkeypatch.setattr(p2_x_intel, "require_prompt", fake_require_prompt)
         monkeypatch.setattr(p2_x_intel.requests, "post", fake_post)
@@ -219,8 +228,15 @@ class TestP2BudgetGuardrail:
         )
 
         assert len(calls) == 1
+        assert calls[0]["json"]["model"] == "grok-4.3"
+        assert calls[0]["json"]["reasoning"] == {"effort": "none"}
+        assert calls[0]["json"]["tools"] == [{"type": "x_search"}]
+        assert calls[0]["json"]["max_output_tokens"] == 2048
         assert "HBM 基板交期再次拉长" in content
         assert stats["status"] == "partial_timeout"
+        assert stats["input_tokens"] == 80
+        assert stats["output_tokens"] == 43
+        assert stats["reasoning_tokens"] == 0
         assert stats["attempted_chunks"] == 1
         assert stats["successful_chunks"] == 1
         assert stats["total_chunks"] == 2

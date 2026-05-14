@@ -12,7 +12,7 @@ P2 X(Twitter) 产业链情报采集 — 使用 Grok API 抓取 X 平台 AI 产�
 连接方式：
   - 走本机翻墙代理（与 Gemini Search 直连共享同一个自动探测端口）
   - xAI 原生 REST API（直连 xAI 服务器，无任何中间代理）
-  - 端点：https://api.x.ai/v1/chat/completions
+  - 端点：https://api.x.ai/v1/responses
 
 【⚠️核心维护规则 / Agent 指令】
 1. P2 作为直连 Grok 的“第一手推特爆料池”，按架构规矩绝对不允许流入 P5 进行二次过滤审计（会导致时限迟滞及洗白），修改时严禁引入任何 P5 依赖。
@@ -24,6 +24,7 @@ import time
 import random
 import logging
 import requests
+import os
 from datetime import datetime
 import re
 
@@ -33,8 +34,26 @@ from utils import parse_backtrack_hours
 from settings import require_prompt, GROK_API_KEY
 from industry_dict import OLIGARCH_DICT, SUPER_GIANTS, STRATEGIC_GIANTS
 
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw_value = os.environ.get(name, '').strip()
+    if not raw_value:
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        logging.warning('%s is not a positive integer: %s', name, raw_value)
+        return default
+    if parsed <= 0:
+        logging.warning('%s must be positive: %s', name, raw_value)
+        return default
+    return parsed
+
+
 GROK_BASE_URL = 'https://api.x.ai'
-GROK_MODEL = 'grok-4-1-fast-reasoning'
+GROK_MODEL = os.environ.get('GROK_MODEL', 'grok-4.3').strip() or 'grok-4.3'
+GROK_REASONING_EFFORT = os.environ.get('GROK_REASONING_EFFORT', 'none').strip().lower() or 'none'
+GROK_MAX_OUTPUT_TOKENS = _env_positive_int('GROK_MAX_OUTPUT_TOKENS', 4096)
 P2_TOTAL_BUDGET_SECONDS = 420
 P2_REQUEST_TIMEOUT_SECONDS = 75
 P2_MIN_REMAINING_SECONDS = 10
@@ -116,7 +135,9 @@ def collect_from_x(
         'model': GROK_MODEL,
         'status': 'pending',
         'duration_seconds': 0,
-        'content_length': 0
+        'content_length': 0,
+        'reasoning_effort': GROK_REASONING_EFFORT,
+        'max_output_tokens': GROK_MAX_OUTPUT_TOKENS,
     }
 
     if not GROK_API_KEY:
@@ -190,9 +211,12 @@ def collect_from_x(
                 {'role': 'user', 'content': user_prompt}
             ],
             'tools': [{'type': 'x_search'}],
+            'max_output_tokens': GROK_MAX_OUTPUT_TOKENS,
             'temperature': 0.7,
             'prompt_cache_key': 'vcp-hunter-l1a-daily-batch'
         }
+        if GROK_REASONING_EFFORT not in {'', '0', 'false', 'off', 'disabled'}:
+            payload['reasoning'] = {'effort': GROK_REASONING_EFFORT}
 
         for attempt in range(max_retries):
             try:
@@ -236,12 +260,24 @@ def collect_from_x(
 
                 usage = data.get('usage', {})
                 total_tok = usage.get('total_tokens', 0)
-                reason_tok = usage.get('reasoning_tokens', 0)
+                input_tok = usage.get('input_tokens', 0)
+                output_tok = usage.get('output_tokens', 0)
                 input_dtls = usage.get('input_tokens_details', {})
+                output_dtls = usage.get('output_tokens_details', {})
+                reason_tok = usage.get('reasoning_tokens', 0) or output_dtls.get('reasoning_tokens', 0)
                 cache_tok = input_dtls.get('cached_tokens', 0)
 
-                logging.info(f'💡   -> 本次耗费 Tokens: {total_tok} (内部推演: {reason_tok}, 命中免单缓存: {cache_tok})')
+                logging.info(
+                    '💡   -> 本次耗费 Tokens: %s (输入: %s, 输出: %s, 内部推演: %s, 命中免单缓存: %s)',
+                    total_tok,
+                    input_tok,
+                    output_tok,
+                    reason_tok,
+                    cache_tok,
+                )
                 stats['total_tokens'] = stats.get('total_tokens', 0) + total_tok
+                stats['input_tokens'] = stats.get('input_tokens', 0) + input_tok
+                stats['output_tokens'] = stats.get('output_tokens', 0) + output_tok
                 stats['reasoning_tokens'] = stats.get('reasoning_tokens', 0) + reason_tok
                 stats['cached_tokens'] = stats.get('cached_tokens', 0) + cache_tok
 

@@ -208,6 +208,30 @@ class TestProviderErrorClassification:
         assert calls[0]["json"]["max_output_tokens"] == 1024
         assert "reasoning" not in calls[0]["json"]
 
+    def test_grok_native_permission_denied_stops_without_retry(self, monkeypatch):
+        import requests
+
+        import native_llm_adapter
+        from native_llm_adapter import NativeLLMAdapter
+
+        class PermissionDeniedResponse:
+            def raise_for_status(self):
+                raise requests.HTTPError(
+                    "403 PERMISSION_DENIED: Cloud Code Private API has not been used in project test before or it is disabled."
+                )
+
+        calls = []
+        sleeps = []
+        monkeypatch.setattr(requests, "post", lambda *args, **kwargs: calls.append(kwargs) or PermissionDeniedResponse())
+        monkeypatch.setattr(native_llm_adapter.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+        adapter = NativeLLMAdapter(model="grok-4.3", api_key="secret", max_retries=3)
+
+        assert adapter._call_grok_native("", "user") == ""
+        assert len(calls) == 1
+        assert adapter.last_error_category == "permission_denied"
+        assert sleeps == []
+
 
 class TestAuditFailureTelemetry:
     def test_p5_empty_output_includes_last_error_details(self, monkeypatch):

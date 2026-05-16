@@ -634,10 +634,10 @@ class NativeLLMAdapter(RunnableSerializable):
                                     text += str(content_block.get("text") or "") + "\n"
                 return text.strip()
             except Exception as e:
-                wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
-                logger.warning(f"⚠️ [Grok Native] 请求异常: {e}，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）")
-                time.sleep(wait)
-        logger.error(f"❌ [Grok Native] {self.max_retries} 次重试全部失败")
+                if not self._handle_provider_error('Grok Native', e, attempt):
+                    break
+                continue
+        logger.error(f"❌ [Grok Native] 调用失败，最后错误分类: {self.last_error_category or 'unknown_error'}")
         return ""
 
     def _call_openai_compat(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:

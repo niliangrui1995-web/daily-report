@@ -89,8 +89,8 @@ notepad .\每日战报\.env
 | `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 覆盖 Pro/Opus 模型服务；未配置时沿用 Antigravity 配置 |
 | `GEMINI_SEARCH_API_KEYS` | Gemini 搜索 key 池，逗号分隔 |
 | `GEMINI_SEARCH_BASE_URL` | Gemini 搜索代理地址 |
-| `GEMINI_PRO_MODEL` | P5/P7a/P7.5 审计模型，默认 `gemini-3.5-flash` |
-| `GEMINI_PRO_API_KEY` | Gemini 3.5 审计专用 key；未配置时使用 `GEMINI_SEARCH_API_KEYS` 的第一个 key |
+| `AUDIT_MODEL` | P5/P7a/P7.5 审计模型，默认 `claude-sonnet-4-6`；兼容旧变量 `GEMINI_PRO_MODEL` |
+| `GEMINI_PRO_API_KEY` | Gemini 审计模型专用 key；仅当 `AUDIT_MODEL` 使用 Gemini 3.5 时生效 |
 | `TAVILY_API_KEY` | Tavily 备用搜索 |
 | `GROK_API_KEY` | P2 X/Grok 情报采集 |
 | `GROK_MODEL` | P2 Grok 模型，默认 `grok-4.3` |

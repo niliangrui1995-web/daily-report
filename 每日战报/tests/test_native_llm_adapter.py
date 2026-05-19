@@ -75,6 +75,17 @@ class TestProviderErrorClassification:
 
         assert adapter.provider == "openai_compat"
 
+    def test_antigravity_v1_routes_sonnet_46_to_openai_compat(self):
+        from native_llm_adapter import NativeLLMAdapter
+
+        adapter = NativeLLMAdapter(
+            model="claude-sonnet-4-6",
+            base_url="http://127.0.0.1:7861/antigravity/v1",
+            api_key="pwd",
+        )
+
+        assert adapter.provider == "openai_compat"
+
     def test_standard_v1_routes_gemini_31_pro_to_openai_compat(self):
         from native_llm_adapter import NativeLLMAdapter
 
@@ -91,6 +102,17 @@ class TestProviderErrorClassification:
 
         adapter = NativeLLMAdapter(
             model="claude-opus-4-6-thinking",
+            base_url="http://127.0.0.1:8317/v1",
+            api_key="pwd",
+        )
+
+        assert adapter.provider == "openai_compat"
+
+    def test_standard_v1_routes_sonnet_46_to_openai_compat(self):
+        from native_llm_adapter import NativeLLMAdapter
+
+        adapter = NativeLLMAdapter(
+            model="claude-sonnet-4-6",
             base_url="http://127.0.0.1:8317/v1",
             api_key="pwd",
         )
@@ -192,7 +214,67 @@ class TestProviderErrorClassification:
         assert result.content == "OK"
         assert result.thinking_content == "trace"
         assert client_kwargs["max_retries"] == 0
-        assert create_kwargs["max_tokens"] == 128000
+        assert "max_tokens" not in create_kwargs
+
+    def test_openai_compat_omits_default_max_tokens_for_non_thinking(self, monkeypatch):
+        import types
+
+        from native_llm_adapter import NativeLLMAdapter
+
+        monkeypatch.delenv("OPENAI_COMPAT_MAX_TOKENS", raising=False)
+        fake_message = SimpleNamespace(content="OK", reasoning_content="")
+        fake_response = SimpleNamespace(choices=[SimpleNamespace(message=fake_message)])
+        create_kwargs = {}
+
+        class FakeOpenAI:
+            def __init__(self, *args, **kwargs):
+                self.chat = SimpleNamespace(
+                    completions=SimpleNamespace(create=lambda **kwargs: create_kwargs.update(kwargs) or fake_response)
+                )
+
+        monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
+
+        adapter = NativeLLMAdapter(
+            model="claude-sonnet-4-6",
+            base_url="http://127.0.0.1:8317/v1",
+            api_key="pwd",
+            max_retries=1,
+        )
+
+        result = adapter.invoke("只返回OK")
+
+        assert result.content == "OK"
+        assert "max_tokens" not in create_kwargs
+
+    def test_openai_compat_honors_max_tokens_override(self, monkeypatch):
+        import types
+
+        from native_llm_adapter import NativeLLMAdapter
+
+        monkeypatch.setenv("OPENAI_COMPAT_MAX_TOKENS", "32000")
+        fake_message = SimpleNamespace(content="OK", reasoning_content="")
+        fake_response = SimpleNamespace(choices=[SimpleNamespace(message=fake_message)])
+        create_kwargs = {}
+
+        class FakeOpenAI:
+            def __init__(self, *args, **kwargs):
+                self.chat = SimpleNamespace(
+                    completions=SimpleNamespace(create=lambda **kwargs: create_kwargs.update(kwargs) or fake_response)
+                )
+
+        monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
+
+        adapter = NativeLLMAdapter(
+            model="claude-sonnet-4-6",
+            base_url="http://127.0.0.1:8317/v1",
+            api_key="pwd",
+            max_retries=1,
+        )
+
+        result = adapter.invoke("只返回OK")
+
+        assert result.content == "OK"
+        assert create_kwargs["max_tokens"] == 32000
 
     def test_grok_native_parses_responses_message_output_text(self, monkeypatch):
         import requests

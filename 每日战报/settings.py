@@ -106,7 +106,8 @@ if not SEARCH_API_KEY_POOL:
     logging.warning('⚠️ GEMINI_SEARCH_API_KEYS 未配置！请检查 .env 文件。联网搜索功能将不可用。')
 
 GEMINI_SEARCH_MODEL = 'gemini-2.5-flash'
-GEMINI_PRO_MODEL = os.environ.get('GEMINI_PRO_MODEL', 'gemini-3.5-flash').strip() or 'gemini-3.5-flash'
+AUDIT_MODEL = os.environ.get('AUDIT_MODEL', os.environ.get('GEMINI_PRO_MODEL', 'claude-sonnet-4-6')).strip() or 'claude-sonnet-4-6'
+GEMINI_PRO_MODEL = AUDIT_MODEL
 OPUS_MODEL = 'claude-opus-4-6-thinking'
 AGENT_ASSIST_ENABLED = os.environ.get('AGENT_ASSIST_ENABLED', '').strip().lower() in {'1', 'true', 'yes', 'on'}
 AGENT_ASSIST_MODEL = os.environ.get('AGENT_ASSIST_MODEL', '').strip()
@@ -160,14 +161,14 @@ def _get_pro_adapter():
     if _pro_adapter is None:
         from native_llm_adapter import NativeLLMAdapter
         pro_api_key = PRO_OPUS_API_KEY
-        if GEMINI_PRO_MODEL.lower().startswith('gemini-3.5-'):
+        if AUDIT_MODEL.lower().startswith('gemini-3.5-'):
             if GEMINI_PRO_API_KEY:
                 pro_api_key = GEMINI_PRO_API_KEY
             elif SEARCH_API_KEY_POOL:
                 pro_api_key = SEARCH_API_KEY_POOL[0]
             else:
-                logging.warning('⚠️ GEMINI_PRO_MODEL 使用 Gemini 3.5，但 GEMINI_PRO_API_KEY / GEMINI_SEARCH_API_KEYS 未配置；Pro 审计调用将鉴权失败。')
-        _pro_adapter = NativeLLMAdapter(model=GEMINI_PRO_MODEL, base_url=PRO_OPUS_BASE_URL, api_key=pro_api_key, max_retries=3)
+                logging.warning('⚠️ AUDIT_MODEL 使用 Gemini 3.5，但 GEMINI_PRO_API_KEY / GEMINI_SEARCH_API_KEYS 未配置；审计调用将鉴权失败。')
+        _pro_adapter = NativeLLMAdapter(model=AUDIT_MODEL, base_url=PRO_OPUS_BASE_URL, api_key=pro_api_key, max_retries=3)
     return _pro_adapter
 
 def _get_opus_adapter():

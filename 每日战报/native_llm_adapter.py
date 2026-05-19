@@ -8,7 +8,7 @@ import random
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 # Why: FAKE_HEADERS 统一在 config.py 定义，避免分散维护
 from config import FAKE_HEADERS
@@ -36,6 +36,11 @@ _GEMINI_OPENAI_COMPAT_MODEL_MARKERS = (
     'gemini-3-pro-low',
     'gemini-pro-agent',
     'gemini-3-flash-agent',
+)
+
+_CLAUDE_OPENAI_COMPAT_MODEL_MARKERS = (
+    'claude-opus-4-6',
+    'claude-sonnet-4-6',
 )
 
 _PERMISSION_DENIED_MARKERS = (
@@ -98,8 +103,11 @@ def _classify_provider_error(error: Exception) -> Dict[str, Any]:
 def _should_use_openai_compat_proxy(model: str, base_url: str) -> bool:
     model_lower = (model or '').lower()
     base_url_lower = (base_url or '').rstrip('/').lower()
-    uses_proxy_model = any(marker in model_lower for marker in _GEMINI_OPENAI_COMPAT_MODEL_MARKERS)
-    if not uses_proxy_model and 'claude-opus-4-6' not in model_lower:
+    uses_proxy_model = (
+        any(marker in model_lower for marker in _GEMINI_OPENAI_COMPAT_MODEL_MARKERS)
+        or any(marker in model_lower for marker in _CLAUDE_OPENAI_COMPAT_MODEL_MARKERS)
+    )
+    if not uses_proxy_model:
         return False
     return 'antigravity/v1' in base_url_lower or base_url_lower.endswith('/v1')
 
@@ -118,7 +126,7 @@ def _is_official_gemini_direct_model(model: str) -> bool:
     )
 
 
-def _openai_compat_max_tokens(model: str) -> int:
+def _openai_compat_max_tokens(model: str) -> Optional[int]:
     override = os.environ.get('OPENAI_COMPAT_MAX_TOKENS', '').strip()
     if override:
         try:
@@ -128,9 +136,7 @@ def _openai_compat_max_tokens(model: str) -> int:
         except ValueError:
             logger.warning("OPENAI_COMPAT_MAX_TOKENS is not a positive integer: %s", override)
 
-    if 'thinking' in (model or '').lower():
-        return 128000
-    return 16000
+    return None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -686,12 +692,15 @@ class NativeLLMAdapter(RunnableSerializable):
 
         for attempt in range(self.max_retries):
             try:
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    max_tokens=_openai_compat_max_tokens(self.model),
-                    timeout=self.timeout
-                )
+                kwargs = {
+                    'model': self.model,
+                    'messages': messages,
+                    'timeout': self.timeout,
+                }
+                max_tokens = _openai_compat_max_tokens(self.model)
+                if max_tokens is not None:
+                    kwargs['max_tokens'] = max_tokens
+                response = client.chat.completions.create(**kwargs)
                 message = response.choices[0].message
                 text = message.content or ''
                 reasoning = getattr(message, 'reasoning_content', '') or ''

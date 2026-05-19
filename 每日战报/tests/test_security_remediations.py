@@ -232,3 +232,30 @@ def test_report_email_sanitizes_html_and_unsafe_links():
     assert "onerror" not in lowered
     assert "javascript:" not in lowered
     assert 'href="https://example.com/report"' in body
+
+
+def test_report_email_falls_back_to_tun_safe_route(monkeypatch):
+    import p9_email
+
+    calls = []
+
+    def fake_send_message(msg, *, sender_email, sender_password, receiver_email, remote_ip=None, source_ip=None):
+        calls.append({"remote_ip": remote_ip, "source_ip": source_ip})
+        if remote_ip is None:
+            raise TimeoutError("primary path timed out")
+
+    monkeypatch.setattr(p9_email, "_send_message", fake_send_message)
+    monkeypatch.setattr(p9_email, "_candidate_source_ips", lambda: ["192.168.0.102"])
+    monkeypatch.setattr(p9_email, "_resolve_real_smtp_ips", lambda: ["43.163.178.76"])
+
+    p9_email.send_report_via_email(
+        "report",
+        sender_email="sender@example.com",
+        sender_password="secret",
+        receiver_email="receiver@example.com",
+    )
+
+    assert calls == [
+        {"remote_ip": None, "source_ip": None},
+        {"remote_ip": "43.163.178.76", "source_ip": "192.168.0.102"},
+    ]

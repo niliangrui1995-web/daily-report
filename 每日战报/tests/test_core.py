@@ -569,7 +569,7 @@ class TestSettings:
     def test_adapters_initialized(self):
         """LLM 适配器应正确初始化"""
         from settings import pro_adapter, opus_adapter
-        assert pro_adapter.model == "gemini-3.1-pro-high"
+        assert pro_adapter.model == "gemini-3.5-flash"
         assert opus_adapter.model == "claude-opus-4-6-thinking"
 
     def test_output_dir_exists(self):

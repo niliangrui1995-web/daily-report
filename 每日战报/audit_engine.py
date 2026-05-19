@@ -1,5 +1,5 @@
 """
-P5 / P7a / P7.5 审计层 — Gemini 3.1 Pro High 独立审计引擎。
+P5 / P7a / P7.5 审计层 — Gemini 3.5 Flash 独立审计引擎。
 
 从 daily_report.py 拆分。负责对 P1 原始数据、P7 深度研究和 P7.5 补充搜索结果进行
 可信度打分、时效性验证、去重汇总与数据清洗。
@@ -213,7 +213,7 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
 
     Why: P7 原始输出通常 40K+ 字，跨 3 轮搜索存在大量重复信息和搜索噪声。
          如果直接送入 P9，会占据 Opus 近一半的注意力窗口，稀释战报质量。
-         P7a 用 Gemini 3.1 Pro 做一次审计汇总，将信息密度提升 3~5 倍，
+         P7a 用 Gemini 3.5 Flash 做一次审计汇总，将信息密度提升 3~5 倍，
          输出 8~12K 字的精炼 Markdown 报告替代原始数据送入 P9。
 
     Args:

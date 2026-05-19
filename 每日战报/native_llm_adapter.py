@@ -29,6 +29,15 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_GEMINI_OPENAI_COMPAT_MODEL_MARKERS = (
+    'gemini-3.1-pro-high',
+    'gemini-3.1-pro-low',
+    'gemini-3-pro-high',
+    'gemini-3-pro-low',
+    'gemini-pro-agent',
+    'gemini-3-flash-agent',
+)
+
 _PERMISSION_DENIED_MARKERS = (
     'permission_denied',
     'accessnotconfigured',
@@ -89,9 +98,25 @@ def _classify_provider_error(error: Exception) -> Dict[str, Any]:
 def _should_use_openai_compat_proxy(model: str, base_url: str) -> bool:
     model_lower = (model or '').lower()
     base_url_lower = (base_url or '').rstrip('/').lower()
-    if 'gemini-3.1-pro' not in model_lower and 'claude-opus-4-6' not in model_lower:
+    uses_proxy_model = any(marker in model_lower for marker in _GEMINI_OPENAI_COMPAT_MODEL_MARKERS)
+    if not uses_proxy_model and 'claude-opus-4-6' not in model_lower:
         return False
     return 'antigravity/v1' in base_url_lower or base_url_lower.endswith('/v1')
+
+
+def _is_official_gemini_direct_model(model: str) -> bool:
+    model_lower = (model or '').lower()
+    if not model_lower.startswith('gemini-'):
+        return False
+    if any(marker in model_lower for marker in _GEMINI_OPENAI_COMPAT_MODEL_MARKERS):
+        return False
+    return (
+        model_lower.startswith('gemini-2.')
+        or model_lower.startswith('gemini-3.5-')
+        or model_lower.endswith('-preview')
+        or model_lower.endswith('-latest')
+    )
+
 
 def _openai_compat_max_tokens(model: str) -> int:
     override = os.environ.get('OPENAI_COMPAT_MAX_TOKENS', '').strip()
@@ -538,16 +563,16 @@ class NativeLLMAdapter(RunnableSerializable):
         return '', ''
 
     def _call_gemini(self, prompt: str) -> str:
-        # 统一使用最新 google.genai 架构（同时处理 2.5 直连与 3.1 反代）
+        # 统一使用最新 google.genai 架构（同时处理官方直连与旧 3.x 反代）
         if getattr(self, '_gemini_client', None) is None:
             from google import genai
             from google.genai import types
             
-            if '2.5' in self.model:
-                # 2.5 走官方默认 URL，原生直连通道 + 环境代理
+            if _is_official_gemini_direct_model(self.model):
+                # 官方 Gemini 模型走默认 URL，避免把 3.5 误送进本地 3.1 反代。
                 client = genai.Client(api_key=self.api_key)
             else:
-                # 3.1 Pro 走反代逻辑 (通过 http_options.base_url 挂载)
+                # 旧版 3.x 兼容模型走反代逻辑 (通过 http_options.base_url 挂载)
                 client = genai.Client(
                     api_key=self.api_key,
                     http_options=types.HttpOptions(base_url=self.base_url)

@@ -108,6 +108,59 @@ class TestProviderErrorClassification:
 
         assert adapter.provider == "google"
 
+    def test_standard_v1_does_not_reroute_gemini_35_flash(self):
+        from native_llm_adapter import NativeLLMAdapter
+
+        adapter = NativeLLMAdapter(
+            model="gemini-3.5-flash",
+            base_url="http://127.0.0.1:8317/v1",
+            api_key="pwd",
+        )
+
+        assert adapter.provider == "google"
+
+    def test_gemini_35_flash_uses_official_client(self, monkeypatch):
+        import types
+
+        from native_llm_adapter import NativeLLMAdapter
+
+        client_kwargs = {}
+        generate_kwargs = {}
+
+        class FakeConfig:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class FakeHttpOptions:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class FakeModels:
+            def generate_content(self, **kwargs):
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(text="OK")
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                client_kwargs.update(kwargs)
+                self.models = FakeModels()
+
+        fake_types = SimpleNamespace(GenerateContentConfig=FakeConfig, HttpOptions=FakeHttpOptions)
+        fake_genai = SimpleNamespace(Client=FakeClient, types=fake_types)
+        monkeypatch.setitem(sys.modules, "google", SimpleNamespace(genai=fake_genai))
+        monkeypatch.setitem(sys.modules, "google.genai", fake_genai)
+
+        adapter = NativeLLMAdapter(
+            model="gemini-3.5-flash",
+            base_url="http://127.0.0.1:8317/v1",
+            api_key="gemini-key",
+            max_retries=1,
+        )
+
+        assert adapter._call_gemini("ping") == "OK"
+        assert client_kwargs == {"api_key": "gemini-key"}
+        assert generate_kwargs["model"] == "gemini-3.5-flash"
+
     def test_openai_compat_preserves_reasoning_content(self, monkeypatch):
         import types
 

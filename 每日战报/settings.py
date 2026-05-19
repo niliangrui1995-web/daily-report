@@ -92,6 +92,7 @@ PRO_OPUS_API_KEY = os.environ.get('PRO_OPUS_API_KEY', ANTIGRAVITY_API_KEY)
 
 GEMINI_SEARCH_DIRECT_URL = 'https://generativelanguage.googleapis.com'
 GEMINI_SEARCH_CF_URL = os.environ.get('GEMINI_SEARCH_BASE_URL', 'https://api.niliangrui.cloud')
+GEMINI_PRO_API_KEY = os.environ.get('GEMINI_PRO_API_KEY', '').strip()
 _search_keys_env = os.environ.get('GEMINI_SEARCH_API_KEYS', '')
 _search_single_key = os.environ.get('GEMINI_SEARCH_API_KEY', '')
 if _search_keys_env:
@@ -105,7 +106,7 @@ if not SEARCH_API_KEY_POOL:
     logging.warning('⚠️ GEMINI_SEARCH_API_KEYS 未配置！请检查 .env 文件。联网搜索功能将不可用。')
 
 GEMINI_SEARCH_MODEL = 'gemini-2.5-flash'
-GEMINI_PRO_MODEL = 'gemini-3.1-pro-high'
+GEMINI_PRO_MODEL = os.environ.get('GEMINI_PRO_MODEL', 'gemini-3.5-flash').strip() or 'gemini-3.5-flash'
 OPUS_MODEL = 'claude-opus-4-6-thinking'
 AGENT_ASSIST_ENABLED = os.environ.get('AGENT_ASSIST_ENABLED', '').strip().lower() in {'1', 'true', 'yes', 'on'}
 AGENT_ASSIST_MODEL = os.environ.get('AGENT_ASSIST_MODEL', '').strip()
@@ -158,7 +159,15 @@ def _get_pro_adapter():
     global _pro_adapter
     if _pro_adapter is None:
         from native_llm_adapter import NativeLLMAdapter
-        _pro_adapter = NativeLLMAdapter(model=GEMINI_PRO_MODEL, base_url=PRO_OPUS_BASE_URL, api_key=PRO_OPUS_API_KEY, max_retries=3)
+        pro_api_key = PRO_OPUS_API_KEY
+        if GEMINI_PRO_MODEL.lower().startswith('gemini-3.5-'):
+            if GEMINI_PRO_API_KEY:
+                pro_api_key = GEMINI_PRO_API_KEY
+            elif SEARCH_API_KEY_POOL:
+                pro_api_key = SEARCH_API_KEY_POOL[0]
+            else:
+                logging.warning('⚠️ GEMINI_PRO_MODEL 使用 Gemini 3.5，但 GEMINI_PRO_API_KEY / GEMINI_SEARCH_API_KEYS 未配置；Pro 审计调用将鉴权失败。')
+        _pro_adapter = NativeLLMAdapter(model=GEMINI_PRO_MODEL, base_url=PRO_OPUS_BASE_URL, api_key=pro_api_key, max_retries=3)
     return _pro_adapter
 
 def _get_opus_adapter():

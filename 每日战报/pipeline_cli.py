@@ -17,6 +17,7 @@ from artifact_store import (
     get_today_logs_dir,
     get_today_output_dir,
     load_run_manifest,
+    set_run_timestamp,
     set_preflight_summary,
     update_run_manifest,
 )
@@ -312,6 +313,10 @@ def _print_preflight(result: dict) -> int:
 
 
 def explain_preflight_and_record(result: dict) -> dict:
+    manifest = load_run_manifest()
+    existing_run_ts = str(manifest.get("run_timestamp", "")).strip()
+    if existing_run_ts and manifest.get("stages"):
+        set_run_timestamp(existing_run_ts)
     agent_result = explain_preflight(result)
     status = "completed" if agent_result.get("ok") else "skipped"
     update_run_manifest(

@@ -86,6 +86,37 @@ def test_apply_evidence_guardrails_caps_single_and_soft_multi_source():
     assert metrics["significance_downgrades"] == 2
 
 
+def test_parse_report_payload_repairs_complete_partial_json():
+    import p9_reporter
+
+    raw = json.dumps(
+        {
+            "x_intel_snipe": [],
+            "p3_machine_intel": [],
+            "core_signals": [],
+            "sniper_tables": [],
+            "fund_pathway": [],
+            "today_advice": [],
+            "risk_warning": [],
+        },
+        ensure_ascii=False,
+    )[:-1]
+
+    payload = p9_reporter._parse_report_payload(raw)
+
+    assert payload["today_advice"] == []
+
+
+def test_parse_report_payload_rejects_incomplete_repaired_json():
+    import pytest
+    import p9_reporter
+
+    raw = '```json\n{"core_signals": [], "sniper_tables": []'
+
+    with pytest.raises(json.JSONDecodeError):
+        p9_reporter._parse_report_payload(raw)
+
+
 def test_p9_risk_analysis_applies_guardrails_before_rendering(monkeypatch):
     import p9_reporter
 

@@ -136,6 +136,25 @@ def _read_json_checkpoint(path: str, label: str):
     return None
 
 
+def _checkpoint_file_mtime(ckpt: dict, file_key: str) -> float:
+    path = ckpt.get("files", {}).get(file_key, "")
+    if not path:
+        return 0.0
+    try:
+        from pathlib import Path
+
+        return Path(path).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _checkpoint_older_than_any(ckpt: dict, file_key: str, upstream_keys: tuple[str, ...]) -> bool:
+    target_mtime = _checkpoint_file_mtime(ckpt, file_key)
+    if not target_mtime:
+        return False
+    return any(_checkpoint_file_mtime(ckpt, upstream_key) > target_mtime for upstream_key in upstream_keys)
+
+
 def _parse_flags(argv: list[str]) -> tuple[bool, bool]:
     force_run = "--force" in argv or "--force-run" in argv
     force_restart = "--force" in argv or "--force-restart" in argv
@@ -370,11 +389,23 @@ def _stage_audit_evidence(context: dict[str, Any]) -> None:
 
     if resume_from in {"none", "p1"}:
         with log_heartbeat("P5 audit"):
-            context["p5_evidence"] = gemini_pro_audit(
-                context.get("evidence_raw", ""),
-                audit_type="p5",
-                backtrack=context["backtrack"] or get_run_config(context["now"]),
-            )
+            try:
+                context["p5_evidence"] = gemini_pro_audit(
+                    context.get("evidence_raw", ""),
+                    audit_type="p5",
+                    backtrack=context["backtrack"] or get_run_config(context["now"]),
+                )
+            except Exception as exc:
+                logging.error("[P5] audit raised unexpectedly; falling back to raw P1 evidence: %s", exc)
+                update_run_manifest(
+                    "p5",
+                    status="failed_exception",
+                    metrics={
+                        "input_chars": len(context.get("evidence_raw", "") or ""),
+                        "fallback_reason": str(exc),
+                    },
+                )
+                context["p5_evidence"] = ""
         if not context["p5_evidence"].strip() and context.get("evidence_raw", "").strip():
             fallback_text = (
                 "## P5 Pro 审计失败兜底\n\n"
@@ -405,22 +436,42 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
     ckpt = context["ckpt"]
 
     if resume_from in {"p6", "p8_resume", "p9_resume"} and ckpt["files"].get("p6"):
-        context["p6_mapping"] = _read_text_checkpoint(ckpt["files"].get("p6", ""), "P6 mapping")
-        context["p5_evidence"] = context["p5_evidence"] or _read_text_checkpoint(ckpt["files"].get("p5", ""), "P5 audit")
-        context["p4_data"] = _read_text_checkpoint(ckpt["files"].get("p4", ""), "P4 market snapshot")
-        if not context["p2_data"] or not context["p3_data"]:
-            context["p2_data"], context["p3_data"] = _recover_p2_p3_from_checkpoint(ckpt)
-        context["p7_deep"] = _read_text_checkpoint(ckpt["files"].get("p7", ""), "P7 deep research")
-        context["p7a_audited"] = _read_text_checkpoint(ckpt["files"].get("p7a", ""), "P7a audited research")
-        context["p75_supplement"] = _read_text_checkpoint(ckpt["files"].get("p75", ""), "P7.5 supplement")
-        context["price_data"] = _read_text_checkpoint(ckpt["files"].get("p8", ""), "P8 technical data")
-        return
+        if _checkpoint_older_than_any(ckpt, "p6", ("p5", "p4", "p3", "p2")):
+            logging.warning("[P6] checkpoint is older than upstream evidence; rerunning mapping")
+        else:
+            context["p6_mapping"] = _read_text_checkpoint(ckpt["files"].get("p6", ""), "P6 mapping")
+            context["p5_evidence"] = context["p5_evidence"] or _read_text_checkpoint(ckpt["files"].get("p5", ""), "P5 audit")
+            context["p4_data"] = _read_text_checkpoint(ckpt["files"].get("p4", ""), "P4 market snapshot")
+            if not context["p2_data"] or not context["p3_data"]:
+                context["p2_data"], context["p3_data"] = _recover_p2_p3_from_checkpoint(ckpt)
+            context["p7_deep"] = _read_text_checkpoint(ckpt["files"].get("p7", ""), "P7 deep research")
+            context["p7a_audited"] = _read_text_checkpoint(ckpt["files"].get("p7a", ""), "P7a audited research")
+            context["p75_supplement"] = _read_text_checkpoint(ckpt["files"].get("p75", ""), "P7.5 supplement")
+            context["price_data"] = _read_text_checkpoint(ckpt["files"].get("p8", ""), "P8 technical data")
+            return
+
+    if not context.get("p5_evidence") and ckpt["files"].get("p5"):
+        context["p5_evidence"] = _read_text_checkpoint(ckpt["files"].get("p5", ""), "P5 audit")
+    if not context["p2_data"] or not context["p3_data"]:
+        context["p2_data"], context["p3_data"] = _recover_p2_p3_from_checkpoint(ckpt)
 
     if ckpt["files"].get("p4"):
         context["p4_data"] = _read_text_checkpoint(ckpt["files"].get("p4", ""), "P4 market snapshot")
     else:
         started_at = time.time()
-        context["p4_data"] = fetch_vanguard_prices()
+        try:
+            context["p4_data"] = fetch_vanguard_prices()
+        except Exception as exc:
+            context["p4_data"] = ""
+            logging.error("[P4] market snapshot failed; continuing without market snapshot: %s", exc)
+            update_run_manifest(
+                "p4",
+                status="failed_exception_fallback_empty",
+                metrics={
+                    "fallback_reason": str(exc),
+                    "duration_seconds": round(time.time() - started_at, 1),
+                },
+            )
         context["p4_duration"] = time.time() - started_at
 
     combined_evidence = "\n".join(
@@ -460,11 +511,30 @@ def _stage_research(context: dict[str, Any]) -> None:
 
     resume_from = context["resume_from"]
     ckpt = context["ckpt"]
-    research_plan = build_research_plan(
-        context["p6_mapping"],
-        p4_data=context.get("p4_data", ""),
-        p5_evidence=context.get("p5_evidence", ""),
-    )
+    try:
+        research_plan = build_research_plan(
+            context["p6_mapping"],
+            p4_data=context.get("p4_data", ""),
+            p5_evidence=context.get("p5_evidence", ""),
+        )
+    except Exception as exc:
+        logging.error("[P7] research plan failed; skipping optional research layers: %s", exc)
+        update_run_manifest(
+            "research",
+            status="failed_plan_fallback",
+            metrics={"fallback_reason": str(exc)},
+        )
+        research_plan = {
+            "goal": "",
+            "triggers": [],
+            "deep_topics": [],
+            "supplement_queries": [],
+            "should_run_p7": False,
+            "should_run_p75": False,
+            "max_rounds": 0,
+            "round_backtracks": [],
+            "skipped_recent_topics": [],
+        }
     context["research_plan"] = research_plan
 
     try:
@@ -564,7 +634,19 @@ def _stage_research(context: dict[str, Any]) -> None:
         return
     if context.get("p7_deep", "").strip() and len(context["p7_deep"].strip()) > 200:
         with log_heartbeat("P7a audit"):
-            context["p7a_audited"] = p7a_deep_research_audit(context["p7_deep"])
+            try:
+                context["p7a_audited"] = p7a_deep_research_audit(context["p7_deep"])
+            except Exception as exc:
+                logging.error("[P7a] audit failed unexpectedly; passing through raw P7 data: %s", exc)
+                update_run_manifest(
+                    "p7a",
+                    status="failed_exception_passthrough",
+                    metrics={
+                        "input_chars": len(context.get("p7_deep", "") or ""),
+                        "fallback_reason": str(exc),
+                    },
+                )
+                context["p7a_audited"] = context.get("p7_deep", "")
     else:
         context["p7a_audited"] = context.get("p7_deep", "")
 
@@ -572,15 +654,46 @@ def _stage_research(context: dict[str, Any]) -> None:
 
 
 def _stage_technical(context: dict[str, Any]) -> None:
-    if context["resume_from"] == "p9_resume" and context.get("price_data", "").strip():
-        logging.info("reusing P8 technical data from checkpoint")
-        return
+    try:
+        if context["resume_from"] == "p9_resume" and context.get("price_data", "").strip():
+            current_stocks = extract_stocks_from_report(context.get("p6_mapping", ""))
+            stale_p8 = _checkpoint_older_than_any(context.get("ckpt", {}), "p8", ("p6",))
+            stale_no_stock_p8 = "未从 P6 映射中提取到 A 股标的" in context.get("price_data", "")
+            if not (stale_p8 or (current_stocks and stale_no_stock_p8)):
+                logging.info("reusing P8 technical data from checkpoint")
+                return
+            logging.warning(
+                "[P8] checkpoint is stale or no-stock while current P6 exposes %s stocks; rerunning technical layer",
+                len(current_stocks),
+            )
 
-    with log_heartbeat("P8 technical"):
-        stocks = extract_stocks_from_report(context.get("p6_mapping", ""))
-        tracks = extract_stock_tracks(context.get("p6_mapping", ""))
-        elasticity = extract_stock_elasticity(context.get("p6_mapping", ""))
-        context["price_data"] = p8_search_stock_prices(stocks, tracks, elasticity)
+        with log_heartbeat("P8 technical"):
+            stocks = current_stocks if "current_stocks" in locals() else extract_stocks_from_report(context.get("p6_mapping", ""))
+            tracks = extract_stock_tracks(context.get("p6_mapping", ""))
+            elasticity = extract_stock_elasticity(context.get("p6_mapping", ""))
+            context["price_data"] = p8_search_stock_prices(stocks, tracks, elasticity)
+    except Exception as exc:
+        logging.error("[P8] technical layer failed; continuing with fallback price section: %s", exc)
+        fallback_text = (
+            "# P8 技术面分析数据（降级占位）\n\n"
+            f"> 读取时间: {datetime.now().isoformat()}\n\n"
+            "> P8 技术面环节发生异常，本次 P9 将在无可用技术面数据的情况下继续生成，并应降低技术面权重。\n"
+        )
+        context["price_data"] = fallback_text
+        fallback_path = ""
+        try:
+            fallback_path = write_text_artifact("P8_技术面_FALLBACK", fallback_text)
+        except Exception as write_exc:
+            logging.warning("[P8] fallback artifact write failed: %s", write_exc)
+        update_run_manifest(
+            "p8",
+            status="failed_exception_fallback",
+            files={"md": fallback_path} if fallback_path else None,
+            metrics={
+                "fallback_reason": str(exc),
+                "price_data_chars": len(fallback_text),
+            },
+        )
 
 
 def _read_log_excerpt(limit_chars: int = 4000) -> str:

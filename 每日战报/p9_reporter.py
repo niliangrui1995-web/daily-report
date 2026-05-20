@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 from datetime import datetime
@@ -12,6 +13,46 @@ from utils import extract_json_from_llm_response
 _HARD_EVIDENCE_LAYERS = {"P4", "P5", "P6", "P7", "P7A", "P8"}
 _SOFT_EVIDENCE_LAYERS = {"P2", "P3", "P7.5"}
 _PRIORITY_RANKS = {"★": 1.0, "★☆☆": 1.5, "★★": 2.0, "★★☆": 2.5, "★★★": 3.0}
+P9_JSON_RETRY_LIMIT = 1
+P9_OUTPUT_LIMITS = """
+JSON output hard limits:
+- Return raw JSON only. Do not wrap it in Markdown fences.
+- x_intel_snipe: max 3 items.
+- p3_machine_intel: max 3 items.
+- core_signals: max 8 items.
+- sniper_tables: max 8 tracks, max 3 targets per track.
+- fund_pathway: max 3 strings.
+- today_advice: max 8 items.
+- risk_warning: max 5 strings.
+- Prefer fewer complete items over long output. Never stop mid-object or mid-string.
+"""
+_REQUIRED_REPORT_KEYS = (
+    "x_intel_snipe",
+    "p3_machine_intel",
+    "core_signals",
+    "sniper_tables",
+    "fund_pathway",
+    "today_advice",
+    "risk_warning",
+)
+
+
+def _parse_report_payload(raw_content: str) -> dict[str, Any]:
+    try:
+        return extract_json_from_llm_response(raw_content, expect_type="dict")
+    except json.JSONDecodeError:
+        data = extract_json_from_llm_response(raw_content, expect_type="dict", allow_partial=True)
+
+    missing = [key for key in _REQUIRED_REPORT_KEYS if key not in data]
+    wrong_type = [key for key in _REQUIRED_REPORT_KEYS if key in data and not isinstance(data.get(key), list)]
+    if missing or wrong_type:
+        detail = []
+        if missing:
+            detail.append("missing=" + ",".join(missing))
+        if wrong_type:
+            detail.append("wrong_type=" + ",".join(wrong_type))
+        raise json.JSONDecodeError("invalid P9 report payload: " + "; ".join(detail), raw_content[:200], 0)
+    return data
 
 
 def _section_or_fallback(value: str | None, fallback: str) -> str:
@@ -167,6 +208,7 @@ def p9_risk_analysis(
     p2_x_intel_data=None,
     p3_intel_data="",
     p4_yfinance="",
+    _retry_count: int = 0,
 ):
     """
     Build the final report and return a stable run timestamp for downstream writes.
@@ -192,6 +234,7 @@ def p9_risk_analysis(
     today_str = datetime.now().strftime("%Y年%m月%d日 北京时间%H:%M")
     p7_section = _section_or_fallback(p7_deep, "（本次运行无 P7 深度研究数据）")
     p75_section = _section_or_fallback(p75_supplement, "（本次运行无 P7.5 补充搜索数据）")
+    p6_section = _section_or_fallback(p6_mapping, "（本次运行无 P6 市场映射数据）")
     p2_section = _section_or_fallback(p2_x_intel_data, "（本次运行无 P2 X 平台情报数据）")
     p3_section = _section_or_fallback(p3_intel_data, "（本次运行无 P3 机动情报数据）")
     yfinance_section = _section_or_fallback(p4_yfinance, "（本次运行无 P4 核心标的行情数据）")
@@ -207,13 +250,21 @@ def p9_risk_analysis(
         today_str=today_str,
         p5_evidence=p5_evidence,
         p7_section=p7_section,
-        p6_mapping=p6_mapping,
+        p6_mapping=p6_section,
         p75_section=p75_section,
         price_data=price_data,
         p2_section=p2_section,
         p3_section=p3_section,
         yfinance_section=yfinance_section,
     )
+    if _retry_count:
+        prompt = (
+            f"{prompt}\n\n{P9_OUTPUT_LIMITS}\n"
+            "The previous attempt returned invalid or incomplete JSON. "
+            "Shorten the content further and return one complete JSON object only."
+        )
+    else:
+        prompt = f"{prompt}\n\n{P9_OUTPUT_LIMITS}"
 
     resp = opus_adapter.invoke(prompt)
     raw_content = getattr(resp, "content", "") or ""
@@ -238,7 +289,7 @@ def p9_risk_analysis(
         return "", run_ts
 
     try:
-        data = extract_json_from_llm_response(raw_content, expect_type="dict")
+        data = _parse_report_payload(raw_content)
         data, guardrail_metrics = _apply_evidence_guardrails(data)
         if any(guardrail_metrics.values()):
             logging.info("[P9] applied evidence guardrails: %s", guardrail_metrics)
@@ -281,18 +332,38 @@ def p9_risk_analysis(
             raw_path = write_text_artifact("P9_raw_invalid_output", raw_content)
         except Exception as write_exc:
             logging.error("[P9] failed to save invalid raw output: %s", write_exc)
+        manifest_files = {
+            key: value
+            for key, value in {
+                "raw": raw_path,
+                "thinking": out_fn,
+            }.items()
+            if value
+        } or None
+        if _retry_count < P9_JSON_RETRY_LIMIT:
+            logging.warning("[P9] retrying report JSON generation after parse failure")
+            update_run_manifest(
+                "p9",
+                status="retrying_parse",
+                files=manifest_files,
+                metrics={"raw_output_chars": len(raw_content), "error": str(exc), "retry_count": _retry_count},
+            )
+            return p9_risk_analysis(
+                p5_evidence,
+                p7_deep,
+                p75_supplement,
+                p6_mapping=p6_mapping,
+                price_data=price_data,
+                p2_x_intel_data=p2_x_intel_data,
+                p3_intel_data=p3_intel_data,
+                p4_yfinance=p4_yfinance,
+                _retry_count=_retry_count + 1,
+            )
         update_run_manifest(
             "p9",
             status="failed_parse",
-            files={
-                key: value
-                for key, value in {
-                    "raw": raw_path,
-                    "thinking": out_fn,
-                }.items()
-                if value
-            } or None,
-            metrics={"raw_output_chars": len(raw_content), "error": str(exc)},
+            files=manifest_files,
+            metrics={"raw_output_chars": len(raw_content), "error": str(exc), "retry_count": _retry_count},
         )
         return "", run_ts
 

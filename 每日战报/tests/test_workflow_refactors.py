@@ -316,6 +316,139 @@ class TestCollectIntelPersistence:
         assert context["evidence_raw"] == "evidence"
 
 
+class TestTechnicalResume:
+    def test_stage_market_mapping_reruns_stale_p6_checkpoint(self, tmp_path, monkeypatch):
+        import orchestrator
+
+        files = {}
+        for name, content in {
+            "p2": "fresh P2",
+            "p3": "fresh P3",
+            "p4": "fresh P4",
+            "p5": "fresh P5",
+            "p6": "old P6",
+        }.items():
+            path = tmp_path / f"{name}.md"
+            path.write_text(content, encoding="utf-8")
+            files[name] = str(path)
+
+        os.utime(files["p6"], (1000, 1000))
+        for key in ("p2", "p3", "p4", "p5"):
+            os.utime(files[key], (2000, 2000))
+
+        captured = {}
+
+        def fake_generate_report(evidence):
+            captured["evidence"] = evidence
+            return "fresh P6"
+
+        monkeypatch.setattr(orchestrator, "generate_report", fake_generate_report)
+        monkeypatch.setattr(orchestrator, "write_text_artifact", lambda prefix, content: "fresh-p6.md")
+        monkeypatch.setattr(orchestrator, "update_run_manifest", lambda *args, **kwargs: captured.setdefault("manifest", (args, kwargs)))
+
+        context = {
+            "resume_from": "p9_resume",
+            "ckpt": {"files": files},
+            "p2_data": "",
+            "p3_data": "",
+            "p4_data": "",
+            "p5_evidence": "",
+            "p6_mapping": "",
+            "p7_deep": "",
+            "p7a_audited": "",
+            "p75_supplement": "",
+            "price_data": "",
+        }
+
+        orchestrator._stage_market_mapping(context)
+
+        assert context["p6_mapping"] == "fresh P6"
+        assert "fresh P5" in captured["evidence"]
+        assert "fresh P4" in captured["evidence"]
+        assert "fresh P2" in captured["evidence"]
+        assert "fresh P3" in captured["evidence"]
+
+    def test_stage_technical_reruns_stale_no_stock_checkpoint(self, monkeypatch):
+        import orchestrator
+
+        calls = {}
+        monkeypatch.setattr(orchestrator, "extract_stocks_from_report", lambda report: [("源杰科技", "688498")])
+        monkeypatch.setattr(orchestrator, "extract_stock_tracks", lambda report: {"688498": "光芯片"})
+        monkeypatch.setattr(orchestrator, "extract_stock_elasticity", lambda report: {"688498": "高弹性"})
+
+        def fake_p8(stocks, tracks, elasticity):
+            calls["stocks"] = stocks
+            calls["tracks"] = tracks
+            calls["elasticity"] = elasticity
+            return "fresh P8 data"
+
+        monkeypatch.setattr(orchestrator, "p8_search_stock_prices", fake_p8)
+
+        context = {
+            "resume_from": "p9_resume",
+            "p6_mapping": "recovered P6 mapping",
+            "price_data": "本次未从 P6 映射中提取到 A 股标的，技术面分析跳过。",
+        }
+
+        orchestrator._stage_technical(context)
+
+        assert calls["stocks"] == [("源杰科技", "688498")]
+        assert context["price_data"] == "fresh P8 data"
+
+    def test_stage_technical_reruns_p8_older_than_p6(self, tmp_path, monkeypatch):
+        import orchestrator
+
+        p6_path = tmp_path / "p6.md"
+        p8_path = tmp_path / "p8.md"
+        p6_path.write_text("fresh P6", encoding="utf-8")
+        p8_path.write_text("old P8", encoding="utf-8")
+        os.utime(p8_path, (1000, 1000))
+        os.utime(p6_path, (2000, 2000))
+
+        calls = {}
+        monkeypatch.setattr(orchestrator, "extract_stocks_from_report", lambda report: [("Stock", "600000")])
+        monkeypatch.setattr(orchestrator, "extract_stock_tracks", lambda report: {"600000": "track"})
+        monkeypatch.setattr(orchestrator, "extract_stock_elasticity", lambda report: {"600000": "high"})
+
+        def fake_p8(stocks, tracks, elasticity):
+            calls["stocks"] = stocks
+            return "fresh P8 data"
+
+        monkeypatch.setattr(orchestrator, "p8_search_stock_prices", fake_p8)
+
+        context = {
+            "resume_from": "p9_resume",
+            "ckpt": {"files": {"p6": str(p6_path), "p8": str(p8_path)}},
+            "p6_mapping": "fresh P6 mapping",
+            "price_data": "old P8 data",
+        }
+
+        orchestrator._stage_technical(context)
+
+        assert calls["stocks"] == [("Stock", "600000")]
+        assert context["price_data"] == "fresh P8 data"
+
+    def test_stage_technical_reuses_non_stale_checkpoint(self, monkeypatch):
+        import orchestrator
+
+        monkeypatch.setattr(orchestrator, "extract_stocks_from_report", lambda report: [("源杰科技", "688498")])
+        monkeypatch.setattr(
+            orchestrator,
+            "p8_search_stock_prices",
+            lambda stocks, tracks, elasticity: (_ for _ in ()).throw(AssertionError("should reuse checkpoint")),
+        )
+
+        context = {
+            "resume_from": "p9_resume",
+            "p6_mapping": "recovered P6 mapping",
+            "price_data": "P8 技术面数据",
+        }
+
+        orchestrator._stage_technical(context)
+
+        assert context["price_data"] == "P8 技术面数据"
+
+
 class TestP9Rendering:
     def test_build_report_markdown_renders_confidence_and_evidence(self):
         from p9_rendering import build_report_markdown

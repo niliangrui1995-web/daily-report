@@ -27,6 +27,17 @@ from industry_dict import OLIGARCH_DICT
 from utils import extract_json_from_llm_response
 from p7_deep_research import build_recent_topic_guardrail
 
+P6_JSON_RETRY_LIMIT = 1
+P6_OUTPUT_LIMITS = """
+JSON output hard limits:
+- Return raw JSON only. Do not wrap it in Markdown fences.
+- events: max 8 tracks.
+- targets: max 5 targets per event.
+- optional_searches: max 3 strings.
+- deep_research: max 3 strings.
+- Prefer fewer complete, high-conviction tracks over long output. Never stop mid-object or mid-string.
+"""
+
 HALLUCINATION_MAP = {
     '佰维存储': '688525',
     '江波龙': '301308',
@@ -120,6 +131,13 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
         evidence_text=evidence_text,
         dedup_section=dedup_section
     )
+    if _retry_count:
+        prompt = (
+            f"{prompt}\n\n{P6_OUTPUT_LIMITS}\n"
+            "The previous attempt returned invalid JSON. Return fewer tracks and one complete JSON object only."
+        )
+    else:
+        prompt = f"{prompt}\n\n{P6_OUTPUT_LIMITS}"
     
     resp = opus_adapter.invoke(prompt)
     raw_content = resp.content if resp.content else ''
@@ -152,7 +170,7 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
         return ''
         
     try:
-        data = extract_json_from_llm_response(raw_content, expect_type='dict')
+        data = extract_json_from_llm_response(raw_content, expect_type='dict', allow_partial=True)
         
         for idx, event in enumerate(data.get('events', [])):
             if not isinstance(event, dict):
@@ -231,10 +249,33 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
         
     except json.JSONDecodeError as e:
         logging.error(f'❌ [P6 映射] JSON解析绝望失败(大模型幻觉了): {e}\n原文开头: {raw_content[:200]}')
+        raw_path = ''
+        try:
+            raw_path = write_text_artifact(f'P6_raw_invalid_output_retry{_retry_count}', raw_content)
+        except Exception as write_exc:
+            logging.warning(f'[P6] invalid raw output save failed: {write_exc}')
+        manifest_files = {
+            key: value
+            for key, value in {
+                'raw': raw_path,
+                'thinking': thinking_fname,
+            }.items()
+            if value
+        } or None
+        if _retry_count < P6_JSON_RETRY_LIMIT:
+            logging.warning('[P6] retrying mapping JSON generation after parse failure')
+            update_run_manifest(
+                'p6',
+                status='retrying_parse',
+                files=manifest_files,
+                metrics={'input_chars': len(evidence_text), 'raw_output_chars': len(raw_content), 'error': str(e), 'retry_count': _retry_count},
+            )
+            time.sleep(5)
+            return generate_report(evidence_text, _retry_count=_retry_count + 1)
         update_run_manifest(
             'p6',
             status='fallback_raw_llm',
-            files={'thinking': thinking_fname} if thinking_fname else None,
-            metrics={'input_chars': len(evidence_text), 'raw_output_chars': len(raw_content), 'error': str(e)},
+            files=manifest_files,
+            metrics={'input_chars': len(evidence_text), 'raw_output_chars': len(raw_content), 'error': str(e), 'retry_count': _retry_count},
         )
         return raw_content

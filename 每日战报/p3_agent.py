@@ -13,6 +13,15 @@ from search_engine import raw_gemini_search
 from settings import SEARCH_API_KEY_POOL, load_prompt
 from utils import extract_json_from_llm_response, parse_backtrack_hours
 
+P3_JSON_OUTPUT_LIMITS = """
+JSON output hard limits:
+- Return raw JSON array only. Do not wrap it in Markdown fences.
+- Return at most 5 items.
+- Keep source_url on one line.
+- Keep summary under 90 Chinese characters.
+- Prefer fewer complete items over long output. Never stop mid-object or mid-string.
+"""
+
 PRIORITY_KEYWORDS = [
     "NVDA",
     "NVIDIA",
@@ -293,14 +302,14 @@ def _parse_json_response(
     grounding_sources = grounding_sources or []
 
     try:
-        result = extract_json_from_llm_response(raw_text, expect_type="list")
+        result = extract_json_from_llm_response(raw_text, expect_type="list", allow_partial=True)
     except json.JSONDecodeError:
         repaired_text = _repair_source_url_fields(raw_text)
         if repaired_text == raw_text:
             _persist_raw_response(bucket, raw_text)
             return []
         try:
-            result = extract_json_from_llm_response(repaired_text, expect_type="list")
+            result = extract_json_from_llm_response(repaired_text, expect_type="list", allow_partial=True)
         except json.JSONDecodeError:
             _persist_raw_response(bucket, raw_text)
             return []
@@ -393,7 +402,7 @@ def run_jinnang_2(hours: int = 24) -> list[dict]:
     logging.info("[P3 jinnang_2] start search")
     template = load_prompt("p3_jinnang2.txt")
     now_str = datetime.now().strftime("%Y年%m月%d日 北京时间%H:%M")
-    prompt = template.format(hours=hours, current_time=now_str)
+    prompt = f"{template.format(hours=hours, current_time=now_str)}\n\n{P3_JSON_OUTPUT_LIMITS}"
     search_result = _call_gemini_search(prompt)
     results = _parse_search_result(search_result, "jinnang_2")
     logging.info("[P3 jinnang_2] captured %s items", len(results))
@@ -404,7 +413,7 @@ def run_jinnang_3(hours: int = 24) -> list[dict]:
     logging.info("[P3 jinnang_3] start search")
     template = load_prompt("p3_jinnang3.txt")
     now_str = datetime.now().strftime("%Y年%m月%d日 北京时间%H:%M")
-    prompt = template.format(hours=hours, current_time=now_str)
+    prompt = f"{template.format(hours=hours, current_time=now_str)}\n\n{P3_JSON_OUTPUT_LIMITS}"
     search_result = _call_gemini_search(prompt)
     results = _parse_search_result(search_result, "jinnang_3")
     logging.info("[P3 jinnang_3] captured %s items", len(results))

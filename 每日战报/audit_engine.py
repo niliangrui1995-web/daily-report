@@ -24,7 +24,17 @@ from settings import pro_adapter, require_prompt
 from industry_dict import ALL_OLIGARCHS_FLAT
 from utils import extract_json_from_llm_response
 
-def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24h') -> str:
+AUDIT_JSON_RETRY_LIMIT = 1
+AUDIT_OUTPUT_LIMITS = """
+
+STRICT OUTPUT LIMITS FOR MACHINE PARSING:
+- Return raw JSON only. Do not wrap it in ```json fences.
+- Keep high_trust to at most 80 items and medium_trust to at most 80 items.
+- Keep deleted to at most 30 representative items; summary.deleted may still count all removed items.
+- If content is too long, prefer fewer items over invalid or truncated JSON.
+"""
+
+def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24h', _retry_count: int = 0) -> str:
     layer_name = 'P5' if audit_type == 'p5' else 'P7.5'
     stage_key = 'p5' if audit_type == 'p5' else 'p75'
     file_prefix = 'P7.5_补充审计' if layer_name == 'P7.5' else 'P5_审计'
@@ -85,7 +95,7 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
         task_three=task_three,
         vanguard_list=vanguard_list,
         raw_data=raw_data
-    )
+    ) + AUDIT_OUTPUT_LIMITS
 
     t0 = time.time()
     _AUDIT_TIMEOUT_SECONDS = 480
@@ -134,7 +144,7 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
         return ''
 
     try:
-        data = extract_json_from_llm_response(raw_content, expect_type='dict')
+        data = extract_json_from_llm_response(raw_content, expect_type='dict', allow_partial=True)
         json_path = write_json_artifact(file_prefix, data)
         logging.info(f'💾 [{layer_name} 审计] 完美架构 JSON 数据已落盘: {json_path}')
 
@@ -186,7 +196,9 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
             metrics={
                 'input_chars': len(raw_data),
                 'output_chars': len(clean_text),
+                'raw_output_chars': len(raw_content),
                 'elapsed_seconds': round(elapsed, 1),
+                'retry_count': _retry_count,
             },
         )
 
@@ -194,14 +206,25 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
         return clean_text
 
     except json.JSONDecodeError as e:
+        raw_path = ''
+        try:
+            raw_path = write_text_artifact(f'{file_prefix}_RAW_INVALID_{_retry_count + 1}', raw_content)
+        except Exception as write_exc:
+            logging.warning(f'[{layer_name} audit] failed to save invalid raw output: {write_exc}')
         logging.error(f'❌ [{layer_name} 审计] JSON解析失败: {e}\n大模型幻觉原文: {raw_content[:200]}')
+        if _retry_count < AUDIT_JSON_RETRY_LIMIT:
+            logging.warning(f'[{layer_name} audit] JSON parse failed; retrying once with stricter output limits')
+            time.sleep(5)
+            return gemini_pro_audit(raw_data, audit_type=audit_type, backtrack=backtrack, _retry_count=_retry_count + 1)
         update_run_manifest(
             stage_key,
             status='fallback_raw_llm',
+            files={'raw': raw_path} if raw_path else None,
             metrics={
                 'input_chars': len(raw_data),
                 'raw_output_chars': len(raw_content),
                 'elapsed_seconds': round(elapsed, 1),
+                'retry_count': _retry_count,
                 'error': str(e),
             },
         )

@@ -668,6 +668,19 @@ class TestExtractJson:
         result = extract_json_from_llm_response(raw)
         assert result["name"] == "test"
 
+    def test_partial_json_repair_is_opt_in(self):
+        from utils import extract_json_from_llm_response
+        import pytest
+        import json
+
+        raw = '```json\n{"summary":{"passed":1},"high_trust":["ok"]'
+        with pytest.raises(json.JSONDecodeError):
+            extract_json_from_llm_response(raw)
+
+        result = extract_json_from_llm_response(raw, allow_partial=True)
+        assert result["summary"]["passed"] == 1
+        assert result["high_trust"] == ["ok"]
+
     def test_garbage_prefix_suffix(self):
         """JSON 前后带废话文本"""
         from utils import extract_json_from_llm_response
@@ -774,6 +787,20 @@ class TestCheckpoint:
         from checkpoint import detect_checkpoint
         ckpt = detect_checkpoint()
         assert ckpt['stage'] == 'p9_done'
+
+    def test_stale_war_report_resumes_downstream(self, tmp_path, monkeypatch):
+        """战报旧于上游 P8 时应恢复生成 P9，而不是直接跳过。"""
+        monkeypatch.setattr('checkpoint.get_today_output_dir', lambda: str(tmp_path))
+        monkeypatch.setattr('artifact_store.get_today_output_dir', lambda: str(tmp_path))
+        report_path = tmp_path / '战报_202604091200.md'
+        p8_path = tmp_path / 'P8_技术面_202604091230.md'
+        report_path.write_text('old report', encoding='utf-8')
+        p8_path.write_text('fresh p8', encoding='utf-8')
+        os.utime(report_path, (1000, 1000))
+        os.utime(p8_path, (2000, 2000))
+        from checkpoint import detect_checkpoint
+        ckpt = detect_checkpoint()
+        assert ckpt['stage'] == 'p9_resume'
 
     def test_p8_detected_as_p9_resume(self, tmp_path, monkeypatch):
         """有 P8 文件时应进入 p9_resume，避免重复重跑技术面"""

@@ -255,6 +255,43 @@ class TestManifestContext:
         assert manifest["stages"]["p1"]["status"] == "completed"
         assert manifest["stages"]["p2"]["status"] == "completed"
 
+    def test_success_status_clears_stale_error_metrics(self, monkeypatch, tmp_path):
+        import artifact_store
+
+        monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+
+        artifact_store.update_run_manifest(
+            "p9",
+            status="failed_parse",
+            metrics={"error": "invalid json", "raw_output_chars": 100},
+            timestamp="20260413010101",
+        )
+        artifact_store.update_run_manifest(
+            "p9",
+            status="completed_email_sent",
+            metrics={"email_sent": True},
+            timestamp="20260413010101",
+        )
+
+        manifest = artifact_store.load_run_manifest()
+        metrics = manifest["stages"]["p9"]["metrics"]
+        assert "error" not in metrics
+        assert metrics["raw_output_chars"] == 100
+        assert metrics["email_sent"] is True
+
+    def test_manifest_update_without_env_preserves_existing_run_timestamp(self, monkeypatch, tmp_path):
+        import artifact_store
+
+        monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+        monkeypatch.delenv(artifact_store.RUN_TIMESTAMP_ENV, raising=False)
+
+        artifact_store.update_run_manifest("p9", status="completed_email_sent", timestamp="20260413010101")
+        artifact_store.update_run_manifest("agent_preflight", status="skipped", metrics={"ok": False})
+
+        manifest = artifact_store.load_run_manifest()
+        assert manifest["run_timestamp"] == "20260413010101"
+        assert manifest["stages"]["agent_preflight"]["run_timestamp"] == "20260413010101"
+
 
 class TestReportStage:
     def test_p5_empty_audit_uses_raw_p1_fallback(self, monkeypatch):
@@ -284,6 +321,170 @@ class TestReportStage:
         assert "raw P1 evidence" in context["p5_evidence"]
         assert manifest_updates[-1][0] == ("p5",)
         assert manifest_updates[-1][1]["status"] == "failed_empty_output_raw_p1_fallback"
+
+    def test_p5_audit_exception_uses_raw_p1_fallback(self, monkeypatch):
+        import orchestrator
+
+        manifest_updates = []
+
+        def fail_audit(*args, **kwargs):
+            raise RuntimeError("model unavailable")
+
+        monkeypatch.setattr(orchestrator, "gemini_pro_audit", fail_audit)
+        monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *args, **kwargs: "fallback.md")
+        monkeypatch.setattr(
+            orchestrator,
+            "update_run_manifest",
+            lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+        )
+
+        context = {
+            "resume_from": "none",
+            "ckpt": {"files": {}},
+            "evidence_raw": "raw P1 evidence",
+            "backtrack": "24h",
+            "now": None,
+        }
+
+        orchestrator._stage_audit_evidence(context)
+
+        assert "raw P1 evidence" in context["p5_evidence"]
+        assert any(update[1]["status"] == "failed_exception" for update in manifest_updates)
+        assert manifest_updates[-1][1]["status"] == "failed_empty_output_raw_p1_fallback"
+
+    def test_market_mapping_continues_when_p4_fails(self, monkeypatch):
+        import orchestrator
+
+        captured = {}
+        manifest_updates = []
+
+        def fail_p4():
+            raise RuntimeError("market api down")
+
+        def fake_generate_report(evidence):
+            captured["evidence"] = evidence
+            return "P6 fallback mapping"
+
+        monkeypatch.setattr(orchestrator, "fetch_vanguard_prices", fail_p4)
+        monkeypatch.setattr(orchestrator, "generate_report", fake_generate_report)
+        monkeypatch.setattr(orchestrator, "write_text_artifact", lambda prefix, content: "p6.md")
+        monkeypatch.setattr(
+            orchestrator,
+            "update_run_manifest",
+            lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+        )
+
+        context = {
+            "resume_from": "none",
+            "ckpt": {"files": {}},
+            "p5_evidence": "P5 evidence",
+            "p2_data": "P2 data",
+            "p3_data": "P3 data",
+            "p4_data": "",
+            "p6_mapping": "",
+        }
+
+        orchestrator._stage_market_mapping(context)
+
+        assert context["p4_data"] == ""
+        assert context["p6_mapping"] == "P6 fallback mapping"
+        assert "P5 evidence" in captured["evidence"]
+        assert any(update[0] == ("p4",) and update[1]["status"] == "failed_exception_fallback_empty" for update in manifest_updates)
+
+    def test_research_plan_failure_skips_optional_research(self, monkeypatch):
+        import orchestrator
+
+        manifest_updates = []
+
+        monkeypatch.setattr(orchestrator, "build_research_plan", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("bad plan")))
+        monkeypatch.setattr(orchestrator, "write_json_artifact", lambda prefix, data: "plan.json")
+        monkeypatch.setattr(
+            orchestrator,
+            "update_run_manifest",
+            lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+        )
+
+        context = {
+            "resume_from": "none",
+            "ckpt": {"files": {}},
+            "p6_mapping": "P6 data",
+            "p4_data": "",
+            "p5_evidence": "",
+            "p7_deep": "",
+            "p7a_audited": "",
+            "p75_supplement": "",
+            "search_queries": [],
+        }
+
+        orchestrator._stage_research(context)
+
+        assert context["research_plan"]["should_run_p7"] is False
+        assert context["research_plan"]["should_run_p75"] is False
+        assert context["p7_deep"] == ""
+        assert any(update[0] == ("research",) and update[1]["status"] == "failed_plan_fallback" for update in manifest_updates)
+
+    def test_technical_failure_sets_price_fallback(self, monkeypatch):
+        import orchestrator
+
+        manifest_updates = []
+
+        monkeypatch.setattr(orchestrator, "extract_stocks_from_report", lambda report: [("Stock", "600000")])
+        monkeypatch.setattr(orchestrator, "extract_stock_tracks", lambda report: {})
+        monkeypatch.setattr(orchestrator, "extract_stock_elasticity", lambda report: {})
+        monkeypatch.setattr(orchestrator, "p8_search_stock_prices", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("vipdoc broken")))
+        monkeypatch.setattr(orchestrator, "write_text_artifact", lambda prefix, content: "p8-fallback.md")
+        monkeypatch.setattr(
+            orchestrator,
+            "update_run_manifest",
+            lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+        )
+
+        context = {
+            "resume_from": "none",
+            "p6_mapping": "P6 data",
+            "price_data": "",
+        }
+
+        orchestrator._stage_technical(context)
+
+        assert "P8 技术面环节发生异常" in context["price_data"]
+        assert manifest_updates[-1][0] == ("p8",)
+        assert manifest_updates[-1][1]["status"] == "failed_exception_fallback"
+
+    def test_p9_prompt_has_p6_fallback_when_mapping_missing(self, monkeypatch):
+        import p9_reporter
+
+        captured = {}
+
+        monkeypatch.setattr(p9_reporter, "require_prompt", lambda name: "{p6_mapping}")
+        def fake_invoke(prompt):
+            captured["prompt"] = prompt
+            return SimpleNamespace(content="{}", thinking_content="")
+
+        monkeypatch.setattr(p9_reporter.opus_adapter, "invoke", fake_invoke)
+        monkeypatch.setattr(
+            p9_reporter,
+            "_parse_report_payload",
+            lambda raw: {"core_signals": [], "today_advice": [], "risk_warning": []},
+        )
+        monkeypatch.setattr(p9_reporter, "_apply_evidence_guardrails", lambda data: (data, {}))
+        monkeypatch.setattr(p9_reporter, "build_report_markdown", lambda data, today_str: "# report")
+        monkeypatch.setattr(p9_reporter, "write_json_artifact", lambda prefix, data: "report.json")
+        monkeypatch.setattr(p9_reporter, "update_run_manifest", lambda *args, **kwargs: None)
+
+        report, _ = p9_reporter.p9_risk_analysis(
+            p5_evidence="P5",
+            p7_deep="",
+            p75_supplement="",
+            p6_mapping="",
+            price_data="P8 data is long enough to avoid fallback text",
+            p2_x_intel_data="",
+            p3_intel_data="",
+            p4_yfinance="",
+        )
+
+        assert report == "# report"
+        assert "P6 市场映射数据" in captured["prompt"]
 
     def test_stage_report_raises_when_report_is_empty(self, monkeypatch):
         import orchestrator

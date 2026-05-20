@@ -25,6 +25,23 @@ def _pick_existing_file(path: str) -> str:
     return path if path and Path(path).exists() else ""
 
 
+def _file_mtime(files: dict[str, str], file_key: str) -> float:
+    path = files.get(file_key, "")
+    if not path:
+        return 0.0
+    try:
+        return Path(path).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _is_older_than_any(files: dict[str, str], file_key: str, upstream_keys: tuple[str, ...]) -> bool:
+    target_mtime = _file_mtime(files, file_key)
+    if not target_mtime:
+        return False
+    return any(_file_mtime(files, upstream_key) > target_mtime for upstream_key in upstream_keys)
+
+
 def _load_files_from_manifest(ckpt: dict, manifest: dict) -> None:
     stages = manifest.get("stages", {})
 
@@ -67,7 +84,8 @@ def _merge_files_from_fallback(ckpt: dict, day_dir: Path) -> None:
 
 def _derive_stage(files: dict[str, str]) -> str:
     if files.get("war_report"):
-        return "p9_done"
+        if not _is_older_than_any(files, "war_report", ("p8", "p75", "p7a", "p7", "p6", "p5", "p4", "p3", "p2")):
+            return "p9_done"
     if files.get("p8"):
         return "p9_resume"
     if files.get("p7") or files.get("p7a"):

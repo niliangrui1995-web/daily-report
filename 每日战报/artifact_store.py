@@ -20,6 +20,13 @@ PREFLIGHT_SUMMARY_ENV = "VCP_PREFLIGHT_SUMMARY_JSON"
 MANIFEST_FILENAME = "run_manifest.json"
 
 ARTIFACT_CATEGORIES = ("logs", "meta", "agent")
+SUCCESS_STATUSES = {
+    "completed",
+    "json_ready",
+    "completed_recovered",
+    "completed_email_sent",
+    "completed_no_email",
+}
 
 _MANIFEST_LOCK = threading.RLock()
 
@@ -299,12 +306,14 @@ def update_run_manifest(
     metrics: dict[str, Any] | None = None,
     timestamp: str | None = None,
 ) -> str:
-    run_ts = timestamp or get_run_timestamp()
     manifest_path = get_manifest_path()
+    env_run_ts = os.environ.get(RUN_TIMESTAMP_ENV, "").strip()
+    initial_run_ts = timestamp or env_run_ts or datetime.now().strftime("%Y%m%d%H%M%S")
 
     with _MANIFEST_LOCK:
         with _manifest_file_lock():
-            manifest = _load_manifest_for_write(run_ts)
+            manifest = _load_manifest_for_write(initial_run_ts)
+            run_ts = timestamp or env_run_ts or manifest.get("run_timestamp") or initial_run_ts
             manifest["run_timestamp"] = run_ts
             manifest["updated_at"] = datetime.now().isoformat()
             manifest["manifest_version"] = 3
@@ -317,8 +326,13 @@ def update_run_manifest(
 
             if files:
                 stage_payload.setdefault("files", {}).update(files)
+            existing_metrics = stage_payload.setdefault("metrics", {})
+            if status in SUCCESS_STATUSES and (not metrics or "error" not in metrics):
+                existing_metrics.pop("error", None)
+                existing_metrics.pop("failure_category", None)
+                existing_metrics.pop("failure_message", None)
             if metrics:
-                stage_payload.setdefault("metrics", {}).update(metrics)
+                existing_metrics.update(metrics)
 
             _write_manifest_file(manifest_path, manifest)
             _cleanup_legacy_manifest(manifest_path)

@@ -50,3 +50,33 @@ def test_p5_audit_saves_invalid_raw_and_retries(monkeypatch):
     assert any("_RAW_INVALID_1" in prefix for prefix, _ in text_artifacts)
     assert manifest_updates[-1][1]["status"] == "completed"
     assert manifest_updates[-1][1]["metrics"]["retry_count"] == 1
+
+
+def test_p5_audit_repairs_unescaped_inner_quotes_without_retry(monkeypatch):
+    import audit_engine
+
+    raw_content = (
+        '{"summary":{"passed":1,"deleted":0},'
+        '"high_trust":["Samsung 劳资双方达成"2026年薪资协议暂定合约"；工会暂停罢工"],'
+        '"medium_trust":[],"deleted":[]}'
+    )
+    calls = []
+    manifest_updates = []
+
+    def fake_invoke(prompt):
+        calls.append(prompt)
+        return SimpleNamespace(content=raw_content, thinking_content="")
+
+    monkeypatch.setattr(audit_engine.pro_adapter, "invoke", fake_invoke)
+    monkeypatch.setattr(audit_engine, "require_prompt", lambda name: "{raw_data}")
+    monkeypatch.setattr(audit_engine, "write_text_artifact", lambda prefix, content, **kwargs: f"{prefix}.md")
+    monkeypatch.setattr(audit_engine, "write_json_artifact", lambda prefix, data, **kwargs: f"{prefix}.json")
+    monkeypatch.setattr(audit_engine, "update_run_manifest", lambda *args, **kwargs: manifest_updates.append((args, kwargs)))
+    monkeypatch.setattr(audit_engine.time, "sleep", lambda seconds: None)
+
+    result = audit_engine.gemini_pro_audit("raw input", audit_type="p5")
+
+    assert len(calls) == 1
+    assert 'Samsung 劳资双方达成"2026年薪资协议暂定合约"；工会暂停罢工' in result
+    assert manifest_updates[-1][1]["status"] == "completed"
+    assert manifest_updates[-1][1]["metrics"]["retry_count"] == 0

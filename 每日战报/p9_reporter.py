@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from artifact_store import get_run_timestamp, update_run_manifest, write_json_artifact, write_text_artifact
+from artifact_store import get_run_timestamp, load_run_manifest, update_run_manifest, write_json_artifact, write_text_artifact
 from p9_email import send_report_via_email
 from p9_rendering import build_report_markdown
 from settings import EMAIL_ADDRESS, EMAIL_PASSWORD, RECEIVER_EMAIL, opus_adapter, require_prompt
@@ -35,6 +35,7 @@ _REQUIRED_REPORT_KEYS = (
     "today_advice",
     "risk_warning",
 )
+_MISSING_FIELD_VALUES = {"", "无", "未提供", "-", "N/A", "n/a", "None", "null"}
 
 
 def _parse_report_payload(raw_content: str) -> dict[str, Any]:
@@ -59,6 +60,129 @@ def _section_or_fallback(value: str | None, fallback: str) -> str:
     if value and len(value.strip()) > 50:
         return value.strip()
     return fallback
+
+
+def _normalize_stock_code(value: Any) -> str:
+    match = re.search(r"\d{6}", str(value or ""))
+    return match.group(0) if match else ""
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(str(value).replace("%", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_missing_field(value: Any) -> bool:
+    return value is None or str(value).strip() in _MISSING_FIELD_VALUES
+
+
+def _format_price(value: Any) -> str | None:
+    number = _coerce_float(value)
+    if number is None:
+        return None
+    return f"{number:.2f}"
+
+
+def _format_signed_pct(value: Any) -> str | None:
+    number = _coerce_float(value)
+    if number is None:
+        return None
+    return f"{number:+.1f}%"
+
+
+def _format_percentile(value: Any) -> str | None:
+    number = _coerce_float(value)
+    if number is None:
+        return None
+    return f"{round(number):.0f}%"
+
+
+def _load_p8_price_db() -> dict[str, Any]:
+    try:
+        manifest = load_run_manifest()
+        p8_files = manifest.get("stages", {}).get("p8", {}).get("files", {})
+        json_path = p8_files.get("json")
+        if not json_path:
+            return {}
+        with open(json_path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logging.warning("[P9] failed to load P8 price JSON for backfill: %s", exc)
+        return {}
+
+
+def _extract_p8_fields(item: dict[str, Any]) -> dict[str, str]:
+    price_data = item.get("price_data") if isinstance(item.get("price_data"), dict) else {}
+    tags = item.get("tags") if isinstance(item.get("tags"), dict) else {}
+    rs = item.get("relative_strength") if isinstance(item.get("relative_strength"), dict) else {}
+    weekly = item.get("weekly_level") if isinstance(item.get("weekly_level"), dict) else {}
+
+    fields: dict[str, str] = {}
+    price = _format_price(price_data.get("latest_close", item.get("latest_close")))
+    chg_3m = _format_signed_pct(price_data.get("chg_3m_pct", item.get("chg_3m_pct")))
+    percentile = _format_percentile(price_data.get("percentile_250d", item.get("percentile_250d")))
+
+    if price:
+        fields["price"] = price
+    if chg_3m:
+        fields["chg_3m"] = chg_3m
+    if percentile:
+        fields["percentile_250d"] = percentile
+
+    vol_desc = tags.get("vol_desc")
+    if vol_desc:
+        fields["volume"] = str(vol_desc)
+
+    rs_20 = rs.get("rs_excess_20d", item.get("rs_20d_pct"))
+    rs_60 = rs.get("rs_excess_60d", item.get("rs_60d_pct"))
+    rs_desc = rs.get("rs_desc")
+    if rs_20 is not None and rs_60 is not None:
+        suffix = f"，{rs_desc}" if rs_desc else ""
+        fields["rs_strength"] = f"20日超额{_format_signed_pct(rs_20)}，60日超额{_format_signed_pct(rs_60)}{suffix}"
+    elif rs_20 is not None:
+        fields["rs_strength"] = f"20日超额{_format_signed_pct(rs_20)}"
+
+    weekly_status = weekly.get("weekly_macd_status")
+    weekly_position = weekly.get("weekly_ma20_position")
+    weekly_trend = weekly.get("weekly_trend", item.get("weekly_trend"))
+    weekly_parts = [str(value) for value in (weekly_status, weekly_position, weekly_trend) if value]
+    if weekly_parts:
+        fields["weekly_level"] = "，".join(weekly_parts)
+
+    return fields
+
+
+def _backfill_sniper_tables_from_p8(data: dict[str, Any], p8_db: dict[str, Any] | None = None) -> dict[str, int]:
+    p8_db = p8_db if p8_db is not None else _load_p8_price_db()
+    if not p8_db:
+        return {"p8_backfilled_targets": 0, "p8_price_db_size": 0}
+
+    backfilled = 0
+    for table in data.get("sniper_tables", []) or []:
+        targets = table.get("targets", []) if isinstance(table, dict) else []
+        for row in targets:
+            if not isinstance(row, dict):
+                continue
+            code = _normalize_stock_code(row.get("code"))
+            item = p8_db.get(code)
+            if not isinstance(item, dict):
+                continue
+            fields = _extract_p8_fields(item)
+            changed = False
+            for key, value in fields.items():
+                if key in {"price", "chg_3m", "percentile_250d"} or _is_missing_field(row.get(key)):
+                    if row.get(key) != value:
+                        row[key] = value
+                        changed = True
+            if changed:
+                backfilled += 1
+
+    return {"p8_backfilled_targets": backfilled, "p8_price_db_size": len(p8_db)}
 
 
 def _normalize_layer_tag(ref: Any) -> str | None:
@@ -293,6 +417,9 @@ def p9_risk_analysis(
         data, guardrail_metrics = _apply_evidence_guardrails(data)
         if any(guardrail_metrics.values()):
             logging.info("[P9] applied evidence guardrails: %s", guardrail_metrics)
+        p8_backfill_metrics = _backfill_sniper_tables_from_p8(data)
+        if p8_backfill_metrics.get("p8_backfilled_targets"):
+            logging.info("[P9] backfilled sniper table fields from P8: %s", p8_backfill_metrics)
         result = build_report_markdown(data, today_str)
         logging.info("[P9] rendered markdown report (%s chars)", len(result))
 
@@ -309,6 +436,7 @@ def p9_risk_analysis(
                     "markdown_chars": len(result),
                     "raw_output_chars": len(raw_content),
                     **guardrail_metrics,
+                    **p8_backfill_metrics,
                 },
             )
         except Exception as exc:
@@ -321,6 +449,7 @@ def p9_risk_analysis(
                     "markdown_chars": len(result),
                     "raw_output_chars": len(raw_content),
                     **guardrail_metrics,
+                    **p8_backfill_metrics,
                 },
             )
 

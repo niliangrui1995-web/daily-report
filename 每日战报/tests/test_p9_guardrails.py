@@ -117,6 +117,61 @@ def test_parse_report_payload_rejects_incomplete_repaired_json():
         p9_reporter._parse_report_payload(raw)
 
 
+def test_backfill_sniper_tables_from_p8_price_json():
+    import p9_reporter
+
+    payload = {
+        "sniper_tables": [
+            {
+                "track_name": "先进封装",
+                "targets": [
+                    {
+                        "name": "华海清科",
+                        "code": "688120",
+                        "price": "未提供",
+                        "chg_3m": "未提供",
+                        "percentile_250d": "未提供",
+                        "volume": "未提供",
+                        "rs_strength": "未提供",
+                        "weekly_level": "未提供",
+                    }
+                ],
+            }
+        ]
+    }
+    p8_db = {
+        "688120": {
+            "price_data": {
+                "latest_close": 298.0,
+                "chg_3m_pct": 62.8,
+                "percentile_250d": 100.0,
+            },
+            "tags": {"vol_desc": "明显放量"},
+            "relative_strength": {
+                "rs_excess_20d": 55.6,
+                "rs_excess_60d": 62.1,
+                "rs_desc": "显著强于大盘",
+            },
+            "weekly_level": {
+                "weekly_macd_status": "金叉上方",
+                "weekly_ma20_position": "站上",
+                "weekly_trend": "上行",
+            },
+        }
+    }
+
+    metrics = p9_reporter._backfill_sniper_tables_from_p8(payload, p8_db)
+    row = payload["sniper_tables"][0]["targets"][0]
+
+    assert metrics == {"p8_backfilled_targets": 1, "p8_price_db_size": 1}
+    assert row["price"] == "298.00"
+    assert row["chg_3m"] == "+62.8%"
+    assert row["percentile_250d"] == "100%"
+    assert row["volume"] == "明显放量"
+    assert row["rs_strength"] == "20日超额+55.6%，60日超额+62.1%，显著强于大盘"
+    assert row["weekly_level"] == "金叉上方，站上，上行"
+
+
 def test_p9_risk_analysis_applies_guardrails_before_rendering(monkeypatch):
     import p9_reporter
 
@@ -161,6 +216,7 @@ def test_p9_risk_analysis_applies_guardrails_before_rendering(monkeypatch):
             thinking_content="",
         ),
     )
+    monkeypatch.setattr(p9_reporter, "_load_p8_price_db", lambda: {})
     monkeypatch.setattr(p9_reporter, "write_text_artifact", lambda *args, **kwargs: "dummy.md")
     monkeypatch.setattr(
         p9_reporter,

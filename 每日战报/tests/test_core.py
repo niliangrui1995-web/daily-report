@@ -424,6 +424,63 @@ class TestStockExtraction:
         assert codes.count("688256") == 1
 
 
+class TestP8FastPath:
+    """测试 P8 简版技术画像仍保留 P9 表格所需字段"""
+
+    def test_fast_path_keeps_3m_and_250d_fields(self, monkeypatch, tmp_path):
+        import p8_technical
+
+        captured = {}
+
+        def make_records(count, start):
+            return [
+                {
+                    "date": f"2026{i + 1:04d}",
+                    "open": start + i,
+                    "high": start + i + 1,
+                    "low": start + i - 1,
+                    "close": start + i,
+                    "amount": 0,
+                    "volume": 1000 + i,
+                }
+                for i in range(count)
+            ]
+
+        stock_records = make_records(80, 100)
+        index_records = make_records(80, 3000)
+
+        def fake_read_day_file(path):
+            if "999999" in path or "399006" in path:
+                return index_records
+            return stock_records
+
+        def fake_persist(markdown_text, json_data, *, status, metrics):
+            captured["markdown"] = markdown_text
+            captured["json"] = json_data
+            captured["status"] = status
+            captured["metrics"] = metrics
+            return markdown_text
+
+        monkeypatch.setattr(p8_technical, "_find_tdx_vipdoc", lambda: str(tmp_path))
+        monkeypatch.setattr(p8_technical, "_resolve_tdx_market_and_path", lambda vipdoc, code: ("sh", str(tmp_path / f"{code}.day")))
+        monkeypatch.setattr(p8_technical.os.path, "exists", lambda path: True)
+        monkeypatch.setattr(p8_technical, "read_day_file_simple", fake_read_day_file)
+        monkeypatch.setattr(p8_technical, "_persist_p8_outputs", fake_persist)
+
+        p8_technical.p8_search_stock_prices(
+            stocks=[("中微公司", "688012")],
+            track_map={"688012": "前道设备"},
+            elasticity_map={"688012": "⚡中弹性"},
+        )
+
+        item = captured["json"]["688012"]
+        assert captured["status"] == "completed"
+        assert item["fast_path"] is True
+        assert "60日" in captured["markdown"]
+        assert item["chg_3m_pct"] == item["price_data"]["chg_3m_pct"]
+        assert item["percentile_250d"] == item["price_data"]["percentile_250d"]
+
+
 # =====================================================================
 # 4. Scrapling 工具测试
 # =====================================================================
@@ -680,6 +737,19 @@ class TestExtractJson:
         result = extract_json_from_llm_response(raw, allow_partial=True)
         assert result["summary"]["passed"] == 1
         assert result["high_trust"] == ["ok"]
+
+    def test_partial_json_repairs_unescaped_inner_quotes(self):
+        from utils import extract_json_from_llm_response
+
+        raw = (
+            '{"summary":{"passed":1,"deleted":0},'
+            '"high_trust":["劳资双方达成"2026年薪资协议暂定合约"；工会暂停罢工"],'
+            '"medium_trust":[],"deleted":[]}'
+        )
+
+        result = extract_json_from_llm_response(raw, allow_partial=True)
+
+        assert result["high_trust"][0] == '劳资双方达成"2026年薪资协议暂定合约"；工会暂停罢工'
 
     def test_garbage_prefix_suffix(self):
         """JSON 前后带废话文本"""

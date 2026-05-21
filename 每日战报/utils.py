@@ -71,6 +71,51 @@ def _append_missing_json_closers(text: str) -> str | None:
         return text
     return text.rstrip() + '\n' + ''.join(reversed(stack))
 
+
+def _looks_like_json_string_close(text: str, index: int) -> bool:
+    next_index = index + 1
+    while next_index < len(text) and text[next_index].isspace():
+        next_index += 1
+    if next_index >= len(text):
+        return True
+    return text[next_index] in ',:]}'
+
+
+def _escape_unescaped_inner_quotes(text: str) -> str:
+    chars: list[str] = []
+    in_string = False
+    escaped = False
+
+    for index, ch in enumerate(text):
+        if not in_string:
+            chars.append(ch)
+            if ch == '"':
+                in_string = True
+            continue
+
+        if escaped:
+            chars.append(ch)
+            escaped = False
+            continue
+
+        if ch == '\\':
+            chars.append(ch)
+            escaped = True
+            continue
+
+        if ch == '"':
+            if _looks_like_json_string_close(text, index):
+                chars.append(ch)
+                in_string = False
+            else:
+                chars.append('\\"')
+            continue
+
+        chars.append(ch)
+
+    return ''.join(chars)
+
+
 def extract_json_from_llm_response(raw_text: str, expect_type: str = 'dict', allow_partial: bool = False) -> Any:
     if not raw_text or not raw_text.strip():
         raise json.JSONDecodeError('空文本', raw_text if raw_text else '', 0)
@@ -110,14 +155,16 @@ def extract_json_from_llm_response(raw_text: str, expect_type: str = 'dict', all
             start_idx = json_str.find(open_bracket)
             if start_idx < 0:
                 continue
-            repaired = _append_missing_json_closers(json_str[start_idx:])
-            if not repaired:
-                continue
-            try:
-                result = json.loads(repaired)
-                if _type_matches(result, expect_type):
-                    return result
-            except json.JSONDecodeError:
-                pass
+            body = json_str[start_idx:]
+            for candidate in (body, _escape_unescaped_inner_quotes(body)):
+                repaired = _append_missing_json_closers(candidate)
+                if not repaired:
+                    continue
+                try:
+                    result = json.loads(repaired)
+                    if _type_matches(result, expect_type):
+                        return result
+                except json.JSONDecodeError:
+                    pass
                 
     raise json.JSONDecodeError(f'无法从大模型返回中提取 {expect_type} 类型 JSON', raw_text[:200], 0)

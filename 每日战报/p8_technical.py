@@ -120,13 +120,19 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
                 highs = [rc['high'] for rc in records[-250:]]
                 lows = [rc['low'] for rc in records[-250:]]
                 chg_1m = _calc_period_change(closes, 20)
+                chg_3m = _calc_period_change(closes, 60)
                 rs_20d = chg_1m - _index_returns.get('上证指数', {}).get('chg_20d', 0)
+                rs_60d = chg_3m - _index_returns.get('上证指数', {}).get('chg_60d', 0)
                 boll_width = _calc_boll_width(closes)
                 atr_pct = _calc_atr_pct(highs, lows, closes)
                 weekly = _calc_weekly_summary(closes)
+                low_250d = min(closes)
+                high_250d = max(closes)
+                pct_250d = (r['close'] - low_250d) / (high_250d - low_250d) * 100 if high_250d > low_250d else 50
                 low_elasticity_names.append(
                     f"- 【{track_label}】{name}({code}) | 收盘 {r['close']:.2f}元 | "
-                    f"20日{chg_1m:+.1f}% | RS{rs_20d:+.1f}% | ATR{atr_pct:.1f}% | "
+                    f"20日{chg_1m:+.1f}% | 60日{chg_3m:+.1f}% | 250日分位{int(pct_250d)}% | "
+                    f"RS{rs_20d:+.1f}%/{rs_60d:+.1f}% | ATR{atr_pct:.1f}% | "
                     f"周线{weekly['trend']} | 布林宽{boll_width:.1f}%"
                 )
                 p8_json_db[code] = {
@@ -137,10 +143,19 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
                     'track': track_label,
                     'latest_close': round(r['close'], 2),
                     'chg_20d_pct': round(chg_1m, 1),
+                    'chg_3m_pct': round(chg_3m, 1),
+                    'percentile_250d': round(pct_250d, 1),
                     'rs_20d_pct': round(rs_20d, 1),
+                    'rs_60d_pct': round(rs_60d, 1),
                     'atr_pct': round(atr_pct, 1),
                     'boll_width_pct': round(boll_width, 1),
                     'weekly_trend': weekly['trend'],
+                    'price_data': {
+                        'latest_close': round(r['close'], 2),
+                        'chg_1m_pct': round(chg_1m, 1),
+                        'chg_3m_pct': round(chg_3m, 1),
+                        'percentile_250d': round(pct_250d, 1),
+                    },
                 }
             else:
                 low_elasticity_names.append(f"- 【{track_label}】{name}({code}) | 本地 K 线缺失，跳过技术画像")

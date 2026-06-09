@@ -15,7 +15,6 @@ from ratelimit import limits, sleep_and_retry
 
 from scraper_utils import enrich_search_urls
 from settings import (
-    GEMINI_SEARCH_CF_URL,
     GEMINI_SEARCH_DIRECT_URL,
     GEMINI_SEARCH_MODEL,
     SEARCH_API_KEY_POOL,
@@ -115,7 +114,6 @@ class ChannelCircuitBreaker:
 
 
 search_rotator_direct = SearchKeyRotator(SEARCH_API_KEY_POOL, GEMINI_SEARCH_DIRECT_URL)
-search_rotator_cf = SearchKeyRotator(SEARCH_API_KEY_POOL, GEMINI_SEARCH_CF_URL)
 channel_breaker = ChannelCircuitBreaker(threshold=2)
 _http_session = requests.Session()
 GEMINI_CONCURRENCY = max(search_rotator_direct.total, 1)
@@ -148,6 +146,8 @@ def _classify_search_http_response(response: requests.Response) -> str:
     status_code = getattr(response, "status_code", 0)
     if status_code == 429:
         return "quota_exhausted"
+    if 500 <= status_code < 600:
+        return "server_error"
     if status_code != 403:
         return ""
 
@@ -451,7 +451,7 @@ def _extract_gemini_text_and_sources(data: dict) -> tuple[str, list[dict[str, st
 
 
 def raw_gemini_search(prompt: str, max_retries: int = 3, *, return_dict: bool = False):
-    channels = [("direct", search_rotator_direct), ("cf_worker", search_rotator_cf)]
+    channels = [("direct", search_rotator_direct)]
 
     for channel_name, rotator in channels:
         if channel_breaker.is_tripped(channel_name):
@@ -459,6 +459,10 @@ def raw_gemini_search(prompt: str, max_retries: int = 3, *, return_dict: bool = 
             continue
 
         for _ in range(rotator.total):
+            if channel_breaker.is_tripped(channel_name):
+                logging.debug(f"[raw_search] skip tripped channel {channel_name}")
+                break
+
             base_url, key, key_idx, key_last4 = rotator.get_client()
             if base_url is None or key is None:
                 logging.error(f"[raw_search] no available key on {channel_name}")
@@ -530,7 +534,7 @@ def gemini_search(
 ) -> dict:
     prompt = _build_search_prompt(category, query, backtrack, structured_mode=structured_mode)
     response_json_schema = _structured_mode_schema(structured_mode)
-    channels = [("direct", search_rotator_direct), ("cf_worker", search_rotator_cf)]
+    channels = [("direct", search_rotator_direct)]
 
     for channel_name, rotator in channels:
         if channel_breaker.is_tripped(channel_name):
@@ -538,6 +542,10 @@ def gemini_search(
             continue
 
         for _ in range(rotator.total):
+            if channel_breaker.is_tripped(channel_name):
+                logging.debug(f"[{category}] skip tripped channel {channel_name}")
+                break
+
             base_url, key, key_idx, key_last4 = rotator.get_client()
             if base_url is None or key is None:
                 logging.error(f"[{category}] no available key on {channel_name}")

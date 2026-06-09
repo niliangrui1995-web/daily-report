@@ -91,7 +91,6 @@ PRO_OPUS_BASE_URL = os.environ.get('PRO_OPUS_BASE_URL', ANTIGRAVITY_BASE_URL)
 PRO_OPUS_API_KEY = os.environ.get('PRO_OPUS_API_KEY', ANTIGRAVITY_API_KEY)
 
 GEMINI_SEARCH_DIRECT_URL = 'https://generativelanguage.googleapis.com'
-GEMINI_SEARCH_CF_URL = os.environ.get('GEMINI_SEARCH_BASE_URL', 'https://api.niliangrui.cloud')
 GEMINI_PRO_API_KEY = os.environ.get('GEMINI_PRO_API_KEY', '').strip()
 _search_keys_env = os.environ.get('GEMINI_SEARCH_API_KEYS', '')
 _search_single_key = os.environ.get('GEMINI_SEARCH_API_KEY', '')
@@ -105,7 +104,7 @@ else:
 if not SEARCH_API_KEY_POOL:
     logging.warning('⚠️ GEMINI_SEARCH_API_KEYS 未配置！请检查 .env 文件。联网搜索功能将不可用。')
 
-GEMINI_SEARCH_MODEL = 'gemini-2.5-flash'
+GEMINI_SEARCH_MODEL = os.environ.get('GEMINI_SEARCH_MODEL', 'gemini-2.5-flash').strip() or 'gemini-2.5-flash'
 AUDIT_MODEL = os.environ.get('AUDIT_MODEL', os.environ.get('GEMINI_PRO_MODEL', 'claude-sonnet-4-6')).strip() or 'claude-sonnet-4-6'
 GEMINI_PRO_MODEL = AUDIT_MODEL
 OPUS_MODEL = 'claude-opus-4-6-thinking'

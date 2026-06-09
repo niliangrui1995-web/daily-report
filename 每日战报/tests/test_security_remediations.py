@@ -159,14 +159,13 @@ def test_search_exception_logging_redacts_gemini_key(monkeypatch, caplog):
     secret = "SECRETKEY123"
 
     class FakeResponse:
-        status_code = 500
+        status_code = 418
         url = f"https://generativelanguage.googleapis.com/v1beta/models/test:generateContent?key={secret}&x=1"
 
         def raise_for_status(self):
-            raise requests.HTTPError(f"500 Server Error for url: {self.url}", response=self)
+            raise requests.HTTPError(f"418 Server Error for url: {self.url}", response=self)
 
     monkeypatch.setattr(search_engine, "search_rotator_direct", search_engine.SearchKeyRotator([secret], "https://example.invalid"))
-    monkeypatch.setattr(search_engine, "search_rotator_cf", search_engine.SearchKeyRotator([], "https://example.invalid"))
     monkeypatch.setattr(search_engine, "channel_breaker", search_engine.ChannelCircuitBreaker(threshold=99))
     monkeypatch.setattr(search_engine, "_post_search_request", lambda **kwargs: FakeResponse())
     monkeypatch.setattr(search_engine, "_tavily_fallback", lambda *args, **kwargs: {})
@@ -178,6 +177,45 @@ def test_search_exception_logging_redacts_gemini_key(monkeypatch, caplog):
     assert search_engine.raw_gemini_search("test prompt", max_retries=1) == ""
     assert secret not in caplog.text
     assert "key=<redacted>" in caplog.text
+
+
+def test_search_5xx_trips_channel_and_uses_tavily(monkeypatch, caplog):
+    import search_engine
+
+    class ServerErrorResponse:
+        status_code = 503
+        url = "https://generativelanguage.googleapis.com/v1beta/models/test:generateContent"
+        text = "503 UNAVAILABLE: model overloaded"
+
+        def raise_for_status(self):
+            raise requests.HTTPError(self.text, response=self)
+
+    direct_rotator = search_engine.SearchKeyRotator(["key_A", "key_B", "key_C"], "https://example.invalid")
+    breaker = search_engine.ChannelCircuitBreaker(threshold=2)
+    calls = []
+
+    def fake_post(**kwargs):
+        calls.append(kwargs)
+        return ServerErrorResponse()
+
+    monkeypatch.setattr(search_engine, "search_rotator_direct", direct_rotator)
+    monkeypatch.setattr(search_engine, "channel_breaker", breaker)
+    monkeypatch.setattr(search_engine, "_post_search_request", fake_post)
+    monkeypatch.setattr(
+        search_engine,
+        "_tavily_fallback",
+        lambda *args, **kwargs: {"text": "fallback ok", "grounding_sources": []},
+    )
+
+    caplog.set_level(logging.WARNING)
+
+    result = search_engine.raw_gemini_search("test prompt", max_retries=3, return_dict=True)
+
+    assert result["text"] == "fallback ok"
+    assert len(calls) == 2
+    assert breaker.is_tripped("direct") is True
+    assert direct_rotator.available == 3
+    assert "server_error on direct" in caplog.text
 
 
 def test_search_permission_denied_403_does_not_exhaust_gemini_key(monkeypatch, caplog):
@@ -198,7 +236,6 @@ def test_search_permission_denied_403_does_not_exhaust_gemini_key(monkeypatch, c
 
     direct_rotator = search_engine.SearchKeyRotator([secret], "https://example.invalid")
     monkeypatch.setattr(search_engine, "search_rotator_direct", direct_rotator)
-    monkeypatch.setattr(search_engine, "search_rotator_cf", search_engine.SearchKeyRotator([], "https://example.invalid"))
     monkeypatch.setattr(search_engine, "channel_breaker", search_engine.ChannelCircuitBreaker(threshold=99))
     monkeypatch.setattr(search_engine, "_post_search_request", lambda **kwargs: PermissionDeniedResponse())
     monkeypatch.setattr(search_engine, "_tavily_fallback", lambda *args, **kwargs: {})

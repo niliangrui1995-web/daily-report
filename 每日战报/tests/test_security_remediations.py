@@ -248,6 +248,115 @@ def test_search_permission_denied_403_does_not_exhaust_gemini_key(monkeypatch, c
     assert "permission_denied" in caplog.text
 
 
+def test_gemini_search_rest_payload_uses_current_google_search_field(monkeypatch):
+    import search_engine
+
+    captured = {}
+    sentinel = object()
+
+    class FakeSession:
+        def post(self, *args, **kwargs):
+            captured["args"] = args
+            captured.update(kwargs)
+            return sentinel
+
+    monkeypatch.setattr(search_engine, "_http_session", FakeSession())
+
+    result = search_engine._post_search_request(
+        base_url="https://generativelanguage.googleapis.com",
+        key="SECRETKEY123",
+        prompt="latest AI infrastructure news",
+        temperature=0.7,
+    )
+
+    assert result is sentinel
+    assert captured["args"][0].endswith(":generateContent")
+    assert captured["json"]["tools"] == [{"google_search": {}}]
+    assert "googleSearch" not in str(captured["json"])
+
+
+def test_search_400_bad_request_trips_channel_and_uses_tavily(monkeypatch, caplog):
+    import search_engine
+
+    class BadRequestResponse:
+        status_code = 400
+        url = "https://generativelanguage.googleapis.com/v1beta/models/test:generateContent"
+        text = "Invalid JSON payload received. Unknown name 'googleSearch' at 'tools[0]'"
+
+        def raise_for_status(self):
+            raise requests.HTTPError(self.text, response=self)
+
+    direct_rotator = search_engine.SearchKeyRotator(["key_A", "key_B", "key_C"], "https://example.invalid")
+    breaker = search_engine.ChannelCircuitBreaker(threshold=2)
+    calls = []
+
+    def fake_post(**kwargs):
+        calls.append(kwargs)
+        return BadRequestResponse()
+
+    monkeypatch.setattr(search_engine, "search_rotator_direct", direct_rotator)
+    monkeypatch.setattr(search_engine, "channel_breaker", breaker)
+    monkeypatch.setattr(search_engine, "_post_search_request", fake_post)
+    monkeypatch.setattr(
+        search_engine,
+        "_tavily_fallback",
+        lambda *args, **kwargs: {"text": "fallback ok", "grounding_sources": []},
+    )
+
+    caplog.set_level(logging.WARNING)
+
+    result = search_engine.raw_gemini_search("test prompt", max_retries=3, return_dict=True)
+
+    assert result["text"] == "fallback ok"
+    assert len(calls) == 1
+    assert breaker.is_tripped("direct") is True
+    assert direct_rotator.available == 3
+    assert "bad_request on direct" in caplog.text
+    assert "Unknown name 'googleSearch'" in caplog.text
+
+
+def test_search_400_unsupported_location_trips_channel(monkeypatch, caplog):
+    import search_engine
+
+    class UnsupportedLocationResponse:
+        status_code = 400
+        url = "https://generativelanguage.googleapis.com/v1beta/models/test:generateContent"
+        text = (
+            '{"error":{"code":400,"message":"User location is not supported for the API use.",'
+            '"status":"FAILED_PRECONDITION"}}'
+        )
+
+        def raise_for_status(self):
+            raise requests.HTTPError(self.text, response=self)
+
+    direct_rotator = search_engine.SearchKeyRotator(["key_A", "key_B"], "https://example.invalid")
+    breaker = search_engine.ChannelCircuitBreaker(threshold=2)
+    calls = []
+
+    def fake_post(**kwargs):
+        calls.append(kwargs)
+        return UnsupportedLocationResponse()
+
+    monkeypatch.setattr(search_engine, "search_rotator_direct", direct_rotator)
+    monkeypatch.setattr(search_engine, "channel_breaker", breaker)
+    monkeypatch.setattr(search_engine, "_post_search_request", fake_post)
+    monkeypatch.setattr(
+        search_engine,
+        "_tavily_fallback",
+        lambda *args, **kwargs: {"text": "fallback ok", "grounding_sources": []},
+    )
+
+    caplog.set_level(logging.WARNING)
+
+    result = search_engine.raw_gemini_search("test prompt", max_retries=3, return_dict=True)
+
+    assert result["text"] == "fallback ok"
+    assert len(calls) == 1
+    assert breaker.is_tripped("direct") is True
+    assert direct_rotator.available == 2
+    assert "unsupported_location on direct" in caplog.text
+
+
 def test_report_email_sanitizes_html_and_unsafe_links():
     from p9_email import build_report_email_message
 

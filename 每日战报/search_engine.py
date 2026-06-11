@@ -94,6 +94,12 @@ class ChannelCircuitBreaker:
                     f"[search] circuit breaker tripped for {channel_name} after {self._threshold} failures"
                 )
 
+    def trip(self, channel_name: str):
+        with self._lock:
+            self._failures[channel_name] = self._threshold
+            self._tripped.add(channel_name)
+            self._tripped_time[channel_name] = time.time()
+
     def record_success(self, channel_name: str):
         with self._lock:
             self._failures[channel_name] = 0
@@ -144,6 +150,11 @@ def _search_response_text(response: requests.Response) -> str:
 
 def _classify_search_http_response(response: requests.Response) -> str:
     status_code = getattr(response, "status_code", 0)
+    if status_code == 400:
+        text = _search_response_text(response).lower()
+        if "location is not supported" in text or "failed_precondition" in text:
+            return "unsupported_location"
+        return "bad_request"
     if status_code == 429:
         return "quota_exhausted"
     if 500 <= status_code < 600:
@@ -177,7 +188,10 @@ def _handle_search_limited_response(
         rotator.mark_exhausted(key_idx)
         return True
 
-    channel_breaker.record_failure(channel_name)
+    if classification in {"bad_request", "unsupported_location"}:
+        channel_breaker.trip(channel_name)
+    else:
+        channel_breaker.record_failure(channel_name)
     logging.warning(
         f"[{category}] {classification} on {channel_name}; keep key ...{key_last4} available | "
         f"{_search_response_text(response)[:240]}"
@@ -415,12 +429,12 @@ def _post_search_request(
         "temperature": temperature,
         "maxOutputTokens": 8192,
     }
-    # Why: Google Search grounding（googleSearch 工具）和 JSON 结构化输出互斥。
-    #      同时传 responseJsonSchema + googleSearch 会返回 400 Bad Request。
+    # Why: Google Search grounding（google_search 工具）和 JSON 结构化输出互斥。
+    #      同时传 response_json_schema + google_search 会返回 400 Bad Request。
     #      P7 结构化模式改为在 prompt 中要求 JSON，拿到纯文本后用代码解析。
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "tools": [{"googleSearch": {}}],
+        "tools": [{"google_search": {}}],
         "generationConfig": generation_config,
     }
     return _http_session.post(

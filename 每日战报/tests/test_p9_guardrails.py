@@ -117,6 +117,48 @@ def test_parse_report_payload_rejects_incomplete_repaired_json():
         p9_reporter._parse_report_payload(raw)
 
 
+def test_backfill_soft_intel_sections_replaces_false_missing_placeholders():
+    import p9_reporter
+
+    payload = {
+        "x_intel_snipe": [
+            {
+                "title": "本次运行无P2 X平台情报",
+                "body": "本轮未收到P2 X平台实时情报数据。",
+            }
+        ],
+        "p3_machine_intel": [
+            {
+                "title": "本次运行无P3机动情报",
+                "body": "本轮未收到P3 Gemini机动情报数据。",
+            }
+        ],
+    }
+    p2_markdown = """### 1. [HBM与先进存储] SK hynix HBM4订单
+- Claim: SK hynix 下单 TC Bonder，HBM4 量产线启动。
+- Source: @TradexWhisperer
+- Confidence: 64% (medium)
+- Impact: 利好 HBM 设备链。
+- Source URL: https://x.com/example/status/1"""
+    p3_markdown = """### 1. [锦囊二 | Tavily备用搜索] d-Matrix AI推理芯片
+- Claim: d-Matrix 获融资并推出推理芯片。
+- Source: Tavily
+- Confidence: 56% (low)
+- Source URL: https://www.d-matrix.ai/news"""
+
+    metrics = p9_reporter._backfill_soft_intel_sections(
+        payload,
+        p2_x_intel_data=p2_markdown,
+        p3_intel_data=p3_markdown,
+    )
+
+    assert metrics == {"p2_intel_section_backfilled": 1, "p3_intel_section_backfilled": 1}
+    assert payload["x_intel_snipe"][0]["title"] == "SK hynix HBM4订单"
+    assert "TC Bonder" in payload["x_intel_snipe"][0]["body"]
+    assert payload["p3_machine_intel"][0]["title"] == "d-Matrix AI推理芯片"
+    assert "Tavily" in payload["p3_machine_intel"][0]["body"]
+
+
 def test_backfill_sniper_tables_from_p8_price_json():
     import p9_reporter
 

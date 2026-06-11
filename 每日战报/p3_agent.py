@@ -290,6 +290,100 @@ def _persist_raw_response(bucket: str, raw_text: str) -> None:
     )
 
 
+def _compact_summary(value: str, *, max_chars: int = 180) -> str:
+    text = re.sub(r"\s+", " ", (value or "").strip())
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "..."
+
+
+def _split_tavily_result_blocks(raw_text: str) -> list[str]:
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in (raw_text or "").splitlines():
+        if line.startswith("- "):
+            if current:
+                blocks.append("\n".join(current).strip())
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current).strip())
+    return blocks
+
+
+def _parse_tavily_fallback_response(
+    raw_text: str,
+    *,
+    bucket: str,
+    grounding_sources: list[dict] | None = None,
+) -> list[dict]:
+    if "[Tavily Fallback]" not in (raw_text or ""):
+        return []
+
+    grounding_sources = grounding_sources or []
+    items: list[dict] = []
+    for index, block in enumerate(_split_tavily_result_blocks(raw_text), 1):
+        text = block[2:].strip() if block.startswith("- ") else block.strip()
+        if not text:
+            continue
+
+        source_url = ""
+        url_match = re.search(r"\[(https?://[^\]\s]+)\]\s*$", text, flags=re.DOTALL)
+        if url_match:
+            source_url = _sanitize_source_url(url_match.group(1))
+            text = text[: url_match.start()].strip()
+        elif index - 1 < len(grounding_sources):
+            source_url = _sanitize_source_url(grounding_sources[index - 1].get("url", ""))
+
+        if ": " in text:
+            title, summary = text.split(": ", 1)
+        else:
+            title, summary = f"Tavily备用搜索结果{index}", text
+
+        title = _compact_summary(title, max_chars=80)
+        summary = _compact_summary(summary)
+        if not title and not summary:
+            continue
+
+        items.append(
+            {
+                "title": title or f"Tavily备用搜索结果{index}",
+                "summary": summary or title,
+                "track": "Tavily备用搜索",
+                "source_name": "Tavily",
+                "source_url": source_url,
+                "signal_type": bucket,
+                "confidence": 0.56,
+            }
+        )
+        if len(items) >= 5:
+            break
+
+    if items:
+        logging.info("[P3] parsed %s Tavily fallback items for %s", len(items), bucket or "unknown")
+        return items
+
+    first_line = next(
+        (line.replace("[Tavily Fallback]", "", 1).strip() for line in raw_text.splitlines() if line.strip()),
+        "",
+    )
+    if first_line:
+        source_url = _sanitize_source_url(grounding_sources[0].get("url", "")) if grounding_sources else ""
+        return [
+            {
+                "title": "Tavily备用搜索摘要",
+                "summary": _compact_summary(first_line),
+                "track": "Tavily备用搜索",
+                "source_name": "Tavily",
+                "source_url": source_url,
+                "signal_type": bucket,
+                "confidence": 0.56,
+            }
+        ]
+    return []
+
+
 def _parse_json_response(
     raw_text: str,
     *,
@@ -304,6 +398,13 @@ def _parse_json_response(
     try:
         result = extract_json_from_llm_response(raw_text, expect_type="list", allow_partial=True)
     except json.JSONDecodeError:
+        fallback_items = _parse_tavily_fallback_response(
+            raw_text,
+            bucket=bucket,
+            grounding_sources=grounding_sources,
+        )
+        if fallback_items:
+            return fallback_items
         repaired_text = _repair_source_url_fields(raw_text)
         if repaired_text == raw_text:
             _persist_raw_response(bucket, raw_text)

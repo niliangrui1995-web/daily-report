@@ -142,6 +142,26 @@ DEF",
         assert captured["prefix"].startswith("P3_raw_response")
         assert captured["content"] == "not-json-at-all"
 
+    def test_parse_json_response_converts_tavily_fallback_to_items(self):
+        import p3_agent
+
+        raw = """[Tavily Fallback] d-Matrix launched its first AI chip.
+- Microsoft-backed startup d-Matrix launches first AI chip: d-Matrix raises $275 million for inference chips. [https://www.d-matrix.ai/announcements/d-matrix-raises-275-million]
+- CNBC semiconductor equipment: Latest semiconductor and AI equipment headlines. [https://www.cnbc.com/semiconductor-equipment]"""
+
+        items = p3_agent._parse_json_response(
+            raw,
+            bucket="jinnang_2",
+            grounding_sources=[],
+        )
+
+        assert len(items) == 2
+        assert items[0]["source_name"] == "Tavily"
+        assert items[0]["track"] == "Tavily备用搜索"
+        assert items[0]["source_url"] == "https://www.d-matrix.ai/announcements/d-matrix-raises-275-million"
+        assert items[0]["signal_type"] == "jinnang_2"
+        assert items[0]["confidence"] == 0.56
+
 
 class TestP2BudgetGuardrail:
     def test_collect_from_x_returns_partial_content_when_budget_is_exhausted(self, monkeypatch):

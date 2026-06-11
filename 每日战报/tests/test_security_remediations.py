@@ -357,6 +357,38 @@ def test_search_400_unsupported_location_trips_channel(monkeypatch, caplog):
     assert "unsupported_location on direct" in caplog.text
 
 
+def test_tavily_fallback_can_feed_p7_structured_mode():
+    import search_engine
+
+    result = {
+        "text": (
+            "[Tavily Fallback] HBM demand is driving ABF substrate pressure and benefits PCB suppliers.\n"
+            "- HBM substrate shortage: Demand growth creates supply pressure and benefits upstream PCB suppliers. [https://example.com/hbm]\n"
+            "- Glass substrate alternatives: Glass remains a backup alternative for advanced packaging. [https://example.com/glass]"
+        ),
+        "grounding_sources": [
+            {"url": "https://example.com/hbm", "title": "HBM substrate shortage"},
+            {"url": "https://example.com/glass", "title": "Glass substrate alternatives"},
+        ],
+        "is_fallback": True,
+        "fallback_provider": "tavily",
+    }
+
+    payload = search_engine._structured_payload_from_tavily_result(
+        result,
+        query="HBM substrate shortage winners alternatives",
+        structured_mode="p7",
+    )
+
+    assert payload is not None
+    assert payload["summary"].startswith("HBM demand")
+    assert payload["claims"]
+    assert "HBM" in payload["entities"]
+    assert payload["coverage_flags"]["winners"] is True
+    assert payload["coverage_flags"]["alternatives"] is True
+    assert "benefits upstream PCB suppliers" in search_engine._render_p7_structured_text(payload)
+
+
 def test_report_email_sanitizes_html_and_unsafe_links():
     from p9_email import build_report_email_message
 

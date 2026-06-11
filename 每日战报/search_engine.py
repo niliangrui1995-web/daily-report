@@ -199,6 +199,35 @@ def _handle_search_limited_response(
     return True
 
 P7_STRUCTURED_MODE = "p7"
+_TAVILY_FALLBACK_MARKER = "[Tavily Fallback]"
+_TAVILY_ENTITY_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "this",
+    "that",
+    "latest",
+    "market",
+    "industry",
+    "company",
+    "search",
+    "source",
+    "news",
+    "about",
+    "their",
+    "will",
+    "into",
+    "over",
+    "more",
+}
+_TAVILY_COVERAGE_MARKERS = {
+    "cause": ("cause", "driver", "driven", "because", "due to", "原因", "驱动", "触发", "由于"),
+    "winners": ("benefit", "winner", "upside", "gain", "利好", "受益", "赢家", "增长"),
+    "losers": ("loser", "downside", "risk", "pressure", "decline", "利空", "受损", "风险", "压力"),
+    "alternatives": ("alternative", "substitute", "backup", "competition", "替代", "备选", "竞争", "格局"),
+}
 _P7_STRUCTURED_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -293,6 +322,175 @@ def _render_p7_structured_text(payload: dict) -> str:
         parts.append("Open questions:")
         parts.extend(f"- {item}" for item in open_questions)
     return "\n".join(parts).strip()
+
+
+def _compact_search_text(value: str, *, max_chars: int = 240) -> str:
+    text = re.sub(r"\s+", " ", (value or "").strip())
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "..."
+
+
+def _split_tavily_result_blocks(raw_text: str) -> list[str]:
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in (raw_text or "").splitlines():
+        if line.startswith("- "):
+            if current:
+                blocks.append("\n".join(current).strip())
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current).strip())
+    return blocks
+
+
+def _parse_tavily_text_items(raw_text: str, sources: list[dict[str, str]] | None = None) -> list[dict[str, str]]:
+    sources = sources or []
+    items: list[dict[str, str]] = []
+    for index, block in enumerate(_split_tavily_result_blocks(raw_text), 1):
+        text = block[2:].strip() if block.startswith("- ") else block.strip()
+        if not text:
+            continue
+
+        url = ""
+        url_match = re.search(r"\[(https?://[^\]\s]+)\]\s*$", text, flags=re.DOTALL)
+        if url_match:
+            url = url_match.group(1).strip()
+            text = text[: url_match.start()].strip()
+        elif index - 1 < len(sources):
+            url = str(sources[index - 1].get("url", "")).strip()
+
+        if ": " in text:
+            title, content = text.split(": ", 1)
+        else:
+            title, content = f"Tavily result {index}", text
+
+        items.append(
+            {
+                "title": _compact_search_text(title, max_chars=100),
+                "content": _compact_search_text(content),
+                "url": url,
+            }
+        )
+        if len(items) >= 5:
+            break
+    return items
+
+
+def _extract_tavily_answer(raw_text: str) -> str:
+    for line in (raw_text or "").splitlines():
+        if line.startswith(_TAVILY_FALLBACK_MARKER):
+            return _compact_search_text(line.replace(_TAVILY_FALLBACK_MARKER, "", 1), max_chars=400)
+    return ""
+
+
+def _extract_tavily_entities(text: str, *, limit: int = 8) -> list[str]:
+    entities: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[A-Z][A-Za-z0-9&\.-]{1,}|[A-Za-z]{3,}|[\u4e00-\u9fff]{2,8}", text or ""):
+        lowered = token.lower()
+        if lowered in _TAVILY_ENTITY_STOPWORDS or lowered in seen:
+            continue
+        seen.add(lowered)
+        entities.append(token)
+        if len(entities) >= limit:
+            break
+    return entities
+
+
+def _extract_tavily_dates(text: str) -> list[str]:
+    dates: list[str] = []
+    seen: set[str] = set()
+    for pattern in (r"20\d{2}[-/]\d{1,2}[-/]\d{1,2}", r"20\d{2}年\d{1,2}月\d{1,2}日"):
+        for match in re.findall(pattern, text or ""):
+            if match in seen:
+                continue
+            seen.add(match)
+            dates.append(match)
+            if len(dates) >= 6:
+                return dates
+    return dates
+
+
+def _coverage_from_tavily_text(text: str) -> dict[str, bool]:
+    lowered = (text or "").lower()
+    return {
+        key: any(marker.lower() in lowered for marker in markers)
+        for key, markers in _TAVILY_COVERAGE_MARKERS.items()
+    }
+
+
+def _tavily_open_questions(coverage: dict[str, bool], query: str) -> list[str]:
+    questions: list[str] = []
+    if not coverage.get("cause"):
+        questions.append(f"Need clearer cause and timing evidence for {query}.")
+    if not coverage.get("winners"):
+        questions.append("Need concrete beneficiary mapping to suppliers or A-share names.")
+    if not coverage.get("losers"):
+        questions.append("Need explicit downside or losing-side evidence.")
+    if not coverage.get("alternatives"):
+        questions.append("Need alternatives, substitutes, or competitive-response context.")
+    return questions[:4]
+
+
+def _structured_payload_from_tavily_result(
+    result: dict,
+    *,
+    query: str,
+    structured_mode: str | None,
+) -> dict | None:
+    if structured_mode != P7_STRUCTURED_MODE or not isinstance(result, dict):
+        return None
+
+    text = str(result.get("text") or "")
+    if not result.get("is_fallback") and _TAVILY_FALLBACK_MARKER not in text:
+        return None
+
+    raw_items = result.get("fallback_results")
+    items = raw_items if isinstance(raw_items, list) else []
+    if not items:
+        items = _parse_tavily_text_items(text, result.get("grounding_sources", []))
+
+    claims = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        claim = _compact_search_text(
+            str(item.get("content") or item.get("title") or ""),
+            max_chars=240,
+        )
+        if claim:
+            claims.append(claim)
+        if len(claims) >= 6:
+            break
+
+    summary = _extract_tavily_answer(text) or (claims[0] if claims else "")
+    corpus = " ".join(
+        [query, text]
+        + [
+            f"{item.get('title', '')} {item.get('content', '')}"
+            for item in items
+            if isinstance(item, dict)
+        ]
+    )
+    coverage = _coverage_from_tavily_text(corpus)
+    payload = {
+        "summary": summary,
+        "claims": claims,
+        "entities": _extract_tavily_entities(corpus),
+        "dates": _extract_tavily_dates(corpus),
+        "implications": [
+            claim
+            for claim in claims
+            if any(marker.lower() in claim.lower() for marker in ("benefit", "winner", "impact", "pressure", "利好", "受益", "影响", "压力"))
+        ][:4]
+        or claims[:2],
+        "open_questions": _tavily_open_questions(coverage, query),
+        "coverage_flags": coverage,
+    }
+    return _normalize_p7_structured_payload(payload)
 
 
 def _structured_mode_schema(structured_mode: str | None) -> dict | None:
@@ -395,13 +593,21 @@ def _tavily_fallback(query: str, category: str = "raw_search", return_dict: bool
         results = data.get("results", [])
         parts: list[str] = []
         sources: list[dict[str, str]] = []
+        fallback_results: list[dict[str, str]] = []
         if answer:
-            parts.append(f"[Tavily Fallback] {answer}")
+            parts.append(f"{_TAVILY_FALLBACK_MARKER} {answer}")
         for item in results[:5]:
             title = item.get("title", "")
             content = item.get("content", "")
             url = item.get("url", "")
             parts.append(f"- {title}: {content[:300]} [{url}]")
+            fallback_results.append(
+                {
+                    "title": str(title).strip(),
+                    "content": str(content).strip(),
+                    "url": str(url).strip(),
+                }
+            )
             if url:
                 sources.append({"url": url, "title": title})
         if not parts:
@@ -409,7 +615,13 @@ def _tavily_fallback(query: str, category: str = "raw_search", return_dict: bool
         channel_breaker.record_success("tavily")
         text = "\n".join(parts)
         if return_dict:
-            return {"text": text, "grounding_sources": sources}
+            return {
+                "text": text,
+                "grounding_sources": sources,
+                "is_fallback": True,
+                "fallback_provider": "tavily",
+                "fallback_results": fallback_results,
+            }
         return text
     except Exception as exc:
         logging.warning(f"[{category}] Tavily fallback failed: {exc}")
@@ -621,6 +833,15 @@ def gemini_search(
 
     result = _tavily_fallback(query, category=category, return_dict=True)
     if result:
+        structured_payload = _structured_payload_from_tavily_result(
+            result,
+            query=query,
+            structured_mode=structured_mode,
+        )
+        if structured_payload:
+            result["raw_text"] = result.get("text", "")
+            result["structured"] = structured_payload
+            result["text"] = _render_p7_structured_text(structured_payload)
         return enrich_search_urls(result)
 
     logging.error(f"[{category}] all search routes failed")

@@ -62,6 +62,95 @@ def _section_or_fallback(value: str | None, fallback: str) -> str:
     return fallback
 
 
+def _is_placeholder_intel_section(items: Any, markers: tuple[str, ...]) -> bool:
+    if not isinstance(items, list) or not items:
+        return True
+    combined = " ".join(
+        " ".join(str(item.get(field, "")) for field in ("title", "body"))
+        if isinstance(item, dict)
+        else str(item)
+        for item in items
+    )
+    normalized = re.sub(r"\s+", "", combined)
+    return any(marker in normalized for marker in markers)
+
+
+def _extract_field_from_markdown_block(block: str, field: str) -> str:
+    pattern = rf"^-\s*{re.escape(field)}:\s*(.+)$"
+    match = re.search(pattern, block, flags=re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def _extract_soft_intel_cards(section: str | None, *, max_items: int = 3) -> list[dict[str, str]]:
+    if not section or len(section.strip()) <= 50:
+        return []
+
+    cards: list[dict[str, str]] = []
+    block_re = re.compile(r"^###\s*\d+\.\s*(.+?)\n(.*?)(?=^###\s*\d+\.|\Z)", re.DOTALL | re.MULTILINE)
+    for match in block_re.finditer(section):
+        raw_title = match.group(1).strip()
+        block = match.group(2)
+        title = re.sub(r"^\[[^\]]+\]\s*", "", raw_title).strip() or "机动情报"
+        claim = _extract_field_from_markdown_block(block, "Claim")
+        impact = _extract_field_from_markdown_block(block, "Impact")
+        source = _extract_field_from_markdown_block(block, "Source")
+        confidence = _extract_field_from_markdown_block(block, "Confidence")
+        source_url = _extract_field_from_markdown_block(block, "Source URL")
+
+        body_parts = []
+        if claim:
+            body_parts.append(claim)
+        if impact and impact != "未提供":
+            body_parts.append(f"影响：{impact}")
+
+        meta_parts = []
+        if source:
+            meta_parts.append(f"来源：{source}")
+        if confidence:
+            meta_parts.append(f"置信度：{confidence}")
+        if source_url and source_url != "未提供":
+            meta_parts.append(f"链接：{source_url}")
+        if meta_parts:
+            body_parts.append("；".join(meta_parts))
+
+        body = " ".join(part for part in body_parts if part).strip()
+        if not body:
+            continue
+        cards.append({"title": title, "body": body})
+        if len(cards) >= max_items:
+            break
+    return cards
+
+
+def _backfill_soft_intel_sections(
+    data: dict[str, Any],
+    *,
+    p2_x_intel_data: str | None,
+    p3_intel_data: str | None,
+) -> dict[str, int]:
+    metrics = {"p2_intel_section_backfilled": 0, "p3_intel_section_backfilled": 0}
+
+    if _section_or_fallback(p2_x_intel_data, "") and _is_placeholder_intel_section(
+        data.get("x_intel_snipe"),
+        ("无P2", "本次运行无P2", "未收到P2"),
+    ):
+        p2_cards = _extract_soft_intel_cards(p2_x_intel_data)
+        if p2_cards:
+            data["x_intel_snipe"] = p2_cards
+            metrics["p2_intel_section_backfilled"] = len(p2_cards)
+
+    if _section_or_fallback(p3_intel_data, "") and _is_placeholder_intel_section(
+        data.get("p3_machine_intel"),
+        ("无P3", "本次运行无P3", "未收到P3"),
+    ):
+        p3_cards = _extract_soft_intel_cards(p3_intel_data)
+        if p3_cards:
+            data["p3_machine_intel"] = p3_cards
+            metrics["p3_intel_section_backfilled"] = len(p3_cards)
+
+    return metrics
+
+
 def _normalize_stock_code(value: Any) -> str:
     match = re.search(r"\d{6}", str(value or ""))
     return match.group(0) if match else ""
@@ -417,6 +506,13 @@ def p9_risk_analysis(
         data, guardrail_metrics = _apply_evidence_guardrails(data)
         if any(guardrail_metrics.values()):
             logging.info("[P9] applied evidence guardrails: %s", guardrail_metrics)
+        soft_intel_metrics = _backfill_soft_intel_sections(
+            data,
+            p2_x_intel_data=p2_x_intel_data,
+            p3_intel_data=p3_intel_data,
+        )
+        if any(soft_intel_metrics.values()):
+            logging.info("[P9] backfilled soft intel sections: %s", soft_intel_metrics)
         p8_backfill_metrics = _backfill_sniper_tables_from_p8(data)
         if p8_backfill_metrics.get("p8_backfilled_targets"):
             logging.info("[P9] backfilled sniper table fields from P8: %s", p8_backfill_metrics)
@@ -436,6 +532,7 @@ def p9_risk_analysis(
                     "markdown_chars": len(result),
                     "raw_output_chars": len(raw_content),
                     **guardrail_metrics,
+                    **soft_intel_metrics,
                     **p8_backfill_metrics,
                 },
             )
@@ -449,6 +546,7 @@ def p9_risk_analysis(
                     "markdown_chars": len(result),
                     "raw_output_chars": len(raw_content),
                     **guardrail_metrics,
+                    **soft_intel_metrics,
                     **p8_backfill_metrics,
                 },
             )

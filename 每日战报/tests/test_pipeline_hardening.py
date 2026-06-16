@@ -9,6 +9,7 @@ import os
 import sys
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -97,6 +98,27 @@ class TestPipelineRuntimeTimeout:
         )
 
         assert result == {"status": "success", "context": {"value": "child"}}
+
+    def test_context_file_roundtrips_utf8_sig_chinese(self, tmp_path):
+        import pipeline_runtime
+
+        context_path = tmp_path / "stage_context.json"
+
+        pipeline_runtime._write_context_to_file(
+            {
+                "report": "战报",
+                "mapping": {"track": "先进封装与混合键合"},
+                "non_serializable": object(),
+            },
+            str(context_path),
+        )
+
+        assert context_path.read_bytes().startswith(b"\xef\xbb\xbf")
+        assert pipeline_runtime._read_context_from_file(str(context_path)) == {
+            "report": "战报",
+            "mapping": {"track": "先进封装与混合键合"},
+        }
+        assert not context_path.exists()
 
     def test_stage_timeout_marks_manifest(self, monkeypatch, tmp_path):
         monkeypatch.setenv("VCP_STAGE_EXECUTION_MODE", "process")
@@ -207,6 +229,46 @@ class TestP1WebTimeParsing:
 
 
 class TestManifestContext:
+    def test_artifact_and_manifest_files_are_utf8_sig(self, monkeypatch, tmp_path):
+        import artifact_store
+
+        monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+        monkeypatch.setenv(artifact_store.RUN_TIMESTAMP_ENV, "20260616083006")
+
+        report_path = Path(artifact_store.write_text_artifact("战报", "# 战报\n生益科技"))
+        mapping_path = Path(
+            artifact_store.write_json_artifact(
+                "P6_映射",
+                {
+                    "events": [
+                        {
+                            "track_name": "先进封装与混合键合",
+                            "targets": [{"name": "新益昌", "elasticity": "🔥高弹性"}],
+                        }
+                    ]
+                },
+            )
+        )
+        manifest_path = Path(
+            artifact_store.update_run_manifest(
+                "p6",
+                status="completed",
+                files={"json": str(mapping_path), "md": str(report_path)},
+                metrics={"note": "中文 manifest 正常"},
+            )
+        )
+
+        for path in (report_path, mapping_path, manifest_path):
+            assert path.read_bytes().startswith(b"\xef\xbb\xbf")
+
+        assert "生益科技" in report_path.read_text(encoding=artifact_store.UTF8_FILE_ENCODING)
+        mapping = json.loads(mapping_path.read_text(encoding=artifact_store.UTF8_FILE_ENCODING))
+        assert mapping["events"][0]["track_name"] == "先进封装与混合键合"
+
+        manifest = artifact_store.load_run_manifest()
+        assert manifest["stages"]["p6"]["metrics"]["note"] == "中文 manifest 正常"
+        assert manifest["stages"]["p6"]["files"]["json"].endswith("P6_映射_20260616083006.json")
+
     def test_manifest_root_contains_runtime_context_and_preflight(self, monkeypatch, tmp_path):
         import artifact_store
 
@@ -251,7 +313,7 @@ class TestManifestContext:
         assert manifest_path.exists()
         assert not legacy_path.exists()
 
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
         assert manifest["stages"]["p1"]["status"] == "completed"
         assert manifest["stages"]["p2"]["status"] == "completed"
 

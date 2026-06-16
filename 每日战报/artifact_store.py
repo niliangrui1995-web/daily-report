@@ -18,6 +18,8 @@ from trading_calendar import get_calendar_mode
 RUN_TIMESTAMP_ENV = "VCP_RUN_TS"
 PREFLIGHT_SUMMARY_ENV = "VCP_PREFLIGHT_SUMMARY_JSON"
 MANIFEST_FILENAME = "run_manifest.json"
+# Windows PowerShell 5.1 guesses ANSI for BOM-less UTF-8; these artifacts are opened locally.
+UTF8_FILE_ENCODING = "utf-8-sig"
 
 ARTIFACT_CATEGORIES = ("logs", "meta", "agent")
 SUCCESS_STATUSES = {
@@ -41,6 +43,18 @@ class ManifestLoadError(RuntimeError):
 def ensure_dir(path: str) -> str:
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def configure_utf8_environment() -> None:
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 
 def get_output_root_dir() -> str:
@@ -125,7 +139,7 @@ def write_text_artifact(
     category: str | None = None,
 ) -> str:
     path = build_artifact_path(prefix, "md", timestamp=timestamp, category=category)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding=UTF8_FILE_ENCODING) as f:
         f.write(content)
     return path
 
@@ -138,7 +152,7 @@ def write_json_artifact(
     category: str | None = None,
 ) -> str:
     path = build_artifact_path(prefix, "json", timestamp=timestamp, category=category)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding=UTF8_FILE_ENCODING) as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return path
 
@@ -230,7 +244,7 @@ def _load_manifest_from_path(path: str, *, run_ts: str | None = None) -> dict[st
         return _build_default_manifest(run_ts)
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding=UTF8_FILE_ENCODING) as f:
             data = json.load(f)
     except Exception as exc:
         raise ManifestLoadError(path, exc) from exc
@@ -254,7 +268,7 @@ def _write_manifest_file(path: str, manifest: dict[str, Any]) -> None:
     ensure_dir(os.path.dirname(path))
     fd, temp_path = tempfile.mkstemp(prefix="manifest_", suffix=".json", dir=os.path.dirname(path))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding=UTF8_FILE_ENCODING) as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())

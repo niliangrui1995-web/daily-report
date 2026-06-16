@@ -14,7 +14,9 @@ from logging.handlers import RotatingFileHandler
 from typing import Any
 
 from artifact_store import (
+    UTF8_FILE_ENCODING,
     build_runtime_context,
+    configure_utf8_environment,
     get_error_log_path,
     get_preflight_summary,
     get_pipeline_log_path,
@@ -69,13 +71,7 @@ CONTROL_STAGE_TIMEOUTS = {
 
 
 def _configure_stdio() -> None:
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
+    configure_utf8_environment()
 
 
 @contextlib.contextmanager
@@ -108,7 +104,7 @@ def _read_text_checkpoint(path: str, label: str) -> str:
     if not path:
         return ""
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding=UTF8_FILE_ENCODING) as f:
             data = f.read()
         logging.info("recovered %s", label)
         return data
@@ -125,7 +121,7 @@ def _read_json_checkpoint(path: str, label: str):
     try:
         import json
 
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding=UTF8_FILE_ENCODING) as f:
             data = json.load(f)
         logging.info("recovered %s", label)
         return data
@@ -698,7 +694,7 @@ def _stage_technical(context: dict[str, Any]) -> None:
 
 def _read_log_excerpt(limit_chars: int = 4000) -> str:
     try:
-        with open(get_pipeline_log_path(), "r", encoding="utf-8") as f:
+        with open(get_pipeline_log_path(), "r", encoding=UTF8_FILE_ENCODING) as f:
             return f.read()[-limit_chars:]
     except Exception:
         return ""

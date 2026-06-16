@@ -55,7 +55,7 @@ class TestAgentAssistantCore:
         assert result["ok"] is True
         assert Path(result["json_path"]).exists()
         assert Path(result["md_path"]).exists()
-        payload = json.loads(Path(result["json_path"]).read_text(encoding="utf-8"))
+        payload = json.loads(Path(result["json_path"]).read_text(encoding="utf-8-sig"))
         assert payload["summary"] == "可以运行"
         assert payload["risk_level"] == "low"
 

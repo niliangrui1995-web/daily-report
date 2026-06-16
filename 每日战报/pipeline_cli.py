@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from artifact_store import (
+    configure_utf8_environment,
     get_error_log_path,
     get_manifest_path,
     get_output_root_dir,
@@ -58,13 +59,7 @@ RUNTIME_IMPORTS = (
 
 
 def _configure_stdio() -> None:
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
+    configure_utf8_environment()
 
 
 def configure_run_logging() -> None:
@@ -413,6 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
     return int(args.handler(args))

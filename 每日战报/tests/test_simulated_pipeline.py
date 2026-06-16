@@ -460,7 +460,7 @@ class TestOrchestratorSimulation:
         assert roi_files
         assert manifest_path.exists(), "manifest should be generated"
 
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
         assert manifest["stages"]["p1"]["status"] == "completed"
         assert manifest["stages"]["p3"]["metrics"]["structured_items"] >= 1
         assert manifest["stages"]["roi"]["status"] == "completed"

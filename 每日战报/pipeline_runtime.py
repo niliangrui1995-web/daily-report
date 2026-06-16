@@ -10,7 +10,13 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-from artifact_store import get_error_log_path, get_pipeline_log_path, update_run_manifest
+from artifact_store import (
+    UTF8_FILE_ENCODING,
+    configure_utf8_environment,
+    get_error_log_path,
+    get_pipeline_log_path,
+    update_run_manifest,
+)
 
 StageHandler = Callable[[dict[str, Any]], None]
 
@@ -22,6 +28,7 @@ class StageTimeoutError(RuntimeError):
 
 
 def _configure_child_logging() -> None:
+    configure_utf8_environment()
     root_logger = logging.getLogger()
     if root_logger.handlers:
         return
@@ -280,7 +287,7 @@ def _read_context_from_file(file_path: str) -> dict[str, Any] | None:
     try:
         if not os.path.exists(file_path):
             return None
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(file_path, "r", encoding=UTF8_FILE_ENCODING) as f:
             data = json.load(f)
         return data
     except Exception as exc:
@@ -352,5 +359,5 @@ def _write_context_to_file(context: dict[str, Any], file_path: str) -> None:
             else:
                 logging.debug("[control] context key '%s' 不可序列化，跳过", key)
 
-    with open(file_path, "w", encoding="utf-8") as f:
+    with open(file_path, "w", encoding=UTF8_FILE_ENCODING) as f:
         json.dump(serializable_context, f, ensure_ascii=False)

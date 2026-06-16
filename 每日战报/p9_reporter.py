@@ -4,7 +4,14 @@ import re
 from datetime import datetime
 from typing import Any
 
-from artifact_store import get_run_timestamp, load_run_manifest, update_run_manifest, write_json_artifact, write_text_artifact
+from artifact_store import (
+    UTF8_FILE_ENCODING,
+    get_run_timestamp,
+    load_run_manifest,
+    update_run_manifest,
+    write_json_artifact,
+    write_text_artifact,
+)
 from p9_email import send_report_via_email
 from p9_rendering import build_report_markdown
 from settings import EMAIL_ADDRESS, EMAIL_PASSWORD, RECEIVER_EMAIL, opus_adapter, require_prompt
@@ -197,7 +204,7 @@ def _load_p8_price_db() -> dict[str, Any]:
         json_path = p8_files.get("json")
         if not json_path:
             return {}
-        with open(json_path, "r", encoding="utf-8-sig") as f:
+        with open(json_path, "r", encoding=UTF8_FILE_ENCODING) as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception as exc:

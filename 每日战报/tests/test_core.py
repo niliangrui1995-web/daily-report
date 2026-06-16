@@ -281,13 +281,11 @@ class TestIndustryDict:
             assert "AI PCB设备与关键耗材" in prompt_text
 
     def test_ai_pcb_equipment_a_share_code_guardrail(self):
-        """P6 代码纠错表应覆盖 AI PCB 设备常见 A 股映射"""
-        from p6_mapper import HALLUCINATION_MAP
+        r"""P6 不应再维护模型纠错表，股票代码统一来自 D:\HT。"""
+        import p6_mapper
 
-        assert HALLUCINATION_MAP["大族数控"] == "301200"
-        assert HALLUCINATION_MAP["芯碁微装"] == "688630"
-        assert HALLUCINATION_MAP["东威科技"] == "688700"
-        assert HALLUCINATION_MAP["鼎泰高科"] == "301377"
+        assert not hasattr(p6_mapper, "HALLUCINATION_MAP")
+        assert not hasattr(p6_mapper, "CANONICAL_A_SHARE_CODE_MAP")
 
     def test_ai_pcb_equipment_asian_kline_track_lookup(self):
         """亚洲寡头行情脚本应能把新增亚洲标的反查到 AI PCB 设备赛道"""

@@ -142,8 +142,6 @@ class TestProviderErrorClassification:
         assert adapter.provider == "google"
 
     def test_gemini_35_flash_uses_official_client(self, monkeypatch):
-        import types
-
         from native_llm_adapter import NativeLLMAdapter
 
         client_kwargs = {}
@@ -188,6 +186,7 @@ class TestProviderErrorClassification:
 
         from native_llm_adapter import NativeLLMAdapter
 
+        monkeypatch.delenv("OPENAI_COMPAT_MAX_TOKENS", raising=False)
         fake_message = SimpleNamespace(content="OK", reasoning_content="trace")
         fake_response = SimpleNamespace(choices=[SimpleNamespace(message=fake_message)])
         client_kwargs = {}

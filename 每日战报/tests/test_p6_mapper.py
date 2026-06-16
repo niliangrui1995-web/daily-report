@@ -12,6 +12,14 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+TEST_TDX_STOCK_CODE_MAP = {
+    "佰维存储": "688525",
+    "江波龙": "301308",
+    "德明利": "001309",
+    "兆易创新": "603986",
+    "聚辰股份": "688123",
+}
+
 
 P6_BAIWEI_WRONG_CODE_CASES = [
     (
@@ -33,7 +41,7 @@ P6_BAIWEI_WRONG_CODE_CASES = [
 
 
 @pytest.mark.parametrize("run_day,evidence_text,reasoning", P6_BAIWEI_WRONG_CODE_CASES)
-def test_baiwei_canonical_code_guardrail_replays_historical_p6_corrections(
+def test_baiwei_tdx_code_postprocess_replays_historical_p6_corrections(
     monkeypatch,
     caplog,
     run_day,
@@ -42,11 +50,9 @@ def test_baiwei_canonical_code_guardrail_replays_historical_p6_corrections(
 ):
     import p6_mapper
 
-    captured_prompts = []
     written_json = []
 
-    def fake_invoke(prompt):
-        captured_prompts.append(prompt)
+    def fake_invoke(_prompt):
         payload = {
             "events": [
                 {
@@ -96,7 +102,8 @@ def test_baiwei_canonical_code_guardrail_replays_historical_p6_corrections(
         return f"{prefix}.json"
 
     monkeypatch.setattr(p6_mapper.opus_adapter, "invoke", fake_invoke)
-    monkeypatch.setattr(p6_mapper, "require_prompt", lambda name: "{canonical_code_guardrail}\n{evidence_text}")
+    monkeypatch.setattr(p6_mapper, "load_tdx_stock_code_map", lambda: TEST_TDX_STOCK_CODE_MAP)
+    monkeypatch.setattr(p6_mapper, "require_prompt", lambda name: "{evidence_text}")
     monkeypatch.setattr(p6_mapper, "build_recent_topic_guardrail", lambda days=5: "")
     monkeypatch.setattr(p6_mapper, "write_json_artifact", fake_write_json_artifact)
     monkeypatch.setattr(p6_mapper, "write_text_artifact", lambda prefix, content, **kwargs: f"{prefix}.md")
@@ -106,10 +113,108 @@ def test_baiwei_canonical_code_guardrail_replays_historical_p6_corrections(
 
     report = p6_mapper.generate_report(evidence_text)
 
-    assert "佰维存储 -> 688525" in captured_prompts[0]
     assert "佰维存储（688525）" in report
     assert "佰维存储（300667）" not in report
     assert written_json[0]["events"][0]["targets"][0]["code"] == "688525"
-    assert "P6纠错拦截" in caplog.text
-    assert "300667" in caplog.text
+    assert "P6本地代码覆盖" in caplog.text
+    assert "300667 -> 688525" in caplog.text
     assert "688525" in caplog.text
+
+
+def test_p6_prompt_no_longer_injects_stock_code_rules(monkeypatch):
+    import p6_mapper
+
+    captured_prompts = []
+
+    def fake_invoke(prompt):
+        captured_prompts.append(prompt)
+        payload = {
+            "events": [
+                {
+                    "track_name": "HBM与先进存储",
+                    "event_summary": "佰维存储受存储景气催化。",
+                    "targets": [
+                        {
+                            "name": "佰维存储",
+                            "code": "300667",
+                            "elasticity": "⚡中弹性",
+                            "reasoning": "存储模组需求改善。",
+                        },
+                        {"name": "江波龙", "elasticity": "⚡中弹性", "reasoning": "存储模组受益。"},
+                        {"name": "德明利", "elasticity": "⚡中弹性", "reasoning": "存储分销受益。"},
+                        {"name": "兆易创新", "elasticity": "🔥高弹性", "reasoning": "存储芯片受益。"},
+                        {"name": "聚辰股份", "elasticity": "⚡中弹性", "reasoning": "接口芯片受益。"},
+                    ],
+                }
+            ],
+            "optional_searches": [],
+            "deep_research": [],
+        }
+        return SimpleNamespace(content=json.dumps(payload, ensure_ascii=False), thinking_content="")
+
+    monkeypatch.setattr(p6_mapper.opus_adapter, "invoke", fake_invoke)
+    monkeypatch.setattr(p6_mapper, "load_tdx_stock_code_map", lambda: TEST_TDX_STOCK_CODE_MAP)
+    monkeypatch.setattr(p6_mapper, "build_recent_topic_guardrail", lambda days=5: "")
+    monkeypatch.setattr(p6_mapper, "write_json_artifact", lambda prefix, data, **kwargs: f"{prefix}.json")
+    monkeypatch.setattr(p6_mapper, "write_text_artifact", lambda prefix, content, **kwargs: f"{prefix}.md")
+    monkeypatch.setattr(p6_mapper, "update_run_manifest", lambda *args, **kwargs: None)
+    monkeypatch.setattr(p6_mapper.time, "sleep", lambda seconds: None)
+
+    p6_mapper.generate_report("佰维存储受存储景气催化")
+
+    assert "佰维存储 -> 688525" not in captured_prompts[0]
+    assert "300667" not in captured_prompts[0]
+    assert "canonical map" not in captured_prompts[0]
+
+
+def test_p6_does_not_keep_model_code_for_unmapped_company(monkeypatch, caplog):
+    import p6_mapper
+
+    written_json = []
+
+    def fake_invoke(_prompt):
+        payload = {
+            "events": [
+                {
+                    "track_name": "未知新赛道",
+                    "event_summary": "模型选择一个本地表未收录公司。",
+                    "targets": [
+                        {
+                            "name": "未收录公司",
+                            "code": "123456",
+                            "elasticity": "⚡中弹性",
+                            "reasoning": "模型给出的公司理由。",
+                        },
+                        {"name": "佰维存储", "elasticity": "⚡中弹性", "reasoning": "存储模组受益。"},
+                        {"name": "江波龙", "elasticity": "⚡中弹性", "reasoning": "存储模组受益。"},
+                        {"name": "德明利", "elasticity": "⚡中弹性", "reasoning": "存储分销受益。"},
+                        {"name": "兆易创新", "elasticity": "🔥高弹性", "reasoning": "存储芯片受益。"},
+                        {"name": "聚辰股份", "elasticity": "⚡中弹性", "reasoning": "接口芯片受益。"},
+                    ],
+                }
+            ],
+            "optional_searches": [],
+            "deep_research": [],
+        }
+        return SimpleNamespace(content=json.dumps(payload, ensure_ascii=False), thinking_content="")
+
+    def fake_write_json_artifact(prefix, data, **kwargs):
+        written_json.append(data)
+        return f"{prefix}.json"
+
+    monkeypatch.setattr(p6_mapper.opus_adapter, "invoke", fake_invoke)
+    monkeypatch.setattr(p6_mapper, "load_tdx_stock_code_map", lambda: TEST_TDX_STOCK_CODE_MAP)
+    monkeypatch.setattr(p6_mapper, "require_prompt", lambda name: "{evidence_text}")
+    monkeypatch.setattr(p6_mapper, "build_recent_topic_guardrail", lambda days=5: "")
+    monkeypatch.setattr(p6_mapper, "write_json_artifact", fake_write_json_artifact)
+    monkeypatch.setattr(p6_mapper, "write_text_artifact", lambda prefix, content, **kwargs: f"{prefix}.md")
+    monkeypatch.setattr(p6_mapper, "update_run_manifest", lambda *args, **kwargs: None)
+    monkeypatch.setattr(p6_mapper.time, "sleep", lambda seconds: None)
+    caplog.set_level(logging.WARNING)
+
+    report = p6_mapper.generate_report("模型选择一个本地表未收录公司")
+
+    assert "未收录公司（123456）" not in report
+    assert "未收录公司（N/A）" in report
+    assert written_json[0]["events"][0]["targets"][0]["code"] == "N/A"
+    assert "已忽略模型 code=123456" in caplog.text

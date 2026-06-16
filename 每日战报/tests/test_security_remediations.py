@@ -153,6 +153,21 @@ def test_safe_requests_get_applies_default_timeout(monkeypatch):
     assert calls[0]["timeout"] == 12
 
 
+def test_rss_fetch_failure_does_not_let_feedparser_fetch_url(monkeypatch):
+    import p1_rss
+
+    def fail_get(*args, **kwargs):
+        raise requests.exceptions.Timeout("network timeout")
+
+    def fail_parse(*args, **kwargs):
+        raise AssertionError("feedparser.parse should not fetch URL after guarded request failure")
+
+    monkeypatch.setattr(p1_rss.requests, "get", fail_get)
+    monkeypatch.setattr(p1_rss.feedparser, "parse", fail_parse)
+
+    assert p1_rss._fetch_rss("Example", "https://example.com/feed.xml", "example") == []
+
+
 def test_search_exception_logging_redacts_gemini_key(monkeypatch, caplog):
     import search_engine
 

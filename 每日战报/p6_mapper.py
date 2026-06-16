@@ -26,6 +26,7 @@ from settings import opus_adapter, OPUS_MODEL, require_prompt
 from industry_dict import OLIGARCH_DICT
 from utils import extract_json_from_llm_response
 from p7_deep_research import build_recent_topic_guardrail
+from tdx_stock_universe import load_tdx_stock_code_map, normalize_stock_name
 
 P6_JSON_RETRY_LIMIT = 1
 P6_OUTPUT_LIMITS = """
@@ -37,76 +38,32 @@ JSON output hard limits:
 - deep_research: max 3 strings.
 - Prefer fewer complete, high-conviction tracks over long output. Never stop mid-object or mid-string.
 """
+UNMAPPED_CODE_PLACEHOLDER = 'N/A'
 
-HALLUCINATION_MAP = {
-    '江波龙': '301308',
-    '德明利': '001309',
-    '兆易创新': '603986',
-    '北京君正': '300223',
-    '香农芯创': '300475',
-    '聚辰股份': '688123',
-    '海光信息': '688041',
-    '寒武纪': '688256',
-    '澜起科技': '688008',
-    '龙芯中科': '688047',
-    '景嘉微': '300474',
-    '紫光国微': '002049',
-    '中国软件': '600536',
-    '中微公司': '688012',
-    '北方华创': '002371',
-    '拓荆科技': '688072',
-    '芯源微': '688037',
-    '华海清科': '688120',
-    '长川科技': '300604',
-    '盛美上海': '688082',
-    '源杰科技': '688498',
-    '中际旭创': '300308',
-    '新易盛': '300502',
-    '天孚通信': '300394',
-    '剑桥科技': '603083',
-    '光迅科技': '002281',
-    '浪潮信息': '000977',
-    '工业富联': '601138',
-    '中科曙光': '603019',
-    '紫光股份': '000938',
-    '拓维信息': '002261',
-    '高新发展': '000628',
-    '英维克': '002837'
-}
-CANONICAL_A_SHARE_CODE_MAP = {
-    '佰维存储': '688525',
-}
-HALLUCINATION_MAP.update(CANONICAL_A_SHARE_CODE_MAP)
-HALLUCINATION_MAP.update({
-    '沪电股份': '002463',
-    '胜宏科技': '300476',
-    '深南电路': '002916',
-    '大族数控': '301200',
-    '芯碁微装': '688630',
-    '东威科技': '688700',
-    '鼎泰高科': '301377',
-    '通富微电': '002156',
-    '长电科技': '600584',
-    '华天科技': '002185',
-    '生益科技': '600183'
-})
+def _apply_tdx_stock_codes(data: dict) -> None:
+    stock_code_map = load_tdx_stock_code_map()
+    for event in data.get('events', []):
+        if not isinstance(event, dict):
+            continue
+        for target in event.get('targets', []):
+            if not isinstance(target, dict):
+                continue
+            name = str(target.get('name', '')).strip()
+            raw_code = str(target.get('code', '')).strip()
+            local_code = stock_code_map.get(name) or stock_code_map.get(normalize_stock_name(name))
+            if local_code:
+                if raw_code and raw_code != local_code:
+                    logging.warning(f'⚠️ [P6本地代码覆盖] 忽略模型 code：{name} {raw_code} -> {local_code}')
+                elif not raw_code:
+                    logging.warning(f'⚠️ [P6本地代码填充] {name} -> {local_code}')
+                target['code'] = local_code
+                continue
 
-
-def _build_canonical_code_guardrail(evidence_text: str) -> str:
-    matched_rules = [
-        (name, code)
-        for name, code in CANONICAL_A_SHARE_CODE_MAP.items()
-        if name in evidence_text
-    ]
-    if not matched_rules:
-        return ''
-
-    lines = [
-        '【确定性 A 股代码规则】',
-        '以下公司一旦被选入 targets，code 必须使用 canonical 代码，禁止模型自行改写：',
-    ]
-    lines.extend(f'- {name} -> {code}' for name, code in matched_rules)
-    return '\n'.join(lines)
+            target['code'] = UNMAPPED_CODE_PLACEHOLDER
+            if raw_code:
+                logging.warning(f'⚠️ [P6本地代码缺失] {name} 未命中 D:\\HT 股票主数据，已忽略模型 code={raw_code}')
+            else:
+                logging.warning(f'⚠️ [P6本地代码缺失] {name} 未命中 D:\\HT 股票主数据，已标记为 {UNMAPPED_CODE_PLACEHOLDER}')
 
 
 def format_evidence(results: list[dict]) -> str:
@@ -148,7 +105,6 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
         current_time=now_str,
         evidence_len=len(evidence_text),
         oligarch_display=oligarch_display,
-        canonical_code_guardrail=_build_canonical_code_guardrail(evidence_text),
         evidence_text=evidence_text,
         dedup_section=dedup_section
     )
@@ -193,17 +149,7 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
     try:
         data = extract_json_from_llm_response(raw_content, expect_type='dict', allow_partial=True)
         
-        for idx, event in enumerate(data.get('events', [])):
-            if not isinstance(event, dict):
-                continue
-            for t_idx, target in enumerate(event.get('targets', [])):
-                if not isinstance(target, dict):
-                    continue
-                name = target.get('name', '未知公司')
-                code = target.get('code', '000000')
-                if name in HALLUCINATION_MAP and code != HALLUCINATION_MAP[name]:
-                    logging.warning(f'⚠️ [P6纠错拦截] 大模型犯蠢！把 {name} 的代码错写成了 {code}，已强行掰正为 {HALLUCINATION_MAP[name]}')
-                    data['events'][idx]['targets'][t_idx]['code'] = HALLUCINATION_MAP[name]
+        _apply_tdx_stock_codes(data)
                     
         try:
             json_fname = write_json_artifact('P6_映射', data)

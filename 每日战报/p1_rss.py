@@ -69,8 +69,9 @@ def _fetch_rss(name: str, url: str, source_tag: str) -> list[dict]:
         resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         feed = feedparser.parse(resp.content)
-    except Exception:
-        feed = feedparser.parse(url, agent=headers['User-Agent'])
+    except Exception as exc:
+        logging.warning(f'[RSS] {name}: fetch failed, skip feed parse fallback - {exc}')
+        return []
         
     if getattr(feed, 'bozo', False) and not getattr(feed, 'entries', False):
         return []

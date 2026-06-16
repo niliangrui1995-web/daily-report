@@ -502,6 +502,78 @@ class TestScraperUtils:
 class TestP1WebTimeWindow:
     """测试 P1 Web 的时间窗筛选逻辑"""
 
+    def test_web_source_config_replaces_persistent_fierce_403(self):
+        from config import WEB_SCRAPE_SOURCES
+
+        sources_by_name = {source["name"]: source for source in WEB_SCRAPE_SOURCES}
+        assert "FierceTelecom" not in sources_by_name
+        assert "TotalTelecom" in sources_by_name
+        assert "entry-title" in sources_by_name["TotalTelecom"]["selector"]
+
+    def test_digitimes_has_fast_web_fallback(self):
+        from config import WEB_SCRAPE_SOURCES
+        from p1_web import SOURCE_TIMEOUT
+
+        source = next(source for source in WEB_SCRAPE_SOURCES if source["name"] == "DIGITIMES_TW")
+        assert source["timeout"] < SOURCE_TIMEOUT
+        assert source["fallback_urls"] == ["https://www.digitimes.com/tech/"]
+
+    def test_scrape_one_source_uses_fallback_url_after_timeout(self, monkeypatch):
+        import p1_web
+
+        calls = []
+
+        class FakeResponse:
+            text = '<html><body><a href="/news/a">Fallback article</a></body></html>'
+
+            def raise_for_status(self):
+                return None
+
+        class FakeElement:
+            text = "Fallback article"
+            attrib = {"href": "/news/a"}
+
+        class FakeSelector:
+            def __init__(self, html):
+                self.html = html
+
+            def css(self, selector):
+                return [FakeElement()] if selector == "a.story" else []
+
+        def fake_get(url, **kwargs):
+            calls.append((url, kwargs.get("timeout")))
+            if url == "https://slow.example/primary":
+                raise p1_web.requests.exceptions.Timeout()
+            return FakeResponse()
+
+        monkeypatch.setattr(p1_web, "Selector", FakeSelector, raising=False)
+        monkeypatch.setattr(p1_web.requests, "get", fake_get)
+        monkeypatch.setattr(
+            p1_web,
+            "get_tls_policy_for_url",
+            lambda url: {"verify": True, "tls_mode": "strict", "insecure_fetch": False},
+        )
+        monkeypatch.setattr(p1_web, "log_tls_policy", lambda *args, **kwargs: None)
+
+        entries = p1_web._scrape_one_source(
+            {
+                "name": "DIGITIMES_TW",
+                "url": "https://slow.example/primary",
+                "fallback_urls": ["https://fast.example/fallback"],
+                "selector": "a.story",
+                "title_attr": "text",
+                "link_attr": "href",
+                "timeout": 8,
+            }
+        )
+
+        assert calls == [
+            ("https://slow.example/primary", 8),
+            ("https://fast.example/fallback", 8),
+        ]
+        assert len(entries) == 1
+        assert entries[0]["url"] == "https://fast.example/news/a"
+
     def test_normalize_web_datetime_date_only(self):
         """纯日期字符串应归一化到北京时间当天 23:59:59"""
         from p1_web import _normalize_web_datetime

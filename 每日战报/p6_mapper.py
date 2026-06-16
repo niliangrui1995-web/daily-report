@@ -39,7 +39,6 @@ JSON output hard limits:
 """
 
 HALLUCINATION_MAP = {
-    '佰维存储': '688525',
     '江波龙': '301308',
     '德明利': '001309',
     '兆易创新': '603986',
@@ -74,6 +73,10 @@ HALLUCINATION_MAP = {
     '高新发展': '000628',
     '英维克': '002837'
 }
+CANONICAL_A_SHARE_CODE_MAP = {
+    '佰维存储': '688525',
+}
+HALLUCINATION_MAP.update(CANONICAL_A_SHARE_CODE_MAP)
 HALLUCINATION_MAP.update({
     '沪电股份': '002463',
     '胜宏科技': '300476',
@@ -87,6 +90,23 @@ HALLUCINATION_MAP.update({
     '华天科技': '002185',
     '生益科技': '600183'
 })
+
+
+def _build_canonical_code_guardrail(evidence_text: str) -> str:
+    matched_rules = [
+        (name, code)
+        for name, code in CANONICAL_A_SHARE_CODE_MAP.items()
+        if name in evidence_text
+    ]
+    if not matched_rules:
+        return ''
+
+    lines = [
+        '【确定性 A 股代码规则】',
+        '以下公司一旦被选入 targets，code 必须使用 canonical 代码，禁止模型自行改写：',
+    ]
+    lines.extend(f'- {name} -> {code}' for name, code in matched_rules)
+    return '\n'.join(lines)
 
 
 def format_evidence(results: list[dict]) -> str:
@@ -128,6 +148,7 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
         current_time=now_str,
         evidence_len=len(evidence_text),
         oligarch_display=oligarch_display,
+        canonical_code_guardrail=_build_canonical_code_guardrail(evidence_text),
         evidence_text=evidence_text,
         dedup_section=dedup_section
     )

@@ -49,6 +49,7 @@ SOURCE_CONTENT_SELECTORS = {
     'HackerNews': ['.article-body p', '.post-content p', '.entry-content p', 'article p', '.content p'],
     'Lightwave': ['.article-body p', '.post-content p', '.entry-content p', 'article p', '.content p'],
     'FierceTelecom': ['.article-body p', '.post-content p', '.entry-content p', 'article p', '.content p'],
+    'TotalTelecom': ['article p', '.entry-content p', '.post-content p', '.td-post-content p'],
 
     'DataCenterKnowledge': ['.article-content p', '.post-content p', '.entry-content p', 'article p'],
     'TheElec_KR': ['.article-body p', '.view-content p', '.entry-content p', 'article p'],
@@ -63,9 +64,12 @@ URL_BLACKLIST = ['/media-library', '/contact-media', '/about-us', '/privacy', '/
 CONTENT_NOISE_KEYWORDS = ['cookie', 'privacy', 'subscribe', 'newsletter', 'sign up', 'log in', 'advertisement', 'javascript', '©', 'all rights reserved']
 
 WEB_SCRAPE_SOURCES = [
-    {'name': 'DIGITIMES_TW', 'url': 'https://www.digitimes.com.tw/', 'selector': "a[href*='/tech/'], a[href*='/news/'], h2 a, h3 a, .article-title a, .news-title a, .list-title a", 'title_attr': 'text', 'link_attr': 'href', 'category': '台湾供应鏈', 'fetcher': 'http'},
+    {'name': 'DIGITIMES_TW', 'url': 'https://www.digitimes.com.tw/', 'fallback_urls': ['https://www.digitimes.com/tech/'], 'timeout': 8, 'selector': "a[href*='/tech/'], a[href*='/news/'], h2 a, h3 a, .article-title a, .news-title a, .list-title a", 'title_attr': 'text', 'link_attr': 'href', 'category': '台湾供应鏈', 'fetcher': 'http'},
     {'name': 'TrendForce', 'url': 'https://www.trendforce.com/presscenter', 'selector': "a[href*='/presscenter/'], a[href*='/news/'], h3 a, .press-title a, .news-item a, article a, .list-item a", 'title_attr': 'text', 'link_attr': 'href', 'category': '半导体市场研究', 'fetcher': 'http'},
     {'name': 'ASML_News', 'url': 'https://www.asml.com/en/news', 'selector': "a[href*='/news/'], a.card-news__link, h3 a", 'title_attr': 'text', 'link_attr': 'href', 'category': '产业链动态', 'fetcher': 'http'},
     {'name': 'Lightwave', 'url': 'https://www.lightwaveonline.com/home', 'selector': "a.title-wrapper, a[href*='/home/article/'], a[href*='/fttx/'], a[href*='/optical-tech/'], h3 a", 'title_attr': 'text', 'link_attr': 'href', 'category': '光通信产业链', 'fetcher': 'http'},
-    {'name': 'FierceTelecom', 'url': 'https://www.fierce-network.com/broadband', 'selector': "a[href*='/broadband/'], a[href*='/telecom/'], a[href*='/fiber/'], h2 a, h3 a, article a", 'title_attr': 'text', 'link_attr': 'href', 'category': '光通信产业链', 'fetcher': 'http'}
+    # 2026-06-16: FierceTelecom/Fierce Network repeated local 403 or connection reset in 20260611/12/15/16 P1 logs.
+    # Use TotalTelecom for reachable telecom/broadband coverage until Fierce Network becomes fetchable again.
+    # Disabled source URL: https://www.fierce-network.com/broadband
+    {'name': 'TotalTelecom', 'url': 'https://www.totaltele.com/', 'selector': "article h3 a, h3.entry-title a, .entry-title a", 'title_attr': 'text', 'link_attr': 'href', 'category': '光通信产业链', 'fetcher': 'http'}
 ]

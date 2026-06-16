@@ -52,6 +52,15 @@ HEADERS = {
 
 SOURCE_TIMEOUT = 20
 
+
+def _source_candidate_urls(source_cfg: dict) -> list[str]:
+    urls = []
+    for candidate in [source_cfg['url'], *source_cfg.get('fallback_urls', [])]:
+        if candidate and candidate not in urls:
+            urls.append(candidate)
+    return urls
+
+
 _WEB_DATE_PATTERNS = [
     re.compile(
         r'(?P<dt>\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?(?:\s?(?:Z|UTC|GMT|[+-]\d{2}:?\d{2}))?)',
@@ -207,74 +216,82 @@ def _scrape_one_source(source_cfg: dict) -> list[dict]:
         logging.warning(f'[Web] {name}: 未配置 CSS 选择器，跳过')
         return []
         
-    try:
-        tls_policy = get_tls_policy_for_url(url)
-        log_tls_policy('P1 Web', url, tls_policy)
-        resp = requests.get(url, headers=HEADERS, timeout=SOURCE_TIMEOUT, verify=tls_policy['verify'])
-        resp.raise_for_status()
-    except requests.exceptions.Timeout:
-        logging.warning(f'[Web] {name}: 请求超时 ({SOURCE_TIMEOUT}s)')
-        return []
-    except requests.exceptions.HTTPError as exc:
-        logging.warning(f'[Web] {name}: HTTP {exc.response.status_code}')
-        return []
-    except Exception as exc:
-        logging.warning(f'[Web] {name}: 请求失败 - {exc}')
-        return []
-        
-    try:
-        page = Selector(resp.text)
-    except Exception as exc:
-        logging.warning(f'[Web] {name}: HTML 解析失败 - {exc}')
-        return []
-        
-    try:
-        elements = page.css(selector)
-    except Exception as exc:
-        logging.warning(f'[Web] {name}: CSS 选择器异常 ({selector}) - {exc}')
-        return []
-        
-    if not elements:
-        fallback_selectors = ['h2 a', 'h3 a', 'article a', '.title a', 'a[title]']
-        for fb_sel in fallback_selectors:
-            try:
-                fb_elems = page.css(fb_sel)
-                if fb_elems and len(fb_elems) >= 3:
-                    logging.info(f"[Web] {name}: 主选择器未匹配，自动发现 '{fb_sel}' ({len(fb_elems)} 个)")
-                    elements = fb_elems
-                    break
-            except Exception as e:
-                logging.warning(f"[P1 Web] 解析选择器异常: {e}")
-                continue
-                
-    if not elements:
-        logging.info(f'[Web] {name}: 所有选择器均未匹配（网站可能改版或需要 JS 渲染）')
-        return []
-        
-    entries = []
-    for el in elements[:max_items]:
-        if title_attr == 'text':
-            title = el.text.strip() if hasattr(el, 'text') and el.text else ''
-        else:
-            title = el.attrib.get(title_attr, '').strip() if hasattr(el, 'attrib') else ''
-            
-        if not title or len(title) < 4:
+    source_timeout = source_cfg.get('timeout', SOURCE_TIMEOUT)
+
+    for fetch_url in _source_candidate_urls(source_cfg):
+        try:
+            tls_policy = get_tls_policy_for_url(fetch_url)
+            log_tls_policy('P1 Web', fetch_url, tls_policy)
+            resp = requests.get(fetch_url, headers=HEADERS, timeout=source_timeout, verify=tls_policy['verify'])
+            resp.raise_for_status()
+        except requests.exceptions.Timeout:
+            logging.warning(f'[Web] {name}: 请求超时 ({source_timeout}s) - {fetch_url}')
             continue
-            
-        raw_link = el.attrib.get(link_attr, '') if hasattr(el, 'attrib') else ''
-        link = urljoin(url, raw_link) if raw_link else ''
-        published_at = _extract_web_published_at(resp.text, raw_link, link, title)
-        
-        entries.append({
-            'title': title,
-            'content': '',
-            'url': link,
-            'published_at': published_at,
-            'source': name,
-            'tls_mode': tls_policy['tls_mode'],
-            'insecure_fetch': tls_policy['insecure_fetch'],
-        })
-    return entries
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 'unknown'
+            logging.warning(f'[Web] {name}: HTTP {status_code} - {fetch_url}')
+            continue
+        except Exception as exc:
+            logging.warning(f'[Web] {name}: 请求失败 - {exc} - {fetch_url}')
+            continue
+
+        try:
+            page = Selector(resp.text)
+        except Exception as exc:
+            logging.warning(f'[Web] {name}: HTML 解析失败 - {exc} - {fetch_url}')
+            continue
+
+        try:
+            elements = page.css(selector)
+        except Exception as exc:
+            logging.warning(f'[Web] {name}: CSS 选择器异常 ({selector}) - {exc} - {fetch_url}')
+            continue
+
+        if not elements:
+            fallback_selectors = ['h2 a', 'h3 a', 'article a', '.title a', 'a[title]']
+            for fb_sel in fallback_selectors:
+                try:
+                    fb_elems = page.css(fb_sel)
+                    if fb_elems and len(fb_elems) >= 3:
+                        logging.info(f"[Web] {name}: 主选择器未匹配，自动发现 '{fb_sel}' ({len(fb_elems)} 个)")
+                        elements = fb_elems
+                        break
+                except Exception as e:
+                    logging.warning(f"[P1 Web] 解析选择器异常: {e}")
+                    continue
+
+        if not elements:
+            logging.info(f'[Web] {name}: 所有选择器均未匹配（网站可能改版或需要 JS 渲染）- {fetch_url}')
+            continue
+
+        entries = []
+        for el in elements[:max_items]:
+            if title_attr == 'text':
+                title = el.text.strip() if hasattr(el, 'text') and el.text else ''
+            else:
+                title = el.attrib.get(title_attr, '').strip() if hasattr(el, 'attrib') else ''
+
+            if not title or len(title) < 4:
+                continue
+
+            raw_link = el.attrib.get(link_attr, '') if hasattr(el, 'attrib') else ''
+            link = urljoin(fetch_url, raw_link) if raw_link else ''
+            published_at = _extract_web_published_at(resp.text, raw_link, link, title)
+
+            entries.append({
+                'title': title,
+                'content': '',
+                'url': link,
+                'published_at': published_at,
+                'source': name,
+                'tls_mode': tls_policy['tls_mode'],
+                'insecure_fetch': tls_policy['insecure_fetch'],
+            })
+
+        if entries:
+            return entries
+
+    return []
 
 def _entries_to_p1_result(entries: list[dict], category: str, source_name: str, hours: int) -> dict | None:
     filtered = []

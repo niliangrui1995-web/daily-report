@@ -214,6 +214,142 @@ def test_backfill_sniper_tables_from_p8_price_json():
     assert row["weekly_level"] == "金叉上方，站上，上行"
 
 
+def test_apply_tdx_stock_codes_to_report_overrides_model_codes(monkeypatch):
+    import p9_reporter
+
+    payload = {
+        "sniper_tables": [
+            {
+                "track_name": "存储",
+                "targets": [{"name": "佰维存储", "code": "300667"}],
+            }
+        ],
+        "today_advice": [{"name": "佰维存储", "code": "300667"}],
+    }
+
+    monkeypatch.setattr(p9_reporter, "load_tdx_stock_code_map", lambda: {"佰维存储": "688525"})
+
+    metrics = p9_reporter._apply_tdx_stock_codes_to_report(payload)
+
+    assert payload["sniper_tables"][0]["targets"][0]["code"] == "688525"
+    assert payload["today_advice"][0]["code"] == "688525"
+    assert metrics["p9_model_codes_ignored"] == 2
+
+
+def test_p9_prompt_no_longer_asks_model_for_stock_codes():
+    from pathlib import Path
+
+    prompt = (Path(__file__).resolve().parents[1] / "prompts" / "p9_report.txt").read_text(encoding="utf-8")
+
+    assert '"code":' not in prompt
+    assert "不要输出 `code` 字段" in prompt
+
+
+def test_p9_risk_analysis_overrides_model_codes_from_local_tdx(monkeypatch):
+    import p9_reporter
+
+    captured: dict[str, object] = {}
+
+    def fake_write_json_artifact(prefix, data, **kwargs):
+        captured["json_payload"] = copy.deepcopy(data)
+        return "dummy.json"
+
+    monkeypatch.setattr(
+        p9_reporter,
+        "require_prompt",
+        lambda name: "{today_str}\n{p5_evidence}\n{p7_section}\n{p6_mapping}\n{p75_section}\n{price_data}\n{p2_section}\n{p3_section}\n{yfinance_section}",
+    )
+    monkeypatch.setattr(
+        p9_reporter.opus_adapter,
+        "invoke",
+        lambda prompt: SimpleNamespace(
+            content=json.dumps(
+                {
+                    "x_intel_snipe": [],
+                    "p3_machine_intel": [],
+                    "core_signals": [],
+                    "sniper_tables": [
+                        {
+                            "track_name": "存储链",
+                            "targets": [
+                                {
+                                    "name": "佰维存储",
+                                    "code": "300667",
+                                    "price": "未提供",
+                                    "chg_3m": "未提供",
+                                    "percentile_250d": "未提供",
+                                    "volume": "未提供",
+                                    "rs_strength": "未提供",
+                                    "weekly_level": "未提供",
+                                    "elasticity": "高弹",
+                                    "catalyst": "存储景气",
+                                    "risk": "🟡",
+                                }
+                            ],
+                        }
+                    ],
+                    "fund_pathway": [],
+                    "today_advice": [
+                        {
+                            "priority": "★★",
+                            "name": "佰维存储",
+                            "code": "300667",
+                            "reason": "存储需求上行",
+                            "strategy": "观察低吸",
+                            "confidence": 0.82,
+                            "evidence_refs": ["P6:存储映射", "P8:技术面"],
+                        }
+                    ],
+                    "risk_warning": [],
+                },
+                ensure_ascii=False,
+            ),
+            thinking_content="",
+        ),
+    )
+    monkeypatch.setattr(p9_reporter, "load_tdx_stock_code_map", lambda: {"佰维存储": "688525"})
+    monkeypatch.setattr(
+        p9_reporter,
+        "_load_p8_price_db",
+        lambda: {
+            "688525": {
+                "price_data": {
+                    "latest_close": 88,
+                    "chg_3m_pct": 12.3,
+                    "percentile_250d": 91,
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(p9_reporter, "write_text_artifact", lambda *args, **kwargs: "dummy.md")
+    monkeypatch.setattr(p9_reporter, "write_json_artifact", fake_write_json_artifact)
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: captured.setdefault("manifest_updates", []).append((args, kwargs)),
+    )
+
+    report, _ = p9_reporter.p9_risk_analysis(
+        p5_evidence="P5 evidence",
+        p7_deep="P7 evidence",
+        p75_supplement="P7.5 evidence",
+        p6_mapping="P6 mapping",
+        price_data="P8 price data " * 10,
+        p2_x_intel_data="P2 data",
+        p3_intel_data="P3 data",
+        p4_yfinance="P4 data",
+    )
+
+    payload = captured["json_payload"]
+    row = payload["sniper_tables"][0]["targets"][0]
+
+    assert row["code"] == "688525"
+    assert row["price"] == "88.00"
+    assert payload["today_advice"][0]["code"] == "688525"
+    assert "688525" in report
+    assert "300667" not in report
+
+
 def test_p9_risk_analysis_applies_guardrails_before_rendering(monkeypatch):
     import p9_reporter
 
@@ -259,6 +395,7 @@ def test_p9_risk_analysis_applies_guardrails_before_rendering(monkeypatch):
         ),
     )
     monkeypatch.setattr(p9_reporter, "_load_p8_price_db", lambda: {})
+    monkeypatch.setattr(p9_reporter, "load_tdx_stock_code_map", lambda: {"生益科技": "600183"})
     monkeypatch.setattr(p9_reporter, "write_text_artifact", lambda *args, **kwargs: "dummy.md")
     monkeypatch.setattr(
         p9_reporter,

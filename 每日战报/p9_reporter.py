@@ -15,6 +15,7 @@ from artifact_store import (
 from p9_email import send_report_via_email
 from p9_rendering import build_report_markdown
 from settings import EMAIL_ADDRESS, EMAIL_PASSWORD, RECEIVER_EMAIL, opus_adapter, require_prompt
+from tdx_stock_universe import load_tdx_stock_code_map, normalize_stock_name
 from utils import extract_json_from_llm_response
 
 _HARD_EVIDENCE_LAYERS = {"P4", "P5", "P6", "P7", "P7A", "P8"}
@@ -43,6 +44,7 @@ _REQUIRED_REPORT_KEYS = (
     "risk_warning",
 )
 _MISSING_FIELD_VALUES = {"", "无", "未提供", "-", "N/A", "n/a", "None", "null"}
+UNMAPPED_CODE_PLACEHOLDER = "N/A"
 
 
 def _parse_report_payload(raw_content: str) -> dict[str, Any]:
@@ -161,6 +163,73 @@ def _backfill_soft_intel_sections(
 def _normalize_stock_code(value: Any) -> str:
     match = re.search(r"\d{6}", str(value or ""))
     return match.group(0) if match else ""
+
+
+def _stock_name_lookup_keys(name: Any) -> list[str]:
+    raw_name = str(name or "").strip()
+    if not raw_name:
+        return []
+
+    compact_name = normalize_stock_name(raw_name)
+    without_code = re.sub(r"[\s（(【\[]*\d{6}[\s）)】\]]*", "", compact_name).strip()
+
+    keys: list[str] = []
+    for key in (raw_name, compact_name, without_code, normalize_stock_name(without_code)):
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _lookup_tdx_stock_code(stock_code_map: dict[str, str], name: Any) -> str:
+    for key in _stock_name_lookup_keys(name):
+        local_code = stock_code_map.get(key)
+        if local_code:
+            return local_code
+    return ""
+
+
+def _apply_tdx_stock_codes_to_report(data: dict[str, Any]) -> dict[str, int]:
+    stock_code_map = load_tdx_stock_code_map()
+    metrics = {
+        "p9_codes_filled_from_tdx": 0,
+        "p9_model_codes_ignored": 0,
+        "p9_unmapped_codes": 0,
+    }
+
+    def apply_row(row: Any, section: str) -> None:
+        if not isinstance(row, dict):
+            return
+
+        name = str(row.get("name", "")).strip()
+        raw_code = str(row.get("code", "")).strip()
+        local_code = _lookup_tdx_stock_code(stock_code_map, name)
+        if local_code:
+            if raw_code and raw_code != local_code:
+                metrics["p9_model_codes_ignored"] += 1
+                logging.warning("[P9 local code override] %s ignored model code=%s -> %s (%s)", name, raw_code, local_code, section)
+            elif not raw_code:
+                metrics["p9_codes_filled_from_tdx"] += 1
+            row["code"] = local_code
+            return
+
+        if raw_code and raw_code != UNMAPPED_CODE_PLACEHOLDER:
+            metrics["p9_model_codes_ignored"] += 1
+            logging.warning("[P9 local code missing] %s ignored model code=%s (%s)", name, raw_code, section)
+        row["code"] = UNMAPPED_CODE_PLACEHOLDER
+        metrics["p9_unmapped_codes"] += 1
+
+    for table_index, table in enumerate(data.get("sniper_tables", []) or []):
+        targets = table.get("targets", []) if isinstance(table, dict) else []
+        for row_index, row in enumerate(targets):
+            apply_row(row, f"sniper_tables[{table_index}].targets[{row_index}]")
+
+    for row_index, row in enumerate(data.get("sniper_table", []) or []):
+        apply_row(row, f"sniper_table[{row_index}]")
+
+    for row_index, row in enumerate(data.get("today_advice", []) or []):
+        apply_row(row, f"today_advice[{row_index}]")
+
+    return metrics
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -513,6 +582,9 @@ def p9_risk_analysis(
         data, guardrail_metrics = _apply_evidence_guardrails(data)
         if any(guardrail_metrics.values()):
             logging.info("[P9] applied evidence guardrails: %s", guardrail_metrics)
+        code_metrics = _apply_tdx_stock_codes_to_report(data)
+        if any(code_metrics.values()):
+            logging.info("[P9] applied local TDX stock codes: %s", code_metrics)
         soft_intel_metrics = _backfill_soft_intel_sections(
             data,
             p2_x_intel_data=p2_x_intel_data,
@@ -539,6 +611,7 @@ def p9_risk_analysis(
                     "markdown_chars": len(result),
                     "raw_output_chars": len(raw_content),
                     **guardrail_metrics,
+                    **code_metrics,
                     **soft_intel_metrics,
                     **p8_backfill_metrics,
                 },
@@ -553,6 +626,7 @@ def p9_risk_analysis(
                     "markdown_chars": len(result),
                     "raw_output_chars": len(raw_content),
                     **guardrail_metrics,
+                    **code_metrics,
                     **soft_intel_metrics,
                     **p8_backfill_metrics,
                 },

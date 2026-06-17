@@ -282,6 +282,7 @@ class TestP8AndP9Simulation:
         monkeypatch.setattr(p9_reporter, "EMAIL_ADDRESS", "")
         monkeypatch.setattr(p9_reporter, "EMAIL_PASSWORD", "")
         monkeypatch.setattr(p9_reporter, "RECEIVER_EMAIL", "")
+        monkeypatch.setattr(p9_reporter, "load_tdx_stock_code_map", lambda: {"生益科技": "600183"})
 
         report, run_ts = p9_reporter.p9_risk_analysis(
             p5_evidence="P5 evidence",

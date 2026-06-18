@@ -18,7 +18,7 @@ import random
 import re
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, ALL_COMPLETED
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from scraper_utils import enrich_article_url, is_article_url as _is_article_url
@@ -51,6 +51,15 @@ HEADERS = {
 }
 
 SOURCE_TIMEOUT = 20
+_FUTURE_TIME_GRACE = timedelta(minutes=10)
+_ASML_NEWS_NAV_PATHS = frozenset({
+    '/en/news',
+    '/en/news/stories',
+    '/en/news/share-buyback',
+    '/en/news/media-library',
+    '/en/news/contact-media-relations',
+    '/en/news/news-subscription',
+})
 
 
 def _source_candidate_urls(source_cfg: dict) -> list[str]:
@@ -59,6 +68,16 @@ def _source_candidate_urls(source_cfg: dict) -> list[str]:
         if candidate and candidate not in urls:
             urls.append(candidate)
     return urls
+
+
+def _is_known_navigation_url(source_name: str, link: str) -> bool:
+    if not link:
+        return False
+    parsed = urlparse(link)
+    path = parsed.path.rstrip('/').lower()
+    if source_name == 'ASML_News' and path in _ASML_NEWS_NAV_PATHS:
+        return True
+    return False
 
 
 _WEB_DATE_PATTERNS = [
@@ -189,6 +208,19 @@ def _classify_time_window(published_at: str | None, hours: int) -> dict:
     try:
         clean = published_at.replace('(北京时间)', '').replace('T', ' ').strip()
         dt = datetime.strptime(clean[:19], '%Y-%m-%d %H:%M:%S').replace(tzinfo=BEIJING_TZ)
+        now = datetime.now(BEIJING_TZ)
+        if dt.year < now.year - 2 or dt.year > now.year + 1:
+            return {
+                'allowed': False,
+                'time_status': 'invalid_time',
+                'time_reason': f'year_out_of_range:{dt.year}',
+            }
+        if dt > now + _FUTURE_TIME_GRACE:
+            return {
+                'allowed': False,
+                'time_status': 'future',
+                'time_reason': 'published_at_in_future',
+            }
         cutoff = datetime.now(BEIJING_TZ) - timedelta(hours=hours)
         is_recent = dt >= cutoff
         return {
@@ -276,6 +308,8 @@ def _scrape_one_source(source_cfg: dict) -> list[dict]:
 
             raw_link = el.attrib.get(link_attr, '') if hasattr(el, 'attrib') else ''
             link = urljoin(fetch_url, raw_link) if raw_link else ''
+            if link and (not _is_article_url(link) or _is_known_navigation_url(name, link)):
+                continue
             published_at = _extract_web_published_at(resp.text, raw_link, link, title)
 
             entries.append({
@@ -300,6 +334,8 @@ def _entries_to_p1_result(entries: list[dict], category: str, source_name: str, 
         'unknown_time': 0,
         'stale': 0,
         'parse_failed': 0,
+        'future': 0,
+        'invalid_time': 0,
     }
     for entry in entries:
         time_window = _classify_time_window(entry.get('published_at'), hours)
@@ -366,6 +402,8 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
         'time_unknown': 0,
         'time_stale': 0,
         'time_parse_failed': 0,
+        'time_future': 0,
+        'time_invalid': 0,
     }
     
     if not _parser_available:
@@ -420,6 +458,8 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
                     stats['time_unknown'] += int(time_window_stats.get('unknown_time', 0))
                     stats['time_stale'] += int(time_window_stats.get('stale', 0))
                     stats['time_parse_failed'] += int(time_window_stats.get('parse_failed', 0))
+                    stats['time_future'] += int(time_window_stats.get('future', 0))
+                    stats['time_invalid'] += int(time_window_stats.get('invalid_time', 0))
                     all_results.append(result)
                     stats['success'].append((source_name, n_items))
                     logging.info(f'  ✅ {source_name}: {n_items} 条')

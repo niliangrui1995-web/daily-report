@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from artifact_store import (
+    UTF8_FILE_ENCODING,
     configure_utf8_environment,
     get_error_log_path,
     get_manifest_path,
@@ -79,7 +80,7 @@ def configure_run_logging() -> None:
         get_pipeline_log_path(),
         maxBytes=10 * 1024 * 1024,
         backupCount=5,
-        encoding="utf-8",
+        encoding=UTF8_FILE_ENCODING,
     )
     pipeline_handler.setLevel(logging.INFO)
     pipeline_handler.setFormatter(formatter)
@@ -89,7 +90,7 @@ def configure_run_logging() -> None:
         get_error_log_path(),
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
-        encoding="utf-8",
+        encoding=UTF8_FILE_ENCODING,
     )
     error_handler.setLevel(logging.ERROR)
     error_handler.setFormatter(formatter)

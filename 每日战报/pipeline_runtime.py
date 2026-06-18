@@ -45,7 +45,7 @@ def _configure_child_logging() -> None:
         return
 
     try:
-        pipeline_handler = logging.FileHandler(get_pipeline_log_path(), encoding="utf-8")
+        pipeline_handler = logging.FileHandler(get_pipeline_log_path(), encoding=UTF8_FILE_ENCODING)
         pipeline_handler.setLevel(logging.INFO)
         pipeline_handler.setFormatter(formatter)
         root_logger.addHandler(pipeline_handler)
@@ -53,7 +53,7 @@ def _configure_child_logging() -> None:
         pass
 
     try:
-        error_handler = logging.FileHandler(get_error_log_path(), encoding="utf-8")
+        error_handler = logging.FileHandler(get_error_log_path(), encoding=UTF8_FILE_ENCODING)
         error_handler.setLevel(logging.ERROR)
         error_handler.setFormatter(formatter)
         root_logger.addHandler(error_handler)

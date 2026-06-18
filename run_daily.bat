@@ -12,6 +12,8 @@ if not defined RUN_DAILY_HOLD_SECONDS set "RUN_DAILY_HOLD_SECONDS=15"
 if not defined RUN_DAILY_PREFLIGHT set "RUN_DAILY_PREFLIGHT=strict"
 if not defined RUN_DAILY_AUTO_RESUME set "RUN_DAILY_AUTO_RESUME=on"
 if not defined RUN_DAILY_RESUME_DELAY_SECONDS set "RUN_DAILY_RESUME_DELAY_SECONDS=10"
+if not defined PYTHONUTF8 set "PYTHONUTF8=1"
+if not defined PYTHONIOENCODING set "PYTHONIOENCODING=utf-8:replace"
 
 for /d %%D in ("%ROOT_DIR%*") do (
     if exist "%%~fD\pipeline_cli.py" (

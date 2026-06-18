@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 import sys
 import time
@@ -574,6 +575,37 @@ class TestReportStage:
 
 
 class TestPreflightChecks:
+    def test_run_logging_writes_chinese_logs_as_utf8_sig(self, monkeypatch, tmp_path):
+        import pipeline_cli
+
+        pipeline_log = tmp_path / "pipeline.log"
+        error_log = tmp_path / "error.log"
+        root_logger = logging.getLogger()
+        previous_handlers = root_logger.handlers[:]
+        previous_level = root_logger.level
+
+        monkeypatch.setattr(pipeline_cli, "get_pipeline_log_path", lambda: str(pipeline_log))
+        monkeypatch.setattr(pipeline_cli, "get_error_log_path", lambda: str(error_log))
+
+        pipeline_cli.configure_run_logging()
+        try:
+            logging.info("中文日志落盘验证：生益科技")
+            logging.error("错误日志落盘验证：中际旭创")
+            for handler in root_logger.handlers:
+                handler.flush()
+        finally:
+            for handler in root_logger.handlers[:]:
+                root_logger.removeHandler(handler)
+                handler.close()
+            for handler in previous_handlers:
+                root_logger.addHandler(handler)
+            root_logger.setLevel(previous_level)
+
+        assert pipeline_log.read_bytes().startswith(b"\xef\xbb\xbf")
+        assert error_log.read_bytes().startswith(b"\xef\xbb\xbf")
+        assert "中文日志落盘验证：生益科技" in pipeline_log.read_text(encoding="utf-8-sig")
+        assert "错误日志落盘验证：中际旭创" in error_log.read_text(encoding="utf-8-sig")
+
     def test_run_blocks_before_orchestrator_when_strict_preflight_fails(self, monkeypatch):
         import pipeline_cli
 

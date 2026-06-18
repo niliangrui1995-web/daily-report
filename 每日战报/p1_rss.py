@@ -34,6 +34,7 @@ from scraper_utils import is_article_url as _is_article_url
 from utils import parse_backtrack_hours
 
 BEIJING_TZ = timezone(timedelta(hours=8))
+_FUTURE_TIME_GRACE = timedelta(minutes=10)
 
 try:
     from scraper_utils import scrapling_available as _scrapling_available
@@ -172,28 +173,62 @@ def _fetch_hackernews() -> list[dict]:
             logging.debug(f'Ignored timeout item_id exception: {item_id}')
 
     return entries
-def _is_within_window(published_at: str | None, hours: int) -> bool:
-    if not published_at:
-        return True
+def _parse_published_datetime(published_at: str) -> datetime | None:
+    is_beijing = '(北京时间)' in published_at
+    clean = published_at.replace('(北京时间)', '').replace('Z', '+00:00').replace('T', ' ').strip()
+    clean = re.sub(r'(\d{1,2}:\d{2})([ap])\b', r'\1\2m', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'\s+', ' ', clean)
+
     try:
-        is_beijing = '(北京时间)' in published_at
-        clean = published_at.replace('(北京时间)', '').replace('Z', '+00:00').replace('T', ' ').strip()
         try:
             dt = datetime.fromisoformat(clean)
         except ValueError:
-            dt = datetime.strptime(clean[:19], '%Y-%m-%d %H:%M:%S')
-            
+            dt = None
+            for fmt in (
+                '%Y-%m-%d %H:%M:%S',
+                '%Y-%m-%d %H:%M',
+                '%b %d, %Y %I:%M%p',
+                '%b %d, %Y %I:%M %p',
+                '%b %d, %Y %H:%M',
+                '%B %d, %Y %I:%M%p',
+                '%B %d, %Y %I:%M %p',
+                '%B %d, %Y %H:%M',
+                '%b %d, %Y',
+                '%B %d, %Y',
+            ):
+                try:
+                    dt = datetime.strptime(clean[:24], fmt)
+                    break
+                except ValueError:
+                    continue
+            if dt is None:
+                return None
+
         if dt.tzinfo is None:
             if is_beijing:
                 dt = dt.replace(tzinfo=BEIJING_TZ)
             else:
                 dt = dt.replace(tzinfo=timezone.utc)
-                
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-        return dt >= cutoff
+        return dt.astimezone(timezone.utc)
     except Exception as e:
-        logging.debug(f'Ignored return True exception: {e}')
+        logging.debug(f'Ignored unparseable RSS published_at: {published_at} ({e})')
+        return None
+
+def _is_within_window(published_at: str | None, hours: int) -> bool:
+    if not published_at:
         return True
+    dt = _parse_published_datetime(published_at)
+    if dt is None:
+        return False
+
+    now = datetime.now(timezone.utc)
+    if dt.year < now.year - 2 or dt.year > now.year + 1:
+        return False
+    if dt > now + _FUTURE_TIME_GRACE:
+        return False
+
+    cutoff = now - timedelta(hours=hours)
+    return dt >= cutoff
 
 def _enrich_article(entry: dict) -> str:
     if not _scrapling_available:

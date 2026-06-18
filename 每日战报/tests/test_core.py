@@ -572,6 +572,55 @@ class TestP1WebTimeWindow:
         assert len(entries) == 1
         assert entries[0]["url"] == "https://fast.example/news/a"
 
+    def test_scrape_one_source_skips_known_asml_navigation_pages(self, monkeypatch):
+        import p1_web
+
+        class FakeResponse:
+            text = "<html><body>ASML news links</body></html>"
+
+            def raise_for_status(self):
+                return None
+
+        class FakeElement:
+            def __init__(self, text, href):
+                self.text = text
+                self.attrib = {"href": href}
+
+        class FakeSelector:
+            def __init__(self, html):
+                self.html = html
+
+            def css(self, selector):
+                return [
+                    FakeElement("Stories", "/en/news/stories"),
+                    FakeElement("Share buyback", "/en/news/share-buyback"),
+                    FakeElement("Media library", "/en/news/media-library"),
+                    FakeElement("Real ASML article", "/en/news/stories/2026/real-asml-article"),
+                ]
+
+        monkeypatch.setattr(p1_web, "Selector", FakeSelector, raising=False)
+        monkeypatch.setattr(p1_web.requests, "get", lambda *args, **kwargs: FakeResponse())
+        monkeypatch.setattr(
+            p1_web,
+            "get_tls_policy_for_url",
+            lambda url: {"verify": True, "tls_mode": "strict", "insecure_fetch": False},
+        )
+        monkeypatch.setattr(p1_web, "log_tls_policy", lambda *args, **kwargs: None)
+
+        entries = p1_web._scrape_one_source(
+            {
+                "name": "ASML_News",
+                "url": "https://www.asml.com/en/news",
+                "selector": "a[href*='/news/']",
+                "title_attr": "text",
+                "link_attr": "href",
+            }
+        )
+
+        assert len(entries) == 1
+        assert entries[0]["title"] == "Real ASML article"
+        assert entries[0]["url"] == "https://www.asml.com/en/news/stories/2026/real-asml-article"
+
     def test_normalize_web_datetime_date_only(self):
         """纯日期字符串应归一化到北京时间当天 23:59:59"""
         from p1_web import _normalize_web_datetime
@@ -611,6 +660,51 @@ class TestP1WebTimeWindow:
         assert "Recent item" in result["text"]
         assert "Old item" not in result["text"]
         assert len(result["grounding_sources"]) == 1
+
+    def test_entries_to_p1_result_filters_future_and_invalid_times(self):
+        from p1_web import _entries_to_p1_result
+
+        bj_tz = timezone(timedelta(hours=8))
+        recent_time = (datetime.now(bj_tz) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S (北京时间)")
+        future_time = (datetime.now(bj_tz) + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S (北京时间)")
+
+        result = _entries_to_p1_result(
+            [
+                {"title": "Recent item", "content": "", "url": "https://example.com/recent", "published_at": recent_time, "source": "Example"},
+                {"title": "Future item", "content": "", "url": "https://example.com/future", "published_at": future_time, "source": "Example"},
+                {"title": "Invalid year item", "content": "", "url": "https://example.com/invalid", "published_at": "6856-01-12T23:59:59 (北京时间)", "source": "Example"},
+            ],
+            "网页采集",
+            "Example",
+            24,
+        )
+
+        assert result is not None
+        assert "Recent item" in result["text"]
+        assert "Future item" not in result["text"]
+        assert "Invalid year item" not in result["text"]
+        assert result["time_window_stats"]["future"] == 1
+        assert result["time_window_stats"]["invalid_time"] == 1
+
+
+class TestP1RssTimeWindow:
+    def test_rss_time_window_parses_fierceelectronics_dates(self):
+        import p1_rss
+
+        recent = (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%b %d, %Y %I:%M%p").replace("AM", "a").replace("PM", "p")
+        old = (datetime.now(timezone.utc) - timedelta(hours=30)).strftime("%b %d, %Y %I:%M%p").replace("AM", "a").replace("PM", "p")
+
+        assert p1_rss._is_within_window(recent, 24) is True
+        assert p1_rss._is_within_window(old, 24) is False
+
+    def test_rss_time_window_drops_future_invalid_and_unparseable_times(self):
+        import p1_rss
+
+        future = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S (北京时间)")
+
+        assert p1_rss._is_within_window(future, 24) is False
+        assert p1_rss._is_within_window("6856-01-12T23:59:59 (北京时间)", 24) is False
+        assert p1_rss._is_within_window("totally-not-a-date", 24) is False
 
 
 # =====================================================================

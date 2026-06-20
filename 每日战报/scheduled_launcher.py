@@ -5,6 +5,7 @@ import subprocess
 import sys
 from datetime import date
 
+from artifact_store import build_runtime_context, record_run_state
 from run_config import get_schedule_decision
 
 
@@ -34,6 +35,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _record_launcher_state(
+    *,
+    status: str,
+    root_cause: str,
+    reason: str,
+    schedule: dict,
+) -> None:
+    try:
+        record_run_state(
+            status=status,
+            root_cause=root_cause,
+            reason=reason,
+            source="scheduled_launcher",
+            schedule=schedule,
+            main_flow_entered=False,
+            runtime_context=build_runtime_context(cwd=os.getcwd()),
+        )
+    except Exception as exc:
+        logging.warning("failed to record launcher state: %s", exc)
+
+
 def main(argv: list[str] | None = None) -> None:
     if argv is None:
         argv = []
@@ -42,9 +64,21 @@ def main(argv: list[str] | None = None) -> None:
     today = date.today()
     schedule = get_schedule_decision(today)
     if not schedule["is_trading_day"]:
+        _record_launcher_state(
+            status="skipped_non_trading_day",
+            root_cause="non_trading_day",
+            reason=str(schedule.get("reason", "today is not a trading day")),
+            schedule=schedule,
+        )
         logging.info("today is not a trading day, skip scheduled run")
         raise SystemExit(0)
     if not schedule["should_run"]:
+        _record_launcher_state(
+            status="skipped_schedule_rule",
+            root_cause="schedule_rule_skip",
+            reason=str(schedule.get("reason", "schedule rule skipped today's run")),
+            schedule=schedule,
+        )
         logging.info("scheduled rule skipped today's run | %s", schedule["reason"])
         raise SystemExit(0)
 
@@ -56,6 +90,12 @@ def main(argv: list[str] | None = None) -> None:
     try:
         result = subprocess.run(cmd, cwd=script_dir)
     except Exception as exc:
+        _record_launcher_state(
+            status="not_entered_main_flow",
+            root_cause="launcher_exception",
+            reason=str(exc),
+            schedule=schedule,
+        )
         logging.error("failed to launch pipeline cli: %s", exc)
         raise SystemExit(1) from exc
 

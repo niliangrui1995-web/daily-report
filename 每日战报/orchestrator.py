@@ -21,6 +21,7 @@ from artifact_store import (
     get_preflight_summary,
     get_pipeline_log_path,
     load_run_manifest,
+    record_run_state,
     set_run_timestamp,
     update_manifest_context,
     update_run_manifest,
@@ -986,9 +987,27 @@ def orchestrator_main(argv: list[str] | None = None):
     if not force_run:
         schedule = get_schedule_decision(now.date())
         if not schedule["is_trading_day"]:
+            record_run_state(
+                status="skipped_non_trading_day",
+                root_cause="non_trading_day",
+                reason=str(schedule.get("reason", "today is not a trading day")),
+                source="orchestrator",
+                schedule=schedule,
+                main_flow_entered=False,
+                runtime_context=build_runtime_context(),
+            )
             logging.info("today is not a trading day, skip run")
             return
         if not schedule["should_run"]:
+            record_run_state(
+                status="skipped_schedule_rule",
+                root_cause="schedule_rule_skip",
+                reason=str(schedule.get("reason", "scheduled rule skipped today's run")),
+                source="orchestrator",
+                schedule=schedule,
+                main_flow_entered=False,
+                runtime_context=build_runtime_context(),
+            )
             logging.info("scheduled rule skipped today's run | %s", schedule["reason"])
             return
 
@@ -1015,6 +1034,14 @@ def orchestrator_main(argv: list[str] | None = None):
         preflight=get_preflight_summary(),
         timestamp=run_ts,
     )
+    record_run_state(
+        status="running",
+        root_cause="orchestrator_started",
+        reason="orchestrator entered main flow",
+        source="orchestrator",
+        main_flow_entered=True,
+        timestamp=run_ts,
+    )
 
     if resume_from == "p9_done":
         logging.info("war report already exists for today, skip run")
@@ -1027,6 +1054,14 @@ def orchestrator_main(argv: list[str] | None = None):
                 "force_run": force_run,
                 "total_elapsed_seconds": round(time.time() - total_start, 1),
             },
+            timestamp=run_ts,
+        )
+        record_run_state(
+            status="completed_existing_report",
+            root_cause="checkpoint_p9_done",
+            reason="war report already exists for today",
+            source="orchestrator",
+            main_flow_entered=True,
             timestamp=run_ts,
         )
         return
@@ -1047,6 +1082,14 @@ def orchestrator_main(argv: list[str] | None = None):
             },
             timestamp=run_ts,
         )
+        record_run_state(
+            status=status,
+            root_cause=status,
+            reason=str(exc),
+            source="orchestrator",
+            main_flow_entered=True,
+            timestamp=run_ts,
+        )
         try:
             stage_name = exc.stage_name if isinstance(exc, StageTimeoutError) else context.get("current_stage", start_at or "orchestrator")
             _run_agent_failure_diagnosis(stage_name, exc)
@@ -1063,6 +1106,14 @@ def orchestrator_main(argv: list[str] | None = None):
             "total_elapsed_seconds": round(total_elapsed, 1),
             "final_report_chars": len(context.get("final_report", "") or ""),
         },
+        timestamp=run_ts,
+    )
+    record_run_state(
+        status="completed",
+        root_cause="completed",
+        reason="orchestrator completed",
+        source="orchestrator",
+        main_flow_entered=True,
         timestamp=run_ts,
     )
     logging.info("pipeline finished in %.1fs", total_elapsed)

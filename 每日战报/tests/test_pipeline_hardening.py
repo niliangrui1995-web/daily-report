@@ -10,6 +10,7 @@ import os
 import sys
 import time
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -285,6 +286,38 @@ class TestManifestContext:
         assert manifest["manifest_version"] == 3
         assert manifest["runtime_context"]["python_version"] == "3.12.0"
         assert manifest["preflight"]["exit_code"] == 0
+
+    def test_record_run_state_marks_skip_root_cause_and_context(self, monkeypatch, tmp_path):
+        import artifact_store
+
+        monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+
+        artifact_store.record_run_state(
+            status="skipped_non_trading_day",
+            root_cause="non_trading_day",
+            reason="today is not a trading day",
+            source="scheduled_launcher",
+            schedule={
+                "is_trading_day": False,
+                "should_run": False,
+                "reason": "today is not a trading day",
+                "week_trading_days": [date(2026, 6, 22)],
+                "window_anchor_day": None,
+            },
+            main_flow_entered=False,
+            runtime_context={"entrypoint": "scheduled_launcher"},
+            timestamp="20260620083006",
+        )
+
+        manifest = artifact_store.load_run_manifest()
+        assert manifest["status"] == "skipped_non_trading_day"
+        assert manifest["root_cause"] == "non_trading_day"
+        assert manifest["status_reason"] == "today is not a trading day"
+        assert manifest["main_flow_entered"] is False
+        assert manifest["schedule_decision"]["week_trading_days"] == ["2026-06-22"]
+        assert manifest["runtime_context"]["run_state"] == "skipped_non_trading_day"
+        assert manifest["runtime_context"]["root_cause"] == "non_trading_day"
+        assert manifest["runtime_context"]["main_flow_entered"] is False
 
     def test_manifest_is_written_at_day_root_and_migrates_legacy_file(self, monkeypatch, tmp_path):
         import artifact_store
@@ -637,6 +670,7 @@ class TestPreflightChecks:
         monkeypatch.setattr(pipeline_cli, "_print_preflight", lambda result: result["summary"]["exit_code"])
         monkeypatch.setattr(pipeline_cli, "set_preflight_summary", lambda summary: calls.append(("summary", summary)))
         monkeypatch.setattr(pipeline_cli, "explain_preflight_and_record", lambda result: calls.append("agent"))
+        monkeypatch.setattr(pipeline_cli, "record_run_state", lambda **kwargs: calls.append(("run_state", kwargs)))
         monkeypatch.setattr(pipeline_cli, "configure_run_logging", lambda: calls.append("logging"))
         monkeypatch.setattr(pipeline_cli, "acquire_run_lock", fake_lock)
         monkeypatch.setitem(
@@ -650,6 +684,47 @@ class TestPreflightChecks:
         assert result == pipeline_cli.EXIT_CHECK_FAILED
         assert "lock" not in calls
         assert not any(call[0] == "orchestrator" for call in calls if isinstance(call, tuple))
+        run_state = [call[1] for call in calls if isinstance(call, tuple) and call[0] == "run_state"][-1]
+        assert run_state["status"] == "not_entered_main_flow"
+        assert run_state["root_cause"] == "preflight_failed"
+        assert run_state["main_flow_entered"] is False
+
+    def test_status_prints_manifest_root_cause(self, monkeypatch, tmp_path, capsys):
+        import pipeline_cli
+
+        manifest = {
+            "run_timestamp": "20260620083006",
+            "status": "skipped_non_trading_day",
+            "root_cause": "non_trading_day",
+            "status_reason": "today is not a trading day",
+            "main_flow_entered": False,
+            "runtime_context": {
+                "run_state": "skipped_non_trading_day",
+                "root_cause": "non_trading_day",
+                "main_flow_entered": False,
+            },
+            "schedule_decision": {
+                "is_trading_day": False,
+                "should_run": False,
+                "reason": "today is not a trading day",
+            },
+            "stages": {},
+        }
+
+        monkeypatch.setattr(pipeline_cli, "get_today_output_dir", lambda: str(tmp_path))
+        monkeypatch.setattr(pipeline_cli, "get_manifest_path", lambda: str(tmp_path / "run_manifest.json"))
+        monkeypatch.setattr(pipeline_cli, "get_output_root_dir", lambda: str(tmp_path))
+        monkeypatch.setattr(pipeline_cli, "load_run_manifest", lambda: manifest)
+        monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: None)
+        monkeypatch.setattr(pipeline_cli, "is_trading_day", lambda _: False)
+
+        result = pipeline_cli.cmd_status(SimpleNamespace())
+
+        output = capsys.readouterr().out
+        assert result == 0
+        assert "run_state: skipped_non_trading_day root_cause=non_trading_day main_flow_entered=no" in output
+        assert "run_reason: today is not a trading day" in output
+        assert "schedule_decision: is_trading_day=no should_run=no reason=today is not a trading day" in output
 
     def test_preflight_strict_returns_lock_exit_code(self, monkeypatch, tmp_path):
         import pipeline_cli

@@ -8,6 +8,7 @@ import sys
 from datetime import date
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any
 
 from artifact_store import (
     UTF8_FILE_ENCODING,
@@ -19,6 +20,7 @@ from artifact_store import (
     get_today_logs_dir,
     get_today_output_dir,
     load_run_manifest,
+    record_run_state,
     set_run_timestamp,
     set_preflight_summary,
     update_run_manifest,
@@ -110,6 +112,14 @@ def _run_orchestrator(flags: list[str], *, command_name: str) -> int:
 
     preflight_exit_code = int(preflight_result.get("summary", {}).get("exit_code", EXIT_CHECK_FAILED))
     if preflight_exit_code != EXIT_OK:
+        record_run_state(
+            status="not_entered_main_flow",
+            root_cause="preflight_failed",
+            reason=f"preflight exit_code={preflight_exit_code}",
+            source=f"pipeline_cli:{command_name}",
+            main_flow_entered=False,
+            runtime_context={"preflight_exit_code": preflight_exit_code},
+        )
         _print_preflight(preflight_result)
         return preflight_exit_code
 
@@ -126,6 +136,14 @@ def _run_orchestrator(flags: list[str], *, command_name: str) -> int:
             info.get("pid", "unknown"),
             info.get("command", "unknown"),
             info.get("started_at", "unknown"),
+        )
+        record_run_state(
+            status="not_entered_main_flow",
+            root_cause="run_lock_active",
+            reason="pipeline lock active",
+            source=f"pipeline_cli:{command_name}",
+            main_flow_entered=False,
+            runtime_context={"lock_info": info},
         )
         return 2
     return 0
@@ -147,16 +165,80 @@ def cmd_restart(_: argparse.Namespace) -> int:
     return _run_orchestrator(["--force-restart"], command_name="restart")
 
 
+def _bool_label(value: Any) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "unknown"
+
+
+def _manifest_schedule(manifest: dict[str, Any], runtime_context: dict[str, Any]) -> dict[str, Any]:
+    schedule = manifest.get("schedule_decision")
+    if isinstance(schedule, dict):
+        return schedule
+    schedule = runtime_context.get("schedule_decision")
+    return schedule if isinstance(schedule, dict) else {}
+
+
+def _manifest_run_state(manifest: dict[str, Any]) -> dict[str, Any]:
+    runtime_context = manifest.get("runtime_context")
+    if not isinstance(runtime_context, dict):
+        runtime_context = {}
+
+    status = str(manifest.get("status") or runtime_context.get("run_state") or "").strip()
+    root_cause = str(manifest.get("root_cause") or runtime_context.get("root_cause") or "").strip()
+    reason = str(manifest.get("status_reason") or runtime_context.get("run_state_reason") or "").strip()
+    main_flow_entered = manifest.get("main_flow_entered", runtime_context.get("main_flow_entered"))
+
+    if not status:
+        stages = manifest.get("stages", {})
+        if isinstance(stages, dict) and stages and "orchestrator" not in stages:
+            status = "not_entered_main_flow"
+            root_cause = "missing_orchestrator_state"
+            reason = "manifest has stages but no root run_state or orchestrator stage"
+            main_flow_entered = False
+        elif isinstance(stages, dict) and not stages:
+            status = "no_run_activity"
+            root_cause = "empty_manifest"
+            reason = "manifest has no stages and no root run_state"
+
+    return {
+        "status": status or "unknown",
+        "root_cause": root_cause or "unknown",
+        "reason": reason,
+        "main_flow_entered": main_flow_entered,
+        "schedule": _manifest_schedule(manifest, runtime_context),
+    }
+
+
 def cmd_status(_: argparse.Namespace) -> int:
     today_dir = Path(get_today_output_dir())
     manifest_path = Path(get_manifest_path())
     manifest = load_run_manifest()
     lock_info = read_run_lock()
+    today_is_trading_day = is_trading_day(date.today())
+    run_state = _manifest_run_state(manifest)
 
     print(f"output_root: {get_output_root_dir()}")
     print(f"today_dir: {today_dir}")
     print(f"manifest: {manifest_path}")
-    print(f"trading_day: {'yes' if is_trading_day(__import__('datetime').date.today()) else 'no'}")
+    print(f"trading_day: {'yes' if today_is_trading_day else 'no'}")
+    print(
+        f"run_state: {run_state['status']} "
+        f"root_cause={run_state['root_cause']} "
+        f"main_flow_entered={_bool_label(run_state['main_flow_entered'])}"
+    )
+    if run_state["reason"]:
+        print(f"run_reason: {run_state['reason']}")
+    schedule = run_state["schedule"]
+    if schedule:
+        print(
+            "schedule_decision:"
+            f" is_trading_day={_bool_label(schedule.get('is_trading_day'))}"
+            f" should_run={_bool_label(schedule.get('should_run'))}"
+            f" reason={schedule.get('reason', '')}"
+        )
 
     if lock_info:
         stale = is_lock_stale(lock_info, stale_after_seconds=6 * 60 * 60)

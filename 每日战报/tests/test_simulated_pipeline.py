@@ -71,6 +71,39 @@ class TestScheduledLauncherSimulation:
         captured = capsys.readouterr()
         assert "usage:" in captured.out
 
+    def test_launcher_records_non_trading_day_skip(self, monkeypatch):
+        import scheduled_launcher
+
+        captured = {}
+        states = []
+
+        monkeypatch.setattr(
+            scheduled_launcher,
+            "get_schedule_decision",
+            lambda d: {
+                "is_trading_day": False,
+                "should_run": False,
+                "reason": "today is not a trading day",
+            },
+        )
+        monkeypatch.setattr(
+            scheduled_launcher.subprocess,
+            "run",
+            lambda cmd, cwd=None: captured.setdefault("called", True),
+        )
+        monkeypatch.setattr(scheduled_launcher, "build_runtime_context", lambda cwd=None: {"cwd": cwd or ""})
+        monkeypatch.setattr(scheduled_launcher, "record_run_state", lambda **kwargs: states.append(kwargs))
+
+        try:
+            scheduled_launcher.main()
+        except SystemExit as exc:
+            assert exc.code == 0
+
+        assert "called" not in captured
+        assert states[-1]["status"] == "skipped_non_trading_day"
+        assert states[-1]["root_cause"] == "non_trading_day"
+        assert states[-1]["main_flow_entered"] is False
+
     def test_launcher_invokes_pipeline_cli_on_trading_day(self, monkeypatch):
         import scheduled_launcher
 
@@ -109,6 +142,7 @@ class TestScheduledLauncherSimulation:
         import scheduled_launcher
 
         captured = {}
+        states = []
 
         monkeypatch.setattr(
             scheduled_launcher,
@@ -124,6 +158,8 @@ class TestScheduledLauncherSimulation:
             "run",
             lambda cmd, cwd=None: captured.setdefault("called", True),
         )
+        monkeypatch.setattr(scheduled_launcher, "build_runtime_context", lambda cwd=None: {"cwd": cwd or ""})
+        monkeypatch.setattr(scheduled_launcher, "record_run_state", lambda **kwargs: states.append(kwargs))
 
         try:
             scheduled_launcher.main()
@@ -131,6 +167,9 @@ class TestScheduledLauncherSimulation:
             assert exc.code == 0
 
         assert "called" not in captured
+        assert states[-1]["status"] == "skipped_schedule_rule"
+        assert states[-1]["root_cause"] == "schedule_rule_skip"
+        assert states[-1]["main_flow_entered"] is False
 
 
 class TestRunDailyBatchSimulation:
@@ -309,6 +348,7 @@ class TestOrchestratorSimulation:
         import orchestrator
 
         captured = {}
+        states = []
 
         monkeypatch.setattr(
             orchestrator,
@@ -324,10 +364,15 @@ class TestOrchestratorSimulation:
             "detect_checkpoint",
             lambda: captured.setdefault("detect_checkpoint_called", True),
         )
+        monkeypatch.setattr(orchestrator, "build_runtime_context", lambda: {"cwd": "test"})
+        monkeypatch.setattr(orchestrator, "record_run_state", lambda **kwargs: states.append(kwargs))
 
         orchestrator.orchestrator_main([])
 
         assert "detect_checkpoint_called" not in captured
+        assert states[-1]["status"] == "skipped_schedule_rule"
+        assert states[-1]["root_cause"] == "schedule_rule_skip"
+        assert states[-1]["main_flow_entered"] is False
 
     def test_orchestrator_main_runs_full_pipeline_offline(self, monkeypatch, tmp_path):
         out_dir = _patch_output_dir(monkeypatch, tmp_path)

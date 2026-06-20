@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -184,6 +184,16 @@ def _normalize_manifest(data: dict[str, Any], *, run_ts: str | None = None) -> d
     data.setdefault("preflight", {})
     data.setdefault("manifest_version", 3)
     return data
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_ready(item) for item in value]
+    return value
 
 
 def _lock_manifest_handle(handle) -> None:
@@ -404,6 +414,61 @@ def update_manifest_context(
                 manifest.setdefault("runtime_context", {}).update(runtime_context)
             if preflight is not None:
                 manifest["preflight"] = preflight
+
+            _write_manifest_file(manifest_path, manifest)
+            _cleanup_legacy_manifest(manifest_path)
+
+    return manifest_path
+
+
+def record_run_state(
+    *,
+    status: str,
+    root_cause: str,
+    reason: str = "",
+    source: str = "",
+    schedule: dict[str, Any] | None = None,
+    main_flow_entered: bool | None = None,
+    runtime_context: dict[str, Any] | None = None,
+    timestamp: str | None = None,
+) -> str:
+    manifest_path = get_manifest_path()
+    env_run_ts = os.environ.get(RUN_TIMESTAMP_ENV, "").strip()
+    initial_run_ts = timestamp or env_run_ts or datetime.now().strftime("%Y%m%d%H%M%S")
+
+    with _MANIFEST_LOCK:
+        with _manifest_file_lock():
+            manifest = _load_manifest_for_write(initial_run_ts)
+            run_ts = timestamp or env_run_ts or manifest.get("run_timestamp") or initial_run_ts
+            manifest["run_timestamp"] = run_ts
+            manifest["updated_at"] = datetime.now().isoformat()
+            manifest["manifest_version"] = 3
+            manifest["status"] = status
+            manifest["root_cause"] = root_cause
+            manifest["status_reason"] = reason
+            if source:
+                manifest["status_source"] = source
+            if main_flow_entered is not None:
+                manifest["main_flow_entered"] = bool(main_flow_entered)
+            if schedule is not None:
+                manifest["schedule_decision"] = _json_ready(schedule)
+
+            context = manifest.setdefault("runtime_context", {})
+            context.update(
+                {
+                    "run_state": status,
+                    "root_cause": root_cause,
+                    "run_state_reason": reason,
+                }
+            )
+            if source:
+                context["run_state_source"] = source
+            if main_flow_entered is not None:
+                context["main_flow_entered"] = bool(main_flow_entered)
+            if schedule is not None:
+                context["schedule_decision"] = _json_ready(schedule)
+            if runtime_context:
+                context.update(_json_ready(runtime_context))
 
             _write_manifest_file(manifest_path, manifest)
             _cleanup_legacy_manifest(manifest_path)

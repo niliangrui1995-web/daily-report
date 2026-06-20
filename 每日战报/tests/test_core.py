@@ -124,6 +124,15 @@ class TestRunSchedule:
         backtrack = run_config.get_run_config(datetime(2026, 4, 22, 8, 50))
         assert backtrack == "24h"
 
+    def test_dragon_boat_resume_caps_auto_backtrack_at_weekend_window(self):
+        import run_config
+
+        decision = run_config.get_schedule_decision(date(2026, 6, 22))
+
+        assert decision["should_run"] is True
+        assert decision["window_anchor_day"] == date(2026, 6, 18)
+        assert run_config.get_run_config(datetime(2026, 6, 22, 8, 30)) == "72h"
+
 
 # =====================================================================
 # 2. 产业链字典测试
@@ -686,6 +695,43 @@ class TestP1WebTimeWindow:
         assert result["time_window_stats"]["future"] == 1
         assert result["time_window_stats"]["invalid_time"] == 1
 
+    def test_scheduled_holiday_resume_does_not_reopen_old_web_items(self, monkeypatch):
+        import p1_web
+        import run_config
+        from p1_web import _entries_to_p1_result
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                fixed_now = datetime(2026, 6, 22, 8, 30, tzinfo=timezone(timedelta(hours=8)))
+                if tz is None:
+                    return fixed_now.replace(tzinfo=None)
+                return fixed_now.astimezone(tz)
+
+        monkeypatch.setattr(p1_web, "datetime", FrozenDateTime)
+        hours = int(run_config.get_run_config(datetime(2026, 6, 22, 8, 30)).rstrip("h"))
+
+        result = _entries_to_p1_result(
+            [
+                {"title": "Old June 18 item", "content": "", "url": "https://example.com/old", "published_at": "2026-06-18T10:00:00 (北京时间)", "source": "Example"},
+                {"title": "Recent June 22 item", "content": "", "url": "https://example.com/recent", "published_at": "2026-06-22T07:00:00 (北京时间)", "source": "Example"},
+                {"title": "Future item", "content": "", "url": "https://example.com/future", "published_at": "2026-06-24T08:30:00 (北京时间)", "source": "Example"},
+                {"title": "Invalid year item", "content": "", "url": "https://example.com/invalid", "published_at": "6856-01-12T23:59:59 (北京时间)", "source": "Example"},
+            ],
+            "网页采集",
+            "Example",
+            hours,
+        )
+
+        assert result is not None
+        assert "Recent June 22 item" in result["text"]
+        assert "Old June 18 item" not in result["text"]
+        assert "Future item" not in result["text"]
+        assert "Invalid year item" not in result["text"]
+        assert result["time_window_stats"]["stale"] == 1
+        assert result["time_window_stats"]["future"] == 1
+        assert result["time_window_stats"]["invalid_time"] == 1
+
 
 class TestP1RssTimeWindow:
     def test_rss_time_window_parses_fierceelectronics_dates(self):
@@ -705,6 +751,26 @@ class TestP1RssTimeWindow:
         assert p1_rss._is_within_window(future, 24) is False
         assert p1_rss._is_within_window("6856-01-12T23:59:59 (北京时间)", 24) is False
         assert p1_rss._is_within_window("totally-not-a-date", 24) is False
+
+    def test_scheduled_holiday_resume_does_not_reopen_old_rss_items(self, monkeypatch):
+        import p1_rss
+        import run_config
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                fixed_now = datetime(2026, 6, 22, 8, 30, tzinfo=timezone(timedelta(hours=8)))
+                if tz is None:
+                    return fixed_now.replace(tzinfo=None)
+                return fixed_now.astimezone(tz)
+
+        monkeypatch.setattr(p1_rss, "datetime", FrozenDateTime)
+        hours = int(run_config.get_run_config(datetime(2026, 6, 22, 8, 30)).rstrip("h"))
+
+        assert p1_rss._is_within_window("2026-06-18T10:00:00 (北京时间)", hours) is False
+        assert p1_rss._is_within_window("2026-06-22T07:00:00 (北京时间)", hours) is True
+        assert p1_rss._is_within_window("2026-06-24T08:30:00 (北京时间)", hours) is False
+        assert p1_rss._is_within_window("6856-01-12T23:59:59 (北京时间)", hours) is False
 
 
 # =====================================================================

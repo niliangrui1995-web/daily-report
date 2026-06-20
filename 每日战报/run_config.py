@@ -22,6 +22,7 @@ from trading_calendar import (
 )
 
 A_SHARE_MARKET_OPEN_HOUR = 9
+MAX_AUTO_BACKTRACK_HOURS = 72
 
 
 def _get_prev_trading_day(today: date, steps: int = 1) -> date:
@@ -76,7 +77,14 @@ def get_run_config(now: datetime) -> str:
         hour=A_SHARE_MARKET_OPEN_HOUR,
         tzinfo=now.tzinfo,
     )
-    delta_hours = max(math.ceil((now - anchor_open).total_seconds() / 3600), 1)
+    raw_delta_hours = max(math.ceil((now - anchor_open).total_seconds() / 3600), 1)
+    delta_hours = min(raw_delta_hours, MAX_AUTO_BACKTRACK_HOURS)
+    if raw_delta_hours > MAX_AUTO_BACKTRACK_HOURS:
+        logging.info(
+            '【自适应回溯】原始窗口 %sh 超过自动上限 %sh，按上限执行',
+            raw_delta_hours,
+            MAX_AUTO_BACKTRACK_HOURS,
+        )
 
     logging.info(
         '【自适应回溯】本周交易日序号=%s, 窗口锚点更新日=%s → 回溯 %sh',

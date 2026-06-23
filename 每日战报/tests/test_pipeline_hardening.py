@@ -712,9 +712,9 @@ class TestPreflightChecks:
         }
 
         monkeypatch.setattr(pipeline_cli, "get_today_output_dir", lambda: str(tmp_path))
-        monkeypatch.setattr(pipeline_cli, "get_manifest_path", lambda: str(tmp_path / "run_manifest.json"))
+        monkeypatch.setattr(pipeline_cli, "get_manifest_path", lambda day_dir=None: str(tmp_path / "run_manifest.json"))
         monkeypatch.setattr(pipeline_cli, "get_output_root_dir", lambda: str(tmp_path))
-        monkeypatch.setattr(pipeline_cli, "load_run_manifest", lambda: manifest)
+        monkeypatch.setattr(pipeline_cli, "load_run_manifest", lambda day_dir=None: manifest)
         monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: None)
         monkeypatch.setattr(pipeline_cli, "is_trading_day", lambda _: False)
 
@@ -725,6 +725,73 @@ class TestPreflightChecks:
         assert "run_state: skipped_non_trading_day root_cause=non_trading_day main_flow_entered=no" in output
         assert "run_reason: today is not a trading day" in output
         assert "schedule_decision: is_trading_day=no should_run=no reason=today is not a trading day" in output
+
+    def test_status_day_closes_running_manifest_when_lock_is_stale(self, monkeypatch, tmp_path, capsys):
+        import pipeline_cli
+
+        output_root = tmp_path / "output"
+        day_dir = output_root / "20260623"
+        day_dir.mkdir(parents=True)
+        manifest_path = day_dir / "run_manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "run_timestamp": "20260623083006",
+                    "status": "running",
+                    "root_cause": "orchestrator_started",
+                    "status_reason": "orchestrator entered main flow",
+                    "main_flow_entered": True,
+                    "runtime_context": {
+                        "run_state": "running",
+                        "root_cause": "orchestrator_started",
+                        "main_flow_entered": True,
+                    },
+                    "stages": {
+                        "orchestrator": {
+                            "status": "started",
+                            "updated_at": "2026-06-23T08:30:06",
+                            "run_timestamp": "20260623083006",
+                        },
+                        "market_mapping": {
+                            "status": "running",
+                            "updated_at": "2026-06-23T08:39:09",
+                            "run_timestamp": "20260623083006",
+                            "metrics": {"timeout_seconds": 600},
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        lock_info = {
+            "pid": 22016,
+            "command": "run",
+            "started_at": "2026-06-23T00:30:06+00:00",
+        }
+
+        monkeypatch.setattr(pipeline_cli, "get_output_root_dir", lambda: str(output_root))
+        monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: lock_info)
+        monkeypatch.setattr(
+            pipeline_cli,
+            "get_lock_stale_reason",
+            lambda info, stale_after_seconds: "pid_not_running",
+        )
+        monkeypatch.setattr(pipeline_cli, "is_trading_day", lambda _: True)
+
+        result = pipeline_cli.cmd_status(SimpleNamespace(day="20260623"))
+
+        output = capsys.readouterr().out
+        rewritten = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        assert result == 0
+        assert rewritten["status"] == "failed_stale_run"
+        assert rewritten["root_cause"] == "stale_run_lock"
+        assert rewritten["main_flow_entered"] is True
+        assert rewritten["runtime_context"]["previous_run_state"] == "running"
+        assert rewritten["runtime_context"]["lock_stale_reason"] == "pid_not_running"
+        assert "run_state: failed_stale_run root_cause=stale_run_lock main_flow_entered=yes" in output
+        assert "lock: stale" in output
+        assert "stale_reason=pid_not_running" in output
 
     def test_preflight_strict_returns_lock_exit_code(self, monkeypatch, tmp_path):
         import pipeline_cli
@@ -754,11 +821,54 @@ class TestPreflightChecks:
             "read_run_lock",
             lambda: {"pid": 1234, "command": "run", "started_at": "2026-04-13T00:00:00+00:00"},
         )
-        monkeypatch.setattr(pipeline_cli, "is_lock_stale", lambda info, stale_after_seconds: False)
+        monkeypatch.setattr(pipeline_cli, "get_lock_stale_reason", lambda info, stale_after_seconds: "")
 
         result = pipeline_cli._collect_preflight(strict=True)
         assert result["summary"]["exit_code"] == pipeline_cli.EXIT_LOCK_ACTIVE
         assert any(item["name"] == "run_lock" and not item["ok"] for item in result["checks"])
+
+    def test_preflight_strict_allows_stale_lock(self, monkeypatch, tmp_path):
+        import pipeline_cli
+
+        today_dir = tmp_path / "today"
+        logs_dir = tmp_path / "logs"
+        output_root = tmp_path / "output"
+        today_dir.mkdir()
+        logs_dir.mkdir()
+        output_root.mkdir()
+
+        monkeypatch.setattr(pipeline_cli, "OUTPUT_DIR", str(output_root))
+        monkeypatch.setattr(pipeline_cli, "settings_today_output_dir", lambda: str(today_dir))
+        monkeypatch.setattr(pipeline_cli, "get_today_logs_dir", lambda: str(logs_dir))
+        monkeypatch.setattr(pipeline_cli, "require_prompt", lambda name: "ok")
+        monkeypatch.setattr(pipeline_cli, "SEARCH_API_KEY_POOL", ["key-1"])
+        monkeypatch.setattr(pipeline_cli, "ANTIGRAVITY_API_KEY", "secret")
+        monkeypatch.setattr(pipeline_cli, "GROK_API_KEY", "optional")
+        monkeypatch.setattr(pipeline_cli, "INSECURE_TLS_ALLOWLIST", ())
+        monkeypatch.setattr(
+            pipeline_cli.importlib,
+            "import_module",
+            lambda module_name: object(),
+        )
+        monkeypatch.setattr(pipeline_cli, "get_calendar_status", lambda: {"mode": "chinese_calendar"})
+        monkeypatch.setattr(pipeline_cli, "is_trading_day", lambda _: True)
+        monkeypatch.setattr(
+            pipeline_cli,
+            "read_run_lock",
+            lambda: {"pid": 22016, "command": "run", "started_at": "2026-06-23T00:30:06+00:00"},
+        )
+        monkeypatch.setattr(
+            pipeline_cli,
+            "get_lock_stale_reason",
+            lambda info, stale_after_seconds: "pid_not_running",
+        )
+
+        result = pipeline_cli._collect_preflight(strict=True)
+
+        run_lock = [item for item in result["checks"] if item["name"] == "run_lock"][-1]
+        assert result["summary"]["exit_code"] == pipeline_cli.EXIT_OK
+        assert run_lock["ok"] is True
+        assert "stale_reason=pid_not_running" in run_lock["detail"]
 
 
 class TestPipelineLock:

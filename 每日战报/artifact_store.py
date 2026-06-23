@@ -157,12 +157,12 @@ def write_json_artifact(
     return path
 
 
-def get_manifest_path() -> str:
-    return os.path.join(get_day_dir(), MANIFEST_FILENAME)
+def get_manifest_path(day_dir: str | None = None) -> str:
+    return os.path.join(get_day_dir(day_dir), MANIFEST_FILENAME)
 
 
-def _get_legacy_manifest_path() -> str:
-    return os.path.join(get_day_subdir("meta"), MANIFEST_FILENAME)
+def _get_legacy_manifest_path(day_dir: str | None = None) -> str:
+    return os.path.join(get_day_subdir("meta", day_dir=day_dir), MANIFEST_FILENAME)
 
 
 def _build_default_manifest(run_ts: str | None = None) -> dict[str, Any]:
@@ -223,8 +223,8 @@ def _unlock_manifest_handle(handle) -> None:
 
 
 @contextmanager
-def _manifest_file_lock():
-    lock_path = f"{get_manifest_path()}.lock"
+def _manifest_file_lock(day_dir: str | None = None):
+    lock_path = f"{get_manifest_path(day_dir)}.lock"
     with open(lock_path, "a+b") as handle:
         if handle.tell() == 0:
             handle.write(b"0")
@@ -237,12 +237,12 @@ def _manifest_file_lock():
             _unlock_manifest_handle(handle)
 
 
-def _resolve_manifest_read_path() -> str:
-    manifest_path = get_manifest_path()
+def _resolve_manifest_read_path(day_dir: str | None = None) -> str:
+    manifest_path = get_manifest_path(day_dir)
     if os.path.exists(manifest_path):
         return manifest_path
 
-    legacy_path = _get_legacy_manifest_path()
+    legacy_path = _get_legacy_manifest_path(day_dir)
     if os.path.exists(legacy_path):
         return legacy_path
 
@@ -288,14 +288,14 @@ def _write_manifest_file(path: str, manifest: dict[str, Any]) -> None:
             os.remove(temp_path)
 
 
-def _cleanup_legacy_manifest(current_path: str) -> None:
-    legacy_path = _get_legacy_manifest_path()
+def _cleanup_legacy_manifest(current_path: str, day_dir: str | None = None) -> None:
+    legacy_path = _get_legacy_manifest_path(day_dir)
     if legacy_path != current_path and os.path.exists(legacy_path):
         os.remove(legacy_path)
 
 
-def _load_manifest_for_write(run_ts: str) -> dict[str, Any]:
-    source_path = _resolve_manifest_read_path()
+def _load_manifest_for_write(run_ts: str, day_dir: str | None = None) -> dict[str, Any]:
+    source_path = _resolve_manifest_read_path(day_dir)
     try:
         return _load_manifest_from_path(source_path, run_ts=run_ts)
     except ManifestLoadError as exc:
@@ -308,10 +308,10 @@ def _load_manifest_for_write(run_ts: str) -> dict[str, Any]:
         return manifest
 
 
-def load_run_manifest() -> dict[str, Any]:
+def load_run_manifest(day_dir: str | None = None) -> dict[str, Any]:
     with _MANIFEST_LOCK:
-        with _manifest_file_lock():
-            source_path = _resolve_manifest_read_path()
+        with _manifest_file_lock(day_dir):
+            source_path = _resolve_manifest_read_path(day_dir)
             try:
                 return _load_manifest_from_path(source_path)
             except ManifestLoadError as exc:
@@ -431,14 +431,15 @@ def record_run_state(
     main_flow_entered: bool | None = None,
     runtime_context: dict[str, Any] | None = None,
     timestamp: str | None = None,
+    day_dir: str | None = None,
 ) -> str:
-    manifest_path = get_manifest_path()
+    manifest_path = get_manifest_path(day_dir)
     env_run_ts = os.environ.get(RUN_TIMESTAMP_ENV, "").strip()
     initial_run_ts = timestamp or env_run_ts or datetime.now().strftime("%Y%m%d%H%M%S")
 
     with _MANIFEST_LOCK:
-        with _manifest_file_lock():
-            manifest = _load_manifest_for_write(initial_run_ts)
+        with _manifest_file_lock(day_dir):
+            manifest = _load_manifest_for_write(initial_run_ts, day_dir)
             run_ts = timestamp or env_run_ts or manifest.get("run_timestamp") or initial_run_ts
             manifest["run_timestamp"] = run_ts
             manifest["updated_at"] = datetime.now().isoformat()
@@ -471,7 +472,7 @@ def record_run_state(
                 context.update(_json_ready(runtime_context))
 
             _write_manifest_file(manifest_path, manifest)
-            _cleanup_legacy_manifest(manifest_path)
+            _cleanup_legacy_manifest(manifest_path, day_dir)
 
     return manifest_path
 

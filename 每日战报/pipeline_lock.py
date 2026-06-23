@@ -86,23 +86,38 @@ def read_run_lock() -> dict[str, Any] | None:
 
 
 def is_lock_stale(info: dict[str, Any] | None, *, stale_after_seconds: int) -> bool:
+    return bool(get_lock_stale_reason(info, stale_after_seconds=stale_after_seconds))
+
+
+def get_lock_stale_reason(info: dict[str, Any] | None, *, stale_after_seconds: int) -> str:
     if not info:
-        return True
+        return "missing_lock"
 
     pid = info.get("pid")
     started_at = info.get("started_at")
-    if pid and not _pid_is_running(int(pid)):
-        return True
+    if pid:
+        try:
+            running = _pid_is_running(int(pid))
+        except (TypeError, ValueError):
+            return "invalid_pid"
+        if not running:
+            return "pid_not_running"
+    else:
+        return "missing_pid"
     if not started_at:
-        return True
+        return "missing_started_at"
 
     try:
         started = datetime.fromisoformat(started_at)
-    except ValueError:
-        return True
+    except (TypeError, ValueError):
+        return "invalid_started_at"
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
 
     age = (datetime.now(timezone.utc) - started).total_seconds()
-    return age > stale_after_seconds
+    if age > stale_after_seconds:
+        return "age_exceeded"
+    return ""
 
 
 def clear_run_lock() -> None:

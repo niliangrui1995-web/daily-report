@@ -5,7 +5,7 @@ import importlib
 import logging
 import os
 import sys
-from datetime import date
+from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -26,7 +26,7 @@ from artifact_store import (
     update_run_manifest,
 )
 from agent_assistant import explain_preflight
-from pipeline_lock import PipelineLockError, acquire_run_lock, is_lock_stale, read_run_lock
+from pipeline_lock import PipelineLockError, acquire_run_lock, get_lock_stale_reason, read_run_lock
 from pipeline_maintenance import clean_workspace, prune_outputs
 from settings import (
     OUTPUT_DIR,
@@ -42,6 +42,7 @@ from trading_calendar import get_calendar_status, is_trading_day
 EXIT_OK = 0
 EXIT_CHECK_FAILED = 1
 EXIT_LOCK_ACTIVE = 2
+RUN_LOCK_STALE_AFTER_SECONDS = 6 * 60 * 60
 
 REQUIRED_PROMPTS = (
     "audit.txt",
@@ -212,18 +213,77 @@ def _manifest_run_state(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def cmd_status(_: argparse.Namespace) -> int:
-    today_dir = Path(get_today_output_dir())
-    manifest_path = Path(get_manifest_path())
-    manifest = load_run_manifest()
+def _resolve_status_target(args: argparse.Namespace) -> tuple[date, Path]:
+    raw_day = str(getattr(args, "day", "") or "").strip()
+    if not raw_day:
+        return date.today(), Path(get_today_output_dir())
+
+    try:
+        target_day = datetime.strptime(raw_day, "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError("--day must use YYYYMMDD, for example 20260623") from exc
+    return target_day, Path(get_output_root_dir()) / raw_day
+
+
+def _maybe_close_stale_running_manifest(
+    *,
+    manifest: dict[str, Any],
+    run_state: dict[str, Any],
+    lock_info: dict[str, Any] | None,
+    lock_stale_reason: str,
+    day_dir: Path,
+) -> bool:
+    if run_state["status"] != "running":
+        return False
+    if not lock_info or not lock_stale_reason:
+        return False
+
+    record_run_state(
+        status="failed_stale_run",
+        root_cause="stale_run_lock",
+        reason=f"manifest was still running but run lock is stale: {lock_stale_reason}",
+        source="pipeline_cli:status",
+        main_flow_entered=True,
+        timestamp=str(manifest.get("run_timestamp") or "").strip() or None,
+        day_dir=str(day_dir),
+        runtime_context={
+            "previous_run_state": run_state["status"],
+            "lock_info": lock_info,
+            "lock_stale_reason": lock_stale_reason,
+        },
+    )
+    return True
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    try:
+        target_day, day_dir = _resolve_status_target(args)
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return EXIT_CHECK_FAILED
+
+    manifest_path = Path(get_manifest_path(day_dir=str(day_dir)))
+    manifest = load_run_manifest(day_dir=str(day_dir))
     lock_info = read_run_lock()
-    today_is_trading_day = is_trading_day(date.today())
+    lock_stale_reason = (
+        get_lock_stale_reason(lock_info, stale_after_seconds=RUN_LOCK_STALE_AFTER_SECONDS) if lock_info else ""
+    )
+    target_is_trading_day = is_trading_day(target_day)
     run_state = _manifest_run_state(manifest)
+    if _maybe_close_stale_running_manifest(
+        manifest=manifest,
+        run_state=run_state,
+        lock_info=lock_info,
+        lock_stale_reason=lock_stale_reason,
+        day_dir=day_dir,
+    ):
+        manifest = load_run_manifest(day_dir=str(day_dir))
+        run_state = _manifest_run_state(manifest)
 
     print(f"output_root: {get_output_root_dir()}")
-    print(f"today_dir: {today_dir}")
+    print(f"day_dir: {day_dir}")
     print(f"manifest: {manifest_path}")
-    print(f"trading_day: {'yes' if today_is_trading_day else 'no'}")
+    print(f"trading_day: {'yes' if target_is_trading_day else 'no'}")
     print(
         f"run_state: {run_state['status']} "
         f"root_cause={run_state['root_cause']} "
@@ -241,13 +301,15 @@ def cmd_status(_: argparse.Namespace) -> int:
         )
 
     if lock_info:
-        stale = is_lock_stale(lock_info, stale_after_seconds=6 * 60 * 60)
+        stale = bool(lock_stale_reason)
+        lock_state = "stale" if stale else "active"
         print(
-            "lock: active"
+            f"lock: {lock_state}"
             f" pid={lock_info.get('pid', 'unknown')}"
             f" command={lock_info.get('command', 'unknown')}"
             f" started_at={lock_info.get('started_at', 'unknown')}"
             f" stale={'yes' if stale else 'no'}"
+            f" stale_reason={lock_stale_reason or 'none'}"
         )
     else:
         print("lock: idle")
@@ -343,9 +405,9 @@ def _collect_preflight(strict: bool) -> dict:
 
     lock_info = read_run_lock()
     if lock_info:
-        stale = is_lock_stale(lock_info, stale_after_seconds=6 * 60 * 60)
-        if stale:
-            add_check("run_lock", False, f"stale={lock_info}", severity="warning")
+        stale_reason = get_lock_stale_reason(lock_info, stale_after_seconds=RUN_LOCK_STALE_AFTER_SECONDS)
+        if stale_reason:
+            add_check("run_lock", True, f"stale_reason={stale_reason} stale={lock_info}")
         else:
             add_check("run_lock", False, f"active={lock_info}", severity="lock")
     else:
@@ -476,6 +538,8 @@ def build_parser() -> argparse.ArgumentParser:
     }
     for name, handler in command_map.items():
         sub = subparsers.add_parser(name)
+        if name == "status":
+            sub.add_argument("--day", help="output day in YYYYMMDD format")
         if name == "doctor":
             sub.add_argument("--strict", action="store_true")
         sub.set_defaults(handler=handler)

@@ -45,6 +45,9 @@ if errorlevel 1 (
     goto :fail
 )
 
+set "PRIMARY_COMMAND=run"
+if not "%~1"=="" set "PRIMARY_COMMAND=%~1"
+
 call :maybe_preflight
 if errorlevel 1 (
     set "EXIT_CODE=!errorlevel!"
@@ -55,11 +58,9 @@ if errorlevel 1 (
     goto :hold
 )
 
-set "PRIMARY_COMMAND=run"
 if "%~1"=="" (
     call :run_default_entry
 ) else (
-    set "PRIMARY_COMMAND=%~1"
     if /I "%PRIMARY_COMMAND%"=="run" (
         call :run_default_entry
     ) else (
@@ -96,6 +97,8 @@ if not "%RUN_DAILY_HOLD_SECONDS%"=="0" (
 exit /b %EXIT_CODE%
 
 :maybe_preflight
+if /I not "%PRIMARY_COMMAND%"=="run" exit /b 0
+
 set "PREFLIGHT_MODE=%RUN_DAILY_PREFLIGHT%"
 if /I "%PREFLIGHT_MODE%"=="0" exit /b 0
 if /I "%PREFLIGHT_MODE%"=="off" exit /b 0

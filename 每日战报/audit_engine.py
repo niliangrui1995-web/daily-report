@@ -330,6 +330,8 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
 
     json_data = None
     markdown_text = raw_content  # 默认整体作为 Markdown（降级兜底）
+    structured_degraded = False
+    degrade_reason = ""
 
     if '===MARKDOWN===' in raw_content:
         parts = raw_content.split('===MARKDOWN===', 1)
@@ -346,6 +348,8 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
             logging.info('[P7a 审计] 成功解析 JSON 结构化数据')
         except Exception as e:
             logging.warning(f'⚠️ [P7a 审计] JSON 解析失败（不影响 Markdown 输出）: {e}')
+            structured_degraded = True
+            degrade_reason = f'json_parse_failed: {e}'
             # Why: JSON 解析失败时仍尝试手动构建基本结构
             json_data = {
                 'meta': {
@@ -360,6 +364,8 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
             markdown_text = markdown_part
     else:
         logging.warning('[P7a 审计] 响应中未找到 ===MARKDOWN=== 分隔符，整体作为 Markdown 处理')
+        structured_degraded = True
+        degrade_reason = 'missing_markdown_separator'
 
     json_path = ''
     if json_data:
@@ -388,17 +394,29 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
         manifest_files['md'] = md_path
     if json_path:
         manifest_files['json'] = json_path
+    manifest_status = 'completed_structured_degraded' if structured_degraded else 'completed'
+    manifest_metrics = {
+        'input_chars': len(raw_deep_research),
+        'output_chars': len(markdown_text),
+        'compression_ratio': round(compression_ratio, 2),
+        'elapsed_seconds': round(elapsed, 1),
+        'topics_count': len(json_data.get('topics', [])) if isinstance(json_data, dict) else 0,
+    }
+    if structured_degraded:
+        manifest_metrics['structured_degraded'] = True
+        manifest_metrics['degrade_reason'] = degrade_reason or 'structured_json_unavailable'
+        if isinstance(json_data, dict):
+            meta = json_data.get('meta', {})
+            if isinstance(meta, dict) and meta.get('parse_error'):
+                manifest_metrics['parse_error'] = str(meta.get('parse_error'))[:500]
+            raw_attempt = json_data.get('raw_json_attempt')
+            if raw_attempt:
+                manifest_metrics['raw_json_attempt_chars'] = len(str(raw_attempt))
     update_run_manifest(
         'p7a',
-        status='completed',
+        status=manifest_status,
         files=manifest_files or None,
-        metrics={
-            'input_chars': len(raw_deep_research),
-            'output_chars': len(markdown_text),
-            'compression_ratio': round(compression_ratio, 2),
-            'elapsed_seconds': round(elapsed, 1),
-            'topics_count': len(json_data.get('topics', [])) if isinstance(json_data, dict) else 0,
-        },
+        metrics=manifest_metrics,
     )
     logging.info(f'✅ [P7a 审计] 完成 ({elapsed:.1f}s) | {len(raw_deep_research)} → {len(markdown_text)} 字 | 压缩比 {compression_ratio:.1f}x')
 

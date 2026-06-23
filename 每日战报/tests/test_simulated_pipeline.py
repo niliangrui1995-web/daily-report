@@ -529,10 +529,24 @@ class TestOrchestratorSimulation:
                 "topics_completed": 1,
                 "rounds_run": 2,
                 "successful_rounds": 2,
-                "text": "## 深度研究：覆铜板涨价如何向A股传导\n#### Claim\n覆铜板涨价已经开始传导。",
+                "text": (
+                    "## 深度研究：覆铜板涨价如何向A股传导\n#### Claim\n"
+                    "覆铜板涨价已经开始传导，产业链库存和订单弹性需要继续核验。\n" * 8
+                ),
             },
         )
-        monkeypatch.setattr(orchestrator, "p7a_deep_research_audit", lambda text: "P7a audited")
+        def fake_p7a_deep_research_audit(text):
+            artifact_store.update_run_manifest(
+                "p7a",
+                status="completed_structured_degraded",
+                metrics={
+                    "structured_degraded": True,
+                    "degrade_reason": "json_parse_failed: invalid json",
+                },
+            )
+            return "P7a audited"
+
+        monkeypatch.setattr(orchestrator, "p7a_deep_research_audit", fake_p7a_deep_research_audit)
         monkeypatch.setattr(orchestrator, "gemini_search", lambda stage, query, backtrack: {"text": f"{query} search result", "grounding_sources": []})
         monkeypatch.setattr(orchestrator, "extract_stocks_from_report", lambda report: [("生益科技", "600183")])
         monkeypatch.setattr(orchestrator, "extract_stock_tracks", lambda report: {"600183": "覆铜板"})
@@ -559,6 +573,10 @@ class TestOrchestratorSimulation:
         assert manifest_path.exists(), "manifest should be generated"
 
         manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        assert manifest["status"] == "completed_with_stage_degradation"
+        assert manifest["root_cause"] == "stage_degraded"
+        assert manifest["runtime_context"]["degraded_stages"][0]["stage"] == "p7a"
         assert manifest["stages"]["p1"]["status"] == "completed"
+        assert manifest["stages"]["p7a"]["status"] == "completed_structured_degraded"
         assert manifest["stages"]["p3"]["metrics"]["structured_items"] >= 1
         assert manifest["stages"]["roi"]["status"] == "completed"

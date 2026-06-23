@@ -15,7 +15,7 @@ from artifact_store import (
 from p9_email import send_report_via_email
 from p9_rendering import build_report_markdown
 from settings import EMAIL_ADDRESS, EMAIL_PASSWORD, RECEIVER_EMAIL, opus_adapter, require_prompt
-from tdx_stock_universe import load_tdx_stock_code_map, normalize_stock_name
+from tdx_stock_universe import load_tdx_stock_code_map, lookup_tdx_stock_code
 from utils import extract_json_from_llm_response
 
 _HARD_EVIDENCE_LAYERS = {"P4", "P5", "P6", "P7", "P7A", "P8"}
@@ -165,27 +165,8 @@ def _normalize_stock_code(value: Any) -> str:
     return match.group(0) if match else ""
 
 
-def _stock_name_lookup_keys(name: Any) -> list[str]:
-    raw_name = str(name or "").strip()
-    if not raw_name:
-        return []
-
-    compact_name = normalize_stock_name(raw_name)
-    without_code = re.sub(r"[\s（(【\[]*\d{6}[\s）)】\]]*", "", compact_name).strip()
-
-    keys: list[str] = []
-    for key in (raw_name, compact_name, without_code, normalize_stock_name(without_code)):
-        if key and key not in keys:
-            keys.append(key)
-    return keys
-
-
 def _lookup_tdx_stock_code(stock_code_map: dict[str, str], name: Any) -> str:
-    for key in _stock_name_lookup_keys(name):
-        local_code = stock_code_map.get(key)
-        if local_code:
-            return local_code
-    return ""
+    return lookup_tdx_stock_code(stock_code_map, name)
 
 
 def _apply_tdx_stock_codes_to_report(data: dict[str, Any]) -> dict[str, int]:

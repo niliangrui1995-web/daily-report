@@ -287,6 +287,30 @@ class TestManifestContext:
         assert manifest["runtime_context"]["python_version"] == "3.12.0"
         assert manifest["preflight"]["exit_code"] == 0
 
+    def test_preflight_context_replaces_stale_failed_exit_code(self, monkeypatch, tmp_path):
+        import artifact_store
+
+        monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+
+        artifact_store.record_run_state(
+            status="not_entered_main_flow",
+            root_cause="preflight_failed",
+            reason="preflight exit_code=1",
+            source="pipeline_cli:run",
+            main_flow_entered=False,
+            runtime_context={"preflight_exit_code": 1},
+            timestamp="20260623083006",
+        )
+        artifact_store.update_manifest_context(
+            runtime_context={"python_version": "3.14.5"},
+            preflight={"failed": 0, "warnings": 0, "exit_code": 0},
+            timestamp="20260623083006",
+        )
+
+        manifest = artifact_store.load_run_manifest()
+        assert manifest["preflight"]["exit_code"] == 0
+        assert manifest["runtime_context"]["preflight_exit_code"] == 0
+
     def test_record_run_state_marks_skip_root_cause_and_context(self, monkeypatch, tmp_path):
         import artifact_store
 
@@ -318,6 +342,34 @@ class TestManifestContext:
         assert manifest["runtime_context"]["run_state"] == "skipped_non_trading_day"
         assert manifest["runtime_context"]["root_cause"] == "non_trading_day"
         assert manifest["runtime_context"]["main_flow_entered"] is False
+
+    def test_record_run_state_keeps_previous_failure_as_history(self, monkeypatch, tmp_path):
+        import artifact_store
+
+        monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+
+        artifact_store.record_run_state(
+            status="failed_timeout",
+            root_cause="failed_timeout",
+            reason="stage 'market_mapping' exceeded timeout_seconds=600",
+            source="orchestrator",
+            main_flow_entered=True,
+            timestamp="20260623083006",
+        )
+        artifact_store.record_run_state(
+            status="running",
+            root_cause="orchestrator_started",
+            reason="orchestrator entered main flow",
+            source="orchestrator",
+            main_flow_entered=True,
+            runtime_context={"resume_from": "p5"},
+            timestamp="20260623083006",
+        )
+
+        manifest = artifact_store.load_run_manifest()
+        assert manifest["runtime_context"]["previous_run_state"] == "failed_timeout"
+        assert manifest["runtime_context"]["previous_root_cause"] == "failed_timeout"
+        assert manifest["runtime_context"]["resume_from"] == "p5"
 
     def test_manifest_is_written_at_day_root_and_migrates_legacy_file(self, monkeypatch, tmp_path):
         import artifact_store
@@ -670,6 +722,7 @@ class TestPreflightChecks:
         monkeypatch.setattr(pipeline_cli, "_print_preflight", lambda result: result["summary"]["exit_code"])
         monkeypatch.setattr(pipeline_cli, "set_preflight_summary", lambda summary: calls.append(("summary", summary)))
         monkeypatch.setattr(pipeline_cli, "explain_preflight_and_record", lambda result: calls.append("agent"))
+        monkeypatch.setattr(pipeline_cli, "update_manifest_context", lambda **kwargs: calls.append(("context", kwargs)))
         monkeypatch.setattr(pipeline_cli, "record_run_state", lambda **kwargs: calls.append(("run_state", kwargs)))
         monkeypatch.setattr(pipeline_cli, "configure_run_logging", lambda: calls.append("logging"))
         monkeypatch.setattr(pipeline_cli, "acquire_run_lock", fake_lock)
@@ -725,6 +778,146 @@ class TestPreflightChecks:
         assert "run_state: skipped_non_trading_day root_cause=non_trading_day main_flow_entered=no" in output
         assert "run_reason: today is not a trading day" in output
         assert "schedule_decision: is_trading_day=no should_run=no reason=today is not a trading day" in output
+
+    def test_status_prints_degraded_stage_summary(self, monkeypatch, tmp_path, capsys):
+        import pipeline_cli
+
+        manifest = {
+            "run_timestamp": "20260623083006",
+            "status": "completed_with_stage_degradation",
+            "root_cause": "stage_degraded",
+            "status_reason": "completed with degraded stages: p7a",
+            "main_flow_entered": True,
+            "runtime_context": {
+                "run_state": "completed_with_stage_degradation",
+                "root_cause": "stage_degraded",
+                "main_flow_entered": True,
+            },
+            "stages": {
+                "p7a": {
+                    "status": "completed_structured_degraded",
+                    "updated_at": "2026-06-23T09:54:28",
+                    "metrics": {
+                        "structured_degraded": True,
+                        "degrade_reason": "json_parse_failed: invalid json",
+                    },
+                },
+                "p9": {"status": "completed_email_sent", "updated_at": "2026-06-23T09:58:03"},
+            },
+        }
+
+        monkeypatch.setattr(pipeline_cli, "get_today_output_dir", lambda: str(tmp_path))
+        monkeypatch.setattr(pipeline_cli, "get_manifest_path", lambda day_dir=None: str(tmp_path / "run_manifest.json"))
+        monkeypatch.setattr(pipeline_cli, "get_output_root_dir", lambda: str(tmp_path))
+        monkeypatch.setattr(pipeline_cli, "load_run_manifest", lambda day_dir=None: manifest)
+        monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: None)
+        monkeypatch.setattr(pipeline_cli, "is_trading_day", lambda _: True)
+
+        result = pipeline_cli.cmd_status(SimpleNamespace())
+
+        output = capsys.readouterr().out
+        assert result == 0
+        assert "run_state: completed_with_stage_degradation root_cause=stage_degraded main_flow_entered=yes" in output
+        assert "run_reason: completed with degraded stages: p7a" in output
+        assert "degraded_stages: p7a=completed_structured_degraded reason=json_parse_failed: invalid json" in output
+
+    def test_status_prints_completed_resume_source(self, monkeypatch, tmp_path, capsys):
+        import pipeline_cli
+
+        manifest = {
+            "run_timestamp": "20260623083006",
+            "status": "completed",
+            "root_cause": "completed",
+            "status_reason": "orchestrator completed after resume_from=p5 start_stage=audit_evidence",
+            "main_flow_entered": True,
+            "runtime_context": {
+                "run_state": "completed",
+                "root_cause": "completed",
+                "main_flow_entered": True,
+                "completed_after_resume": True,
+                "resume_from": "p5",
+                "resume_start_stage": "audit_evidence",
+                "preflight_exit_code": 0,
+            },
+            "preflight": {"exit_code": 0},
+            "stages": {
+                "orchestrator": {
+                    "status": "completed",
+                    "metrics": {
+                        "resume_from": "p5",
+                        "resume_start_stage": "audit_evidence",
+                        "completed_after_resume": True,
+                    },
+                }
+            },
+        }
+
+        monkeypatch.setattr(pipeline_cli, "get_today_output_dir", lambda: str(tmp_path))
+        monkeypatch.setattr(pipeline_cli, "get_manifest_path", lambda day_dir=None: str(tmp_path / "run_manifest.json"))
+        monkeypatch.setattr(pipeline_cli, "get_output_root_dir", lambda: str(tmp_path))
+        monkeypatch.setattr(pipeline_cli, "load_run_manifest", lambda day_dir=None: manifest)
+        monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: None)
+        monkeypatch.setattr(pipeline_cli, "is_trading_day", lambda _: True)
+
+        result = pipeline_cli.cmd_status(SimpleNamespace())
+
+        output = capsys.readouterr().out
+        assert result == 0
+        assert (
+            "run_state: completed root_cause=completed main_flow_entered=yes "
+            "completed_after_resume=yes resume_from=p5 resume_start_stage=audit_evidence"
+        ) in output
+        assert "run_reason: orchestrator completed after resume_from=p5 start_stage=audit_evidence" in output
+
+    def test_orchestrator_completion_records_resume_metadata(self, monkeypatch):
+        import orchestrator
+
+        manifest_updates = []
+        run_states = []
+        contexts = []
+
+        monkeypatch.setattr(
+            orchestrator,
+            "get_schedule_decision",
+            lambda day: {"is_trading_day": True, "should_run": True, "reason": "ok"},
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "detect_checkpoint",
+            lambda: {"stage": "p5", "files": {}, "run_timestamp": "20260623083006"},
+        )
+        monkeypatch.setattr(orchestrator, "set_run_timestamp", lambda timestamp=None: timestamp or "20260623083006")
+        monkeypatch.setattr(orchestrator, "get_preflight_summary", lambda: {"exit_code": 0})
+        monkeypatch.setattr(orchestrator, "build_runtime_context", lambda: {"cwd": "test"})
+        monkeypatch.setattr(orchestrator, "load_run_manifest", lambda: {"stages": {}})
+        monkeypatch.setattr(
+            orchestrator,
+            "update_run_manifest",
+            lambda stage, **kwargs: manifest_updates.append((stage, kwargs)),
+        )
+        monkeypatch.setattr(orchestrator, "update_manifest_context", lambda **kwargs: contexts.append(kwargs))
+        monkeypatch.setattr(orchestrator, "record_run_state", lambda **kwargs: run_states.append(kwargs))
+        monkeypatch.setattr(
+            orchestrator,
+            "run_stage_registry",
+            lambda stages, context, start_at=None: context.update({"final_report": "# done"}),
+        )
+
+        orchestrator.orchestrator_main([])
+
+        final_update = [item for item in manifest_updates if item[0] == "orchestrator"][-1][1]
+        final_state = run_states[-1]
+        assert contexts[-1]["preflight"]["exit_code"] == 0
+        assert contexts[-1]["runtime_context"]["resume_from"] == "p5"
+        assert final_update["metrics"]["resume_from"] == "p5"
+        assert final_update["metrics"]["resume_start_stage"] == "audit_evidence"
+        assert final_update["metrics"]["completed_after_resume"] is True
+        assert final_state["status"] == "completed"
+        assert final_state["root_cause"] == "completed"
+        assert final_state["reason"] == "orchestrator completed after resume_from=p5 start_stage=audit_evidence"
+        assert final_state["runtime_context"]["completed_after_resume"] is True
+        assert final_state["runtime_context"]["resume_from"] == "p5"
+        assert final_state["runtime_context"]["resume_start_stage"] == "audit_evidence"
 
     def test_status_day_closes_running_manifest_when_lock_is_stale(self, monkeypatch, tmp_path, capsys):
         import pipeline_cli

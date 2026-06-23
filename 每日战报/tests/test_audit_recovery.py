@@ -80,3 +80,45 @@ def test_p5_audit_repairs_unescaped_inner_quotes_without_retry(monkeypatch):
     assert 'Samsung 劳资双方达成"2026年薪资协议暂定合约"；工会暂停罢工' in result
     assert manifest_updates[-1][1]["status"] == "completed"
     assert manifest_updates[-1][1]["metrics"]["retry_count"] == 0
+
+
+def test_p7a_marks_structured_degradation_when_json_parse_fails(monkeypatch):
+    import audit_engine
+
+    raw_content = (
+        "not-json\n===MARKDOWN===\n## clean markdown\n"
+        "P7a markdown is usable. " * 8
+    )
+    manifest_updates = []
+    json_artifacts = []
+    text_artifacts = []
+
+    monkeypatch.setattr(
+        audit_engine.pro_adapter,
+        "invoke",
+        lambda prompt: SimpleNamespace(content=raw_content, thinking_content=""),
+    )
+    monkeypatch.setattr(audit_engine, "require_prompt", lambda name: "{raw_deep_research}")
+
+    def fake_write_json_artifact(prefix, data, **kwargs):
+        json_artifacts.append((prefix, data))
+        return f"{prefix}.json"
+
+    def fake_write_text_artifact(prefix, content, **kwargs):
+        text_artifacts.append((prefix, content))
+        return f"{prefix}.md"
+
+    monkeypatch.setattr(audit_engine, "write_json_artifact", fake_write_json_artifact)
+    monkeypatch.setattr(audit_engine, "write_text_artifact", fake_write_text_artifact)
+    monkeypatch.setattr(audit_engine, "update_run_manifest", lambda *args, **kwargs: manifest_updates.append((args, kwargs)))
+
+    result = audit_engine.p7a_deep_research_audit("deep research input " * 20)
+
+    assert result.startswith("## clean markdown\nP7a markdown is usable.")
+    assert json_artifacts[-1][1]["raw_json_attempt"] == "not-json"
+    assert text_artifacts[-1][0] == "P7a_深研审计"
+    assert manifest_updates[-1][0] == ("p7a",)
+    assert manifest_updates[-1][1]["status"] == "completed_structured_degraded"
+    assert manifest_updates[-1][1]["metrics"]["structured_degraded"] is True
+    assert manifest_updates[-1][1]["metrics"]["degrade_reason"].startswith("json_parse_failed:")
+    assert manifest_updates[-1][1]["metrics"]["raw_json_attempt_chars"] == len("not-json")

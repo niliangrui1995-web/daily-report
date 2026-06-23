@@ -26,7 +26,7 @@ from settings import opus_adapter, OPUS_MODEL, require_prompt
 from industry_dict import OLIGARCH_DICT
 from utils import extract_json_from_llm_response
 from p7_deep_research import build_recent_topic_guardrail
-from tdx_stock_universe import load_tdx_stock_code_map, normalize_stock_name
+from tdx_stock_universe import load_tdx_stock_code_map, lookup_tdx_stock_code
 
 P6_JSON_RETRY_LIMIT = 1
 P6_OUTPUT_LIMITS = """
@@ -50,7 +50,7 @@ def _apply_tdx_stock_codes(data: dict) -> None:
                 continue
             name = str(target.get('name', '')).strip()
             raw_code = str(target.get('code', '')).strip()
-            local_code = stock_code_map.get(name) or stock_code_map.get(normalize_stock_name(name))
+            local_code = lookup_tdx_stock_code(stock_code_map, name)
             if local_code:
                 if raw_code and raw_code != local_code:
                     logging.warning(f'⚠️ [P6本地代码覆盖] 忽略模型 code：{name} {raw_code} -> {local_code}')

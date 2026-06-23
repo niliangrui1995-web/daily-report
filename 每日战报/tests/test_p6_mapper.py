@@ -218,3 +218,36 @@ def test_p6_does_not_keep_model_code_for_unmapped_company(monkeypatch, caplog):
     assert "未收录公司（N/A）" in report
     assert written_json[0]["events"][0]["targets"][0]["code"] == "N/A"
     assert "已忽略模型 code=123456" in caplog.text
+
+
+def test_p6_tdx_code_postprocess_uses_local_alias_fallback(monkeypatch):
+    import p6_mapper
+
+    payload = {
+        "events": [
+            {
+                "track_name": "本地别名回归",
+                "targets": [
+                    {"name": "文一科技"},
+                    {"name": "博创科技"},
+                ],
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        p6_mapper,
+        "load_tdx_stock_code_map",
+        lambda: {
+            "三佳科技": "600520",
+            "文一三佳": "600520",
+            "文一科技": "600520",
+            "长芯博创": "300548",
+            "博创股份": "300548",
+        },
+    )
+
+    p6_mapper._apply_tdx_stock_codes(payload)
+
+    targets = payload["events"][0]["targets"]
+    assert targets[0]["code"] == "600520"
+    assert targets[1]["code"] == "300548"

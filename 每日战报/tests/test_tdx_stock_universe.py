@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tdx_stock_universe import load_tdx_stock_code_map
+from tdx_stock_universe import load_tdx_stock_code_map, lookup_tdx_stock_code
 
 TNF_HEADER_SIZE = 50
 TNF_RECORD_SIZE = 360
@@ -62,3 +62,34 @@ def test_load_tdx_stock_code_map_reads_local_sh_sz_bj_tables(tmp_path):
     assert stock_code_map['北证测试'] == '920001'
     assert '上证指数' not in stock_code_map
     assert '深证成指' not in stock_code_map
+
+
+def test_lookup_tdx_stock_code_falls_back_to_company_aliases(tmp_path):
+    hq_cache = tmp_path / 'T0002' / 'hq_cache'
+    _write_fake_tnf(
+        hq_cache / 'shs.tnf',
+        [
+            ('600520', '三佳科技'),
+        ],
+    )
+    _write_fake_tnf(
+        hq_cache / 'szs.tnf',
+        [
+            ('300548', '长芯博创'),
+        ],
+    )
+    _write_fake_tnf(hq_cache / 'bjs.tnf', [])
+    (hq_cache / 'infoharbor_ex.code').write_text(
+        '600520|三佳科技|文一三佳,裴晓辉\n'
+        '300548|长芯博创|博创股份,庄丹\n',
+        encoding='gbk',
+    )
+
+    stock_code_map = load_tdx_stock_code_map(str(tmp_path))
+
+    assert stock_code_map['文一三佳'] == '600520'
+    assert stock_code_map['博创股份'] == '300548'
+    assert '裴晓辉' not in stock_code_map
+    assert '庄丹' not in stock_code_map
+    assert lookup_tdx_stock_code(stock_code_map, '文一科技') == '600520'
+    assert lookup_tdx_stock_code(stock_code_map, '博创科技') == '300548'

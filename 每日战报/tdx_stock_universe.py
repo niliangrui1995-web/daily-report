@@ -22,10 +22,77 @@ TNF_CODE_SIZE = 6
 TNF_NAME_OFFSET = 31
 TNF_NAME_SIZE = 40
 INFOHARBOR_CODE_FILE = 'infoharbor_ex.code'
+COMPANY_ALIAS_SUFFIXES = ('科技', '股份')
+COMPANY_ALIAS_MARKERS = ('科技', '股份', '集团', '控股')
 
 
 def normalize_stock_name(name: str) -> str:
     return re.sub(r'\s+', '', str(name or '').strip())
+
+
+def _split_company_suffix(name: str) -> tuple[str, str]:
+    normalized = normalize_stock_name(name)
+    for suffix in COMPANY_ALIAS_SUFFIXES:
+        if normalized.endswith(suffix) and len(normalized) > len(suffix) + 1:
+            return normalized[:-len(suffix)], suffix
+    return normalized, ''
+
+
+def _looks_like_company_alias(alias: str, primary_name: str) -> bool:
+    alias = normalize_stock_name(alias)
+    if len(alias) < 4:
+        return False
+    if alias.endswith(COMPANY_ALIAS_MARKERS):
+        return True
+
+    primary_base, _ = _split_company_suffix(primary_name)
+    return len(primary_base) >= 2 and primary_base in alias and len(alias) <= 6
+
+
+def _iter_infoharbor_aliases(primary_name: str, alias_field: str) -> Iterator[str]:
+    primary_base, primary_suffix = _split_company_suffix(primary_name)
+    for raw_alias in re.split(r'[,，、/；;]+', alias_field or ''):
+        alias = normalize_stock_name(raw_alias)
+        if not _looks_like_company_alias(alias, primary_name):
+            continue
+
+        yield alias
+        if primary_suffix and primary_base in alias:
+            alias_prefix = alias.split(primary_base, 1)[0]
+            if len(alias_prefix) >= 2:
+                yield f'{alias_prefix}{primary_suffix}'
+
+
+def _stock_name_lookup_keys(name: object) -> list[str]:
+    raw_name = str(name or '').strip()
+    if not raw_name:
+        return []
+
+    compact_name = normalize_stock_name(raw_name)
+    without_code = re.sub(r'[\s（(【\[]*\d{6}[\s）)】\]]*', '', compact_name).strip()
+
+    keys: list[str] = []
+    for key in (raw_name, compact_name, without_code, normalize_stock_name(without_code)):
+        if key and key not in keys:
+            keys.append(key)
+
+    for key in list(keys):
+        base, suffix = _split_company_suffix(key)
+        if not suffix:
+            continue
+        for alt_suffix in COMPANY_ALIAS_SUFFIXES:
+            alias_key = f'{base}{alt_suffix}'
+            if alias_key and alias_key not in keys:
+                keys.append(alias_key)
+    return keys
+
+
+def lookup_tdx_stock_code(stock_code_map: dict[str, str], name: object) -> str:
+    for key in _stock_name_lookup_keys(name):
+        local_code = stock_code_map.get(key)
+        if local_code:
+            return local_code
+    return ''
 
 
 def _decode_tnf_field(raw: bytes) -> str:
@@ -92,6 +159,30 @@ def _iter_infoharbor_full_names(path: Path) -> Iterator[tuple[str, str]]:
             yield name, code
 
 
+def _iter_infoharbor_company_aliases(path: Path) -> Iterator[tuple[str, str]]:
+    text = _read_text_file(path)
+    for line in text.splitlines():
+        fields = [field.strip() for field in line.split('|')]
+        if len(fields) < 3:
+            continue
+        code, name = fields[0], fields[1]
+        if not re.fullmatch(r'\d{6}', code) or not name:
+            continue
+        for alias in _iter_infoharbor_aliases(name, fields[2]):
+            yield alias, code
+
+
+def _add_unique_alias(stock_code_map: dict[str, str], alias: str, code: str) -> None:
+    keys = {alias, normalize_stock_name(alias)}
+    for key in keys:
+        if not key:
+            continue
+        existing_code = stock_code_map.get(key)
+        if existing_code and existing_code != code:
+            return
+    _add_stock_code(stock_code_map, alias, code)
+
+
 @lru_cache(maxsize=4)
 def load_tdx_stock_code_map(tdx_root: str | os.PathLike[str] = DEFAULT_TDX_ROOT) -> dict[str, str]:
     hq_cache = Path(tdx_root) / 'T0002' / 'hq_cache'
@@ -118,6 +209,14 @@ def load_tdx_stock_code_map(tdx_root: str | os.PathLike[str] = DEFAULT_TDX_ROOT)
             for name, code in _iter_infoharbor_full_names(full_name_path):
                 if code in stock_codes:
                     _add_stock_code(stock_code_map, name, code)
+
+            alias_codes: dict[str, set[str]] = {}
+            for alias, code in _iter_infoharbor_company_aliases(full_name_path):
+                if code in stock_codes:
+                    alias_codes.setdefault(alias, set()).add(code)
+            for alias, codes in alias_codes.items():
+                if len(codes) == 1:
+                    _add_unique_alias(stock_code_map, alias, next(iter(codes)))
         except OSError as exc:
             logging.warning(f'[TDX股票主数据] 读取失败 {full_name_path}: {exc}')
 

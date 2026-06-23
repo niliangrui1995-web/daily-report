@@ -23,6 +23,8 @@ from artifact_store import (
     record_run_state,
     set_run_timestamp,
     set_preflight_summary,
+    summarize_stage_degradations,
+    update_manifest_context,
     update_run_manifest,
 )
 from agent_assistant import explain_preflight
@@ -105,13 +107,18 @@ def configure_run_logging() -> None:
 
 def _run_orchestrator(flags: list[str], *, command_name: str) -> int:
     preflight_result = _collect_preflight(strict=True)
-    set_preflight_summary(preflight_result["summary"])
+    preflight_summary = preflight_result["summary"]
+    set_preflight_summary(preflight_summary)
     try:
         explain_preflight_and_record(preflight_result)
     except Exception:
         pass
 
-    preflight_exit_code = int(preflight_result.get("summary", {}).get("exit_code", EXIT_CHECK_FAILED))
+    preflight_exit_code = int(preflight_summary.get("exit_code", EXIT_CHECK_FAILED))
+    update_manifest_context(
+        runtime_context={"preflight_exit_code": preflight_exit_code},
+        preflight=preflight_summary,
+    )
     if preflight_exit_code != EXIT_OK:
         record_run_state(
             status="not_entered_main_flow",
@@ -186,14 +193,33 @@ def _manifest_run_state(manifest: dict[str, Any]) -> dict[str, Any]:
     runtime_context = manifest.get("runtime_context")
     if not isinstance(runtime_context, dict):
         runtime_context = {}
+    stages = manifest.get("stages", {})
+    if not isinstance(stages, dict):
+        stages = {}
+    orchestrator_metrics = {}
+    orchestrator_payload = stages.get("orchestrator", {})
+    if isinstance(orchestrator_payload, dict):
+        metrics = orchestrator_payload.get("metrics", {})
+        if isinstance(metrics, dict):
+            orchestrator_metrics = metrics
 
     status = str(manifest.get("status") or runtime_context.get("run_state") or "").strip()
     root_cause = str(manifest.get("root_cause") or runtime_context.get("root_cause") or "").strip()
     reason = str(manifest.get("status_reason") or runtime_context.get("run_state_reason") or "").strip()
     main_flow_entered = manifest.get("main_flow_entered", runtime_context.get("main_flow_entered"))
+    resume_from = str(runtime_context.get("resume_from") or orchestrator_metrics.get("resume_from") or "").strip()
+    resume_start_stage = str(
+        runtime_context.get("resume_start_stage") or orchestrator_metrics.get("resume_start_stage") or ""
+    ).strip()
+    completed_after_resume = runtime_context.get("completed_after_resume")
+    if completed_after_resume is None:
+        completed_after_resume = orchestrator_metrics.get("completed_after_resume")
+    if completed_after_resume is None:
+        completed_after_resume = bool(
+            status.startswith("completed") and resume_from and resume_from not in {"none", "p9_done"}
+        )
 
     if not status:
-        stages = manifest.get("stages", {})
         if isinstance(stages, dict) and stages and "orchestrator" not in stages:
             status = "not_entered_main_flow"
             root_cause = "missing_orchestrator_state"
@@ -210,6 +236,10 @@ def _manifest_run_state(manifest: dict[str, Any]) -> dict[str, Any]:
         "reason": reason,
         "main_flow_entered": main_flow_entered,
         "schedule": _manifest_schedule(manifest, runtime_context),
+        "degraded_stages": summarize_stage_degradations(manifest),
+        "completed_after_resume": bool(completed_after_resume),
+        "resume_from": resume_from,
+        "resume_start_stage": resume_start_stage,
     }
 
 
@@ -284,13 +314,28 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"day_dir: {day_dir}")
     print(f"manifest: {manifest_path}")
     print(f"trading_day: {'yes' if target_is_trading_day else 'no'}")
-    print(
+    run_state_line = (
         f"run_state: {run_state['status']} "
         f"root_cause={run_state['root_cause']} "
         f"main_flow_entered={_bool_label(run_state['main_flow_entered'])}"
     )
+    if run_state["completed_after_resume"]:
+        run_state_line += " completed_after_resume=yes"
+        if run_state["resume_from"]:
+            run_state_line += f" resume_from={run_state['resume_from']}"
+        if run_state["resume_start_stage"]:
+            run_state_line += f" resume_start_stage={run_state['resume_start_stage']}"
+    print(run_state_line)
     if run_state["reason"]:
         print(f"run_reason: {run_state['reason']}")
+    degraded_stages = run_state["degraded_stages"]
+    if degraded_stages:
+        stage_text = ", ".join(
+            f"{item['stage']}={item['status']}"
+            + (f" reason={item['reason']}" if item.get("reason") else "")
+            for item in degraded_stages
+        )
+        print(f"degraded_stages: {stage_text}")
     schedule = run_state["schedule"]
     if schedule:
         print(
@@ -481,6 +526,10 @@ def explain_preflight_and_record(result: dict) -> dict:
 def _run_preflight_with_agent(strict: bool) -> int:
     result = _collect_preflight(strict=strict)
     exit_code = _print_preflight(result)
+    update_manifest_context(
+        runtime_context={"preflight_exit_code": exit_code},
+        preflight=result.get("summary", {}),
+    )
     agent_result = explain_preflight_and_record(result)
     update_run_manifest(
         "agent_preflight",

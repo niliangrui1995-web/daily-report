@@ -236,6 +236,44 @@ def test_apply_tdx_stock_codes_to_report_overrides_model_codes(monkeypatch):
     assert metrics["p9_model_codes_ignored"] == 2
 
 
+def test_apply_tdx_stock_codes_to_report_uses_local_alias_fallback(monkeypatch):
+    import p9_reporter
+
+    payload = {
+        "sniper_tables": [
+            {
+                "track_name": "先进封装",
+                "targets": [{"name": "文一科技"}],
+            },
+            {
+                "track_name": "光通信",
+                "targets": [{"name": "博创科技"}],
+            },
+        ],
+        "today_advice": [{"name": "博创科技"}],
+    }
+
+    monkeypatch.setattr(
+        p9_reporter,
+        "load_tdx_stock_code_map",
+        lambda: {
+            "三佳科技": "600520",
+            "文一三佳": "600520",
+            "文一科技": "600520",
+            "长芯博创": "300548",
+            "博创股份": "300548",
+        },
+    )
+
+    metrics = p9_reporter._apply_tdx_stock_codes_to_report(payload)
+
+    assert payload["sniper_tables"][0]["targets"][0]["code"] == "600520"
+    assert payload["sniper_tables"][1]["targets"][0]["code"] == "300548"
+    assert payload["today_advice"][0]["code"] == "300548"
+    assert metrics["p9_codes_filled_from_tdx"] == 3
+    assert metrics["p9_unmapped_codes"] == 0
+
+
 def test_p9_prompt_no_longer_asks_model_for_stock_codes():
     from pathlib import Path
 

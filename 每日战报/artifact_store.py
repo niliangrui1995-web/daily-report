@@ -22,13 +22,19 @@ MANIFEST_FILENAME = "run_manifest.json"
 UTF8_FILE_ENCODING = "utf-8-sig"
 
 ARTIFACT_CATEGORIES = ("logs", "meta", "agent")
+STAGE_DEGRADED_STATUSES = {
+    "completed_structured_degraded",
+}
+DEGRADED_STATUSES = STAGE_DEGRADED_STATUSES | {
+    "completed_with_stage_degradation",
+}
 SUCCESS_STATUSES = {
     "completed",
     "json_ready",
     "completed_recovered",
     "completed_email_sent",
     "completed_no_email",
-}
+} | DEGRADED_STATUSES
 
 _MANIFEST_LOCK = threading.RLock()
 
@@ -194,6 +200,31 @@ def _json_ready(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_json_ready(item) for item in value]
     return value
+
+
+def summarize_stage_degradations(manifest: dict[str, Any]) -> list[dict[str, str]]:
+    stages = manifest.get("stages", {})
+    if not isinstance(stages, dict):
+        return []
+
+    degraded: list[dict[str, str]] = []
+    for stage_name, payload in sorted(stages.items()):
+        if not isinstance(payload, dict):
+            continue
+        status = str(payload.get("status") or "").strip()
+        metrics = payload.get("metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = {}
+        if status not in STAGE_DEGRADED_STATUSES and not metrics.get("structured_degraded"):
+            continue
+        reason = str(
+            metrics.get("degrade_reason")
+            or metrics.get("parse_error")
+            or metrics.get("fallback_reason")
+            or ""
+        ).strip()
+        degraded.append({"stage": str(stage_name), "status": status or "unknown", "reason": reason})
+    return degraded
 
 
 def _lock_manifest_handle(handle) -> None:
@@ -410,10 +441,15 @@ def update_manifest_context(
             manifest["updated_at"] = datetime.now().isoformat()
             manifest["manifest_version"] = 3
 
+            context = manifest.setdefault("runtime_context", {})
             if runtime_context:
-                manifest.setdefault("runtime_context", {}).update(runtime_context)
+                context.update(runtime_context)
             if preflight is not None:
                 manifest["preflight"] = preflight
+                if isinstance(preflight, dict) and "exit_code" in preflight:
+                    context["preflight_exit_code"] = preflight["exit_code"]
+                else:
+                    context.pop("preflight_exit_code", None)
 
             _write_manifest_file(manifest_path, manifest)
             _cleanup_legacy_manifest(manifest_path)
@@ -441,6 +477,9 @@ def record_run_state(
         with _manifest_file_lock(day_dir):
             manifest = _load_manifest_for_write(initial_run_ts, day_dir)
             run_ts = timestamp or env_run_ts or manifest.get("run_timestamp") or initial_run_ts
+            previous_status = str(manifest.get("status") or "").strip()
+            previous_root_cause = str(manifest.get("root_cause") or "").strip()
+            previous_reason = str(manifest.get("status_reason") or "").strip()
             manifest["run_timestamp"] = run_ts
             manifest["updated_at"] = datetime.now().isoformat()
             manifest["manifest_version"] = 3
@@ -455,6 +494,16 @@ def record_run_state(
                 manifest["schedule_decision"] = _json_ready(schedule)
 
             context = manifest.setdefault("runtime_context", {})
+            if (
+                status == "running"
+                and previous_status
+                and (previous_status.startswith("failed") or previous_status == "not_entered_main_flow")
+            ):
+                context["previous_run_state"] = previous_status
+                if previous_root_cause:
+                    context["previous_root_cause"] = previous_root_cause
+                if previous_reason:
+                    context["previous_status_reason"] = previous_reason
             context.update(
                 {
                     "run_state": status,

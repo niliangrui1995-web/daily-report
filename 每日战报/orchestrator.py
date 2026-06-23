@@ -23,6 +23,7 @@ from artifact_store import (
     load_run_manifest,
     record_run_state,
     set_run_timestamp,
+    summarize_stage_degradations,
     update_manifest_context,
     update_run_manifest,
     write_json_artifact,
@@ -1019,18 +1020,29 @@ def orchestrator_main(argv: list[str] | None = None):
         run_ts = set_run_timestamp()
 
     resume_from = ckpt["stage"]
+    start_at = _resolve_start_stage(resume_from)
+    completed_after_resume = resume_from not in {"", "none", "p9_done"}
+    resume_runtime_context = {
+        "resume_from": resume_from,
+        "resume_start_stage": start_at or "",
+        "completed_after_resume": completed_after_resume,
+    }
     update_run_manifest(
         "orchestrator",
         status="started",
         metrics={
             "resume_from": resume_from,
+            "resume_start_stage": start_at or "",
+            "completed_after_resume": completed_after_resume,
             "force_restart": force_restart,
             "force_run": force_run,
         },
         timestamp=run_ts,
     )
+    runtime_context = build_runtime_context()
+    runtime_context.update(resume_runtime_context)
     update_manifest_context(
-        runtime_context=build_runtime_context(),
+        runtime_context=runtime_context,
         preflight=get_preflight_summary(),
         timestamp=run_ts,
     )
@@ -1040,6 +1052,7 @@ def orchestrator_main(argv: list[str] | None = None):
         reason="orchestrator entered main flow",
         source="orchestrator",
         main_flow_entered=True,
+        runtime_context=resume_runtime_context,
         timestamp=run_ts,
     )
 
@@ -1050,6 +1063,8 @@ def orchestrator_main(argv: list[str] | None = None):
             status="completed",
             metrics={
                 "resume_from": resume_from,
+                "resume_start_stage": start_at or "",
+                "completed_after_resume": completed_after_resume,
                 "force_restart": force_restart,
                 "force_run": force_run,
                 "total_elapsed_seconds": round(time.time() - total_start, 1),
@@ -1062,12 +1077,12 @@ def orchestrator_main(argv: list[str] | None = None):
             reason="war report already exists for today",
             source="orchestrator",
             main_flow_entered=True,
+            runtime_context=resume_runtime_context,
             timestamp=run_ts,
         )
         return
 
     context = _build_context(now, run_ts, ckpt, resume_from)
-    start_at = _resolve_start_stage(resume_from)
     try:
         run_stage_registry(_build_stage_registry(), context, start_at=start_at)
     except Exception as exc:
@@ -1077,6 +1092,8 @@ def orchestrator_main(argv: list[str] | None = None):
             status=status,
             metrics={
                 "resume_from": resume_from,
+                "resume_start_stage": start_at or "",
+                "completed_after_resume": completed_after_resume,
                 "total_elapsed_seconds": round(time.time() - total_start, 1),
                 "error": str(exc),
             },
@@ -1088,6 +1105,7 @@ def orchestrator_main(argv: list[str] | None = None):
             reason=str(exc),
             source="orchestrator",
             main_flow_entered=True,
+            runtime_context=resume_runtime_context,
             timestamp=run_ts,
         )
         try:
@@ -1098,22 +1116,38 @@ def orchestrator_main(argv: list[str] | None = None):
         raise
 
     total_elapsed = time.time() - total_start
+    degraded_stages = summarize_stage_degradations(load_run_manifest())
+    final_status = "completed_with_stage_degradation" if degraded_stages else "completed"
+    final_root_cause = "stage_degraded" if degraded_stages else "completed"
+    if degraded_stages:
+        final_reason = "completed with degraded stages: " + ", ".join(item["stage"] for item in degraded_stages)
+    else:
+        final_reason = "orchestrator completed"
+    if completed_after_resume:
+        final_reason = f"{final_reason} after resume_from={resume_from} start_stage={start_at or 'unknown'}"
+    final_runtime_context = dict(resume_runtime_context)
+    if degraded_stages:
+        final_runtime_context["degraded_stages"] = degraded_stages
     update_run_manifest(
         "orchestrator",
-        status="completed",
+        status=final_status,
         metrics={
             "resume_from": resume_from,
+            "resume_start_stage": start_at or "",
+            "completed_after_resume": completed_after_resume,
             "total_elapsed_seconds": round(total_elapsed, 1),
             "final_report_chars": len(context.get("final_report", "") or ""),
+            "degraded_stage_count": len(degraded_stages),
         },
         timestamp=run_ts,
     )
     record_run_state(
-        status="completed",
-        root_cause="completed",
-        reason="orchestrator completed",
+        status=final_status,
+        root_cause=final_root_cause,
+        reason=final_reason,
         source="orchestrator",
         main_flow_entered=True,
+        runtime_context=final_runtime_context,
         timestamp=run_ts,
     )
     logging.info("pipeline finished in %.1fs", total_elapsed)

@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait, ALL_COMPL
 from urllib.parse import urljoin, urlparse
 
 import requests
-from scraper_utils import enrich_article_url, is_article_url as _is_article_url
+from scraper_utils import enrich_article_url, is_article_url as _is_article_url, _safe_external_requests_get
 from http_security import get_tls_policy_for_url, log_tls_policy
 
 
@@ -254,7 +254,7 @@ def _scrape_one_source(source_cfg: dict) -> list[dict]:
         try:
             tls_policy = get_tls_policy_for_url(fetch_url)
             log_tls_policy('P1 Web', fetch_url, tls_policy)
-            resp = requests.get(fetch_url, headers=HEADERS, timeout=source_timeout, verify=tls_policy['verify'])
+            resp = _safe_external_requests_get(fetch_url, headers=HEADERS, timeout=source_timeout, verify=tls_policy['verify'])
             resp.raise_for_status()
         except requests.exceptions.Timeout:
             logging.warning(f'[Web] {name}: 请求超时 ({source_timeout}s) - {fetch_url}')

@@ -7,6 +7,7 @@ import html as html_lib
 import json
 import logging
 import socket
+import ssl
 import urllib.request
 from contextlib import contextmanager
 from datetime import datetime
@@ -237,11 +238,13 @@ def _send_message(
     source_address = (source_ip, 0) if source_ip else None
 
     def send() -> None:
+        context = ssl.create_default_context()
         with smtplib.SMTP_SSL(
             SMTP_HOST,
             SMTP_PORT,
             timeout=SMTP_TIMEOUT_SECONDS,
             source_address=source_address,
+            context=context,
         ) as s:
             s.set_debuglevel(0)
             s.login(sender_email, sender_password)

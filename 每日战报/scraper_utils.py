@@ -14,7 +14,6 @@ import logging
 import random
 import socket
 import time
-from functools import lru_cache
 import requests
 from urllib.parse import urljoin, urlparse
 from config import SUMMARY_LEN, SOURCE_CONTENT_SELECTORS, GENERIC_CONTENT_SELECTORS, CONTENT_NOISE_KEYWORDS, FAKE_UA, URL_BLACKLIST
@@ -94,7 +93,6 @@ def _is_blocked_hostname(hostname: str) -> bool:
     return host in BLOCKED_HOSTNAMES or host.endswith(BLOCKED_HOST_SUFFIXES)
 
 
-@lru_cache(maxsize=1024)
 def _host_resolves_to_public_addresses(hostname: str) -> bool:
     try:
         addr_infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
@@ -150,15 +148,20 @@ def _safe_url_for_fetch(url: str) -> bool:
     return bool(url) and is_article_url(url) and _is_safe_external_url(url, resolve_dns=True)
 
 
-def _safe_requests_get(url: str, **kwargs) -> requests.Response:
+def _safe_external_url_for_fetch(url: str) -> bool:
+    return bool(url) and _is_safe_external_url(url, resolve_dns=True)
+
+
+def _safe_requests_get_checked(url: str, url_checker, **kwargs) -> requests.Response:
     current_url = url
     timeout = kwargs.pop('timeout', DEFAULT_FETCH_TIMEOUT)
+    kwargs.pop('allow_redirects', None)
     for _ in range(MAX_SAFE_REDIRECTS + 1):
-        if not _safe_url_for_fetch(current_url):
+        if not url_checker(current_url):
             raise requests.exceptions.InvalidURL(f'Blocked unsafe fetch URL: {current_url}')
 
         response = requests.get(current_url, allow_redirects=False, timeout=timeout, **kwargs)
-        if not response.is_redirect and not response.is_permanent_redirect:
+        if not getattr(response, 'is_redirect', False) and not getattr(response, 'is_permanent_redirect', False):
             return response
 
         location = response.headers.get('Location')
@@ -167,6 +170,14 @@ def _safe_requests_get(url: str, **kwargs) -> requests.Response:
         current_url = urljoin(response.url or current_url, location)
 
     raise requests.exceptions.TooManyRedirects(f'Too many redirects for URL: {url}')
+
+
+def _safe_requests_get(url: str, **kwargs) -> requests.Response:
+    return _safe_requests_get_checked(url, _safe_url_for_fetch, **kwargs)
+
+
+def _safe_external_requests_get(url: str, **kwargs) -> requests.Response:
+    return _safe_requests_get_checked(url, _safe_external_url_for_fetch, **kwargs)
 
 
 def _is_high_value_domain(url: str) -> bool:

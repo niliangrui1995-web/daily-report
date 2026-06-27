@@ -19,7 +19,6 @@ import time
 import random
 from datetime import datetime, timedelta, timezone
 import feedparser
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, ALL_COMPLETED
 
 from config import (
@@ -30,7 +29,7 @@ from config import (
     REQUEST_TIMEOUT,
     SUMMARY_LEN,
 )
-from scraper_utils import is_article_url as _is_article_url
+from scraper_utils import is_article_url as _is_article_url, _safe_external_requests_get
 from utils import parse_backtrack_hours
 
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -67,7 +66,7 @@ def _fetch_rss(name: str, url: str, source_tag: str) -> list[dict]:
         headers = {'User-Agent': FAKE_UA, 'Accept': 'application/atom+xml, application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8'}
     
     try:
-        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp = _safe_external_requests_get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         feed = feedparser.parse(resp.content)
     except Exception as exc:
@@ -98,7 +97,7 @@ def _fetch_rss(name: str, url: str, source_tag: str) -> list[dict]:
 def _fetch_reddit(sub: str) -> list[dict]:
     url = f'https://www.reddit.com/r/{sub}/new.json?limit=50'
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp = _safe_external_requests_get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
             data = resp.json()
             entries = []
@@ -127,7 +126,7 @@ def _fetch_reddit(sub: str) -> list[dict]:
 
 def _fetch_hackernews() -> list[dict]:
     try:
-        resp = requests.get('https://hacker-news.firebaseio.com/v0/newstories.json', timeout=REQUEST_TIMEOUT)
+        resp = _safe_external_requests_get('https://hacker-news.firebaseio.com/v0/newstories.json', timeout=REQUEST_TIMEOUT)
         ids = resp.json()[:50]
     except Exception as e:
         logging.debug(f'Ignored return [] exception: {e}')
@@ -135,7 +134,7 @@ def _fetch_hackernews() -> list[dict]:
         
     def _fetch_one_hn_story(item_id: int) -> dict | None:
         try:
-            item = requests.get(f'https://hacker-news.firebaseio.com/v0/item/{item_id}.json', timeout=5).json()
+            item = _safe_external_requests_get(f'https://hacker-news.firebaseio.com/v0/item/{item_id}.json', timeout=5).json()
             if not item or item.get('type') != 'story':
                 return None
             created = item.get('time', 0)

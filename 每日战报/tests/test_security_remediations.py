@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import ssl
 import sys
 from datetime import datetime
 
@@ -40,8 +41,6 @@ def test_is_article_url_rejects_unsafe_targets():
 def test_safe_fetch_url_allows_public_dns_resolution(monkeypatch):
     import scraper_utils
 
-    scraper_utils._host_resolves_to_public_addresses.cache_clear()
-
     def fake_getaddrinfo(host, port, type=0):
         assert host == "example.com"
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
@@ -54,8 +53,6 @@ def test_safe_fetch_url_allows_public_dns_resolution(monkeypatch):
 def test_safe_fetch_url_allows_proxy_fake_ip_dns_resolution(monkeypatch):
     import scraper_utils
 
-    scraper_utils._host_resolves_to_public_addresses.cache_clear()
-
     def fake_getaddrinfo(host, port, type=0):
         assert host == "example.com"
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.182", 443))]
@@ -67,8 +64,6 @@ def test_safe_fetch_url_allows_proxy_fake_ip_dns_resolution(monkeypatch):
 
 def test_safe_fetch_url_rejects_dns_private_resolution(monkeypatch):
     import scraper_utils
-
-    scraper_utils._host_resolves_to_public_addresses.cache_clear()
 
     def fake_getaddrinfo(host, port, type=0):
         assert host == "attacker.example"
@@ -97,7 +92,6 @@ def test_enrich_article_url_rejects_private_url_before_request(monkeypatch):
 def test_safe_requests_get_rejects_redirect_to_private_host(monkeypatch):
     import scraper_utils
 
-    scraper_utils._host_resolves_to_public_addresses.cache_clear()
     calls = []
 
     def fake_getaddrinfo(host, port, type=0):
@@ -127,7 +121,6 @@ def test_safe_requests_get_rejects_redirect_to_private_host(monkeypatch):
 def test_safe_requests_get_applies_default_timeout(monkeypatch):
     import scraper_utils
 
-    scraper_utils._host_resolves_to_public_addresses.cache_clear()
     calls = []
 
     def fake_getaddrinfo(host, port, type=0):
@@ -153,19 +146,182 @@ def test_safe_requests_get_applies_default_timeout(monkeypatch):
     assert calls[0]["timeout"] == 12
 
 
+def test_safe_requests_get_rechecks_dns_on_each_request(monkeypatch):
+    import scraper_utils
+
+    state = {"private": False, "dns_calls": 0, "http_calls": []}
+
+    def fake_getaddrinfo(host, port, type=0):
+        assert host == "rebind.example"
+        state["dns_calls"] += 1
+        ip = "10.0.0.5" if state["private"] else "8.8.8.8"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 443))]
+
+    class OkResponse:
+        status_code = 200
+        headers = {}
+        url = "https://rebind.example/news"
+        is_redirect = False
+        is_permanent_redirect = False
+
+    def fake_get(url, **kwargs):
+        state["http_calls"].append((url, kwargs.get("allow_redirects")))
+        return OkResponse()
+
+    monkeypatch.setattr(scraper_utils.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(scraper_utils.requests, "get", fake_get)
+
+    assert scraper_utils._safe_requests_get("https://rebind.example/news", headers={}, verify=True).status_code == 200
+    state["private"] = True
+
+    with pytest.raises(requests.exceptions.InvalidURL):
+        scraper_utils._safe_requests_get("https://rebind.example/news", headers={}, verify=True)
+
+    assert state["dns_calls"] == 2
+    assert state["http_calls"] == [("https://rebind.example/news", False)]
+
+
+def test_safe_external_requests_get_allows_non_article_source_urls(monkeypatch):
+    import scraper_utils
+
+    calls = []
+
+    def fake_getaddrinfo(host, port, type=0):
+        assert host == "feeds.example.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+
+    class OkResponse:
+        status_code = 200
+        headers = {}
+        url = "https://feeds.example.com/feed.xml"
+        is_redirect = False
+        is_permanent_redirect = False
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs.get("allow_redirects")))
+        return OkResponse()
+
+    monkeypatch.setattr(scraper_utils.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(scraper_utils.requests, "get", fake_get)
+
+    assert scraper_utils._safe_external_requests_get("https://feeds.example.com/feed.xml").status_code == 200
+    assert calls == [("https://feeds.example.com/feed.xml", False)]
+
+
 def test_rss_fetch_failure_does_not_let_feedparser_fetch_url(monkeypatch):
     import p1_rss
 
-    def fail_get(*args, **kwargs):
+    def fail_safe_get(*args, **kwargs):
         raise requests.exceptions.Timeout("network timeout")
 
     def fail_parse(*args, **kwargs):
         raise AssertionError("feedparser.parse should not fetch URL after guarded request failure")
 
-    monkeypatch.setattr(p1_rss.requests, "get", fail_get)
+    monkeypatch.setattr(p1_rss, "_safe_external_requests_get", fail_safe_get)
     monkeypatch.setattr(p1_rss.feedparser, "parse", fail_parse)
 
     assert p1_rss._fetch_rss("Example", "https://example.com/feed.xml", "example") == []
+
+
+def test_rss_source_fetch_blocks_redirect_to_private_host(monkeypatch):
+    import p1_rss
+    import scraper_utils
+
+    calls = []
+
+    def fake_getaddrinfo(host, port, type=0):
+        assert host == "example.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+
+    class RedirectResponse:
+        status_code = 302
+        headers = {"Location": "http://127.0.0.1:8123/feed.xml"}
+        url = "https://example.com/feed.xml"
+        is_redirect = True
+        is_permanent_redirect = False
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs.get("allow_redirects")))
+        return RedirectResponse()
+
+    def fail_parse(*args, **kwargs):
+        raise AssertionError("unsafe redirected response must not be parsed")
+
+    monkeypatch.setattr(scraper_utils.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(scraper_utils.requests, "get", fake_get)
+    monkeypatch.setattr(p1_rss.feedparser, "parse", fail_parse)
+
+    assert p1_rss._fetch_rss("Example", "https://example.com/feed.xml", "example") == []
+    assert calls == [("https://example.com/feed.xml", False)]
+
+
+def test_social_source_fetches_use_safe_external_get(monkeypatch):
+    import p1_rss
+
+    calls = []
+
+    class JsonResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_safe_get(url, **kwargs):
+        calls.append(url)
+        if "reddit.com" in url:
+            return JsonResponse({"data": {"children": []}})
+        if url.endswith("newstories.json"):
+            return JsonResponse([1])
+        return JsonResponse({"type": "story", "title": "AI infra", "time": 1, "url": "https://example.com/news"})
+
+    monkeypatch.setattr(p1_rss, "_safe_external_requests_get", fake_safe_get)
+
+    assert p1_rss._fetch_reddit("hardware") == []
+    hn_entries = p1_rss._fetch_hackernews()
+
+    assert hn_entries[0]["title"] == "AI infra"
+    assert calls == [
+        "https://www.reddit.com/r/hardware/new.json?limit=50",
+        "https://hacker-news.firebaseio.com/v0/newstories.json",
+        "https://hacker-news.firebaseio.com/v0/item/1.json",
+    ]
+
+
+def test_web_source_fetch_blocks_redirect_to_private_host(monkeypatch):
+    import p1_web
+    import scraper_utils
+
+    calls = []
+
+    def fake_getaddrinfo(host, port, type=0):
+        assert host == "example.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+
+    class RedirectResponse:
+        status_code = 302
+        headers = {"Location": "http://127.0.0.1:8123/admin"}
+        url = "https://example.com/source"
+        is_redirect = True
+        is_permanent_redirect = False
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs.get("allow_redirects")))
+        return RedirectResponse()
+
+    monkeypatch.setattr(scraper_utils.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(scraper_utils.requests, "get", fake_get)
+
+    assert p1_web._scrape_one_source({"name": "Example", "url": "https://example.com/source", "selector": "a"}) == []
+    assert calls == [("https://example.com/source", False)]
 
 
 def test_search_exception_logging_redacts_gemini_key(monkeypatch, caplog):
@@ -452,3 +608,53 @@ def test_report_email_falls_back_to_tun_safe_route(monkeypatch):
         {"remote_ip": None, "source_ip": None},
         {"remote_ip": "43.163.178.76", "source_ip": "192.168.0.102"},
     ]
+
+
+def test_send_message_uses_verifying_ssl_context(monkeypatch):
+    import p9_email
+
+    captured = {}
+
+    class FakeSMTP:
+        def __init__(self, host, port, *, timeout, source_address=None, context=None):
+            captured["host"] = host
+            captured["port"] = port
+            captured["timeout"] = timeout
+            captured["source_address"] = source_address
+            captured["context"] = context
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def set_debuglevel(self, level):
+            captured["debuglevel"] = level
+
+        def login(self, sender_email, sender_password):
+            captured["login"] = (sender_email, sender_password)
+
+        def sendmail(self, sender_email, receivers, payload):
+            captured["sendmail"] = (sender_email, receivers, payload)
+
+    msg = p9_email.build_report_email_message(
+        "report",
+        sender_email="sender@example.com",
+        receiver_email="receiver@example.com",
+        now=datetime(2026, 5, 3, 9, 0),
+    )
+    monkeypatch.setattr(p9_email.smtplib, "SMTP_SSL", FakeSMTP)
+
+    p9_email._send_message(
+        msg,
+        sender_email="sender@example.com",
+        sender_password="secret",
+        receiver_email="receiver@example.com",
+    )
+
+    context = captured["context"]
+    assert isinstance(context, ssl.SSLContext)
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert captured["login"] == ("sender@example.com", "secret")

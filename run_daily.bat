@@ -5,7 +5,7 @@ set "ROOT_DIR=%~dp0"
 for %%I in ("%ROOT_DIR%.") do set "ROOT_DIR=%%~fI\"
 
 set "APP_DIR="
-set "PYTHON_EXE=%ROOT_DIR%.venv\Scripts\python.exe"
+if not defined PYTHON_EXE set "PYTHON_EXE=%ROOT_DIR%.venv\Scripts\python.exe"
 set "SCHEDULED_LAUNCHER="
 set "PIPELINE_CLI="
 if not defined RUN_DAILY_HOLD_SECONDS set "RUN_DAILY_HOLD_SECONDS=15"
@@ -142,7 +142,7 @@ exit /b 0
 :run_default_entry
 if exist "%SCHEDULED_LAUNCHER%" (
     "%PYTHON_EXE%" -u "%SCHEDULED_LAUNCHER%"
-    exit /b %errorlevel%
+    exit /b !errorlevel!
 )
 echo [WARN] scheduled_launcher.py not found, fallback to pipeline_cli.py run
 "%PYTHON_EXE%" -u "%PIPELINE_CLI%" run

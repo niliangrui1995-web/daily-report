@@ -175,10 +175,10 @@ class TestScheduledLauncherSimulation:
 class TestRunDailyBatchSimulation:
     def test_run_daily_defaults_to_strict_preflight(self):
         source_batch = Path(__file__).resolve().parents[2] / "run_daily.bat"
+        source = source_batch.read_text(encoding="utf-8")
 
-        assert 'if not defined RUN_DAILY_PREFLIGHT set "RUN_DAILY_PREFLIGHT=strict"' in source_batch.read_text(
-            encoding="utf-8"
-        )
+        assert 'if not defined PYTHON_EXE set "PYTHON_EXE=%ROOT_DIR%.venv\\Scripts\\python.exe"' in source
+        assert 'if not defined RUN_DAILY_PREFLIGHT set "RUN_DAILY_PREFLIGHT=strict"' in source
 
     def test_run_daily_status_skips_outer_preflight(self, tmp_path):
         if os.name != "nt":
@@ -187,14 +187,6 @@ class TestRunDailyBatchSimulation:
         source_batch = Path(__file__).resolve().parents[2] / "run_daily.bat"
         batch_path = tmp_path / "run_daily.bat"
         batch_path.write_text(source_batch.read_text(encoding="utf-8"), encoding="utf-8")
-
-        real_python = Path(sys.executable)
-        fake_python = tmp_path / ".venv" / "Scripts" / "python.exe"
-        fake_python.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fake_python.symlink_to(real_python)
-        except (NotImplementedError, OSError):
-            return
 
         app_dir = tmp_path / "app"
         app_dir.mkdir(parents=True, exist_ok=True)
@@ -216,6 +208,7 @@ class TestRunDailyBatchSimulation:
         )
 
         env = os.environ.copy()
+        env["PYTHON_EXE"] = sys.executable
         env["RUN_DAILY_HOLD_SECONDS"] = "0"
         env["RUN_DAILY_PREFLIGHT"] = "strict"
 
@@ -239,14 +232,6 @@ class TestRunDailyBatchSimulation:
         source_batch = Path(__file__).resolve().parents[2] / "run_daily.bat"
         batch_path = tmp_path / "run_daily.bat"
         batch_path.write_text(source_batch.read_text(encoding="utf-8"), encoding="utf-8")
-
-        real_python = Path(sys.executable)
-        fake_python = tmp_path / ".venv" / "Scripts" / "python.exe"
-        fake_python.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fake_python.symlink_to(real_python)
-        except (NotImplementedError, OSError):
-            return
 
         app_dir = tmp_path / "app"
         app_dir.mkdir(parents=True, exist_ok=True)
@@ -285,6 +270,7 @@ class TestRunDailyBatchSimulation:
         )
 
         env = os.environ.copy()
+        env["PYTHON_EXE"] = sys.executable
         env["RUN_DAILY_HOLD_SECONDS"] = "0"
         env["RUN_DAILY_PREFLIGHT"] = "off"
         env["RUN_DAILY_AUTO_RESUME"] = "on"

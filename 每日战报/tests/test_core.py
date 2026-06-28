@@ -647,6 +647,18 @@ class TestP1WebTimeWindow:
         )
         assert result == "2026-04-10T23:59:59 (北京时间)"
 
+    def test_extract_web_published_at_from_compact_url_date(self):
+        """TrendForce 紧凑日期 URL 应进入近时效判定，而不是落成 unknown_time"""
+        from p1_web import _extract_web_published_at
+
+        result = _extract_web_published_at(
+            page_html="<html><body>no date here</body></html>",
+            raw_link="/presscenter/news/20260625-13121.html",
+            link="https://www.trendforce.com/presscenter/news/20260625-13121.html",
+            title="NVIDIA 800V HVDC Power Rack",
+        )
+        assert result == "2026-06-25T23:59:59 (北京时间)"
+
     def test_entries_to_p1_result_filters_outdated_items(self):
         """超出时间窗的网页条目不应进入 P1 输出"""
         from p1_web import _entries_to_p1_result

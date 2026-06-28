@@ -180,6 +180,71 @@ class TestRunDailyBatchSimulation:
         assert 'if not defined PYTHON_EXE set "PYTHON_EXE=%ROOT_DIR%.venv\\Scripts\\python.exe"' in source
         assert 'if not defined RUN_DAILY_PREFLIGHT set "RUN_DAILY_PREFLIGHT=strict"' in source
 
+    def test_run_daily_default_uses_scheduled_launcher_after_preflight(self, tmp_path):
+        if os.name != "nt":
+            return
+
+        source_batch = Path(__file__).resolve().parents[2] / "run_daily.bat"
+        batch_path = tmp_path / "run_daily.bat"
+        batch_path.write_text(source_batch.read_text(encoding="utf-8"), encoding="utf-8")
+
+        app_dir = tmp_path / "app"
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "scheduled_launcher.py").write_text(
+            (
+                "import json\n"
+                "import subprocess\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "\n"
+                "state = Path(__file__).with_name('calls.json')\n"
+                "calls = json.loads(state.read_text(encoding='utf-8')) if state.exists() else []\n"
+                "calls.append(['scheduled_launcher'])\n"
+                "state.write_text(json.dumps(calls), encoding='utf-8')\n"
+                "result = subprocess.run([sys.executable, str(Path(__file__).with_name('pipeline_cli.py')), 'run'])\n"
+                "raise SystemExit(result.returncode)\n"
+            ),
+            encoding="utf-8",
+        )
+        (app_dir / "pipeline_cli.py").write_text(
+            (
+                "import json\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "\n"
+                "state = Path(__file__).with_name('calls.json')\n"
+                "calls = json.loads(state.read_text(encoding='utf-8')) if state.exists() else []\n"
+                "command = sys.argv[1] if len(sys.argv) > 1 else 'run'\n"
+                "calls.append(['pipeline_cli', command])\n"
+                "state.write_text(json.dumps(calls), encoding='utf-8')\n"
+                "raise SystemExit(0)\n"
+            ),
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env["PYTHON_EXE"] = sys.executable
+        env["RUN_DAILY_HOLD_SECONDS"] = "0"
+        env["RUN_DAILY_PREFLIGHT"] = "strict"
+        env["RUN_DAILY_AUTO_RESUME"] = "off"
+
+        result = subprocess.run(
+            [str(batch_path)],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        calls = json.loads((app_dir / "calls.json").read_text(encoding="utf-8"))
+        assert result.returncode == 0
+        assert calls == [
+            ["pipeline_cli", "preflight"],
+            ["scheduled_launcher"],
+            ["pipeline_cli", "run"],
+        ]
+
     def test_run_daily_status_skips_outer_preflight(self, tmp_path):
         if os.name != "nt":
             return

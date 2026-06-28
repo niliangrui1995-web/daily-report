@@ -12,6 +12,7 @@ Scrapling 公共工具 — 统一的正文深挖和 URL 过滤逻辑。
 import ipaddress
 import logging
 import random
+import re
 import socket
 import time
 import requests
@@ -267,6 +268,37 @@ def extract_content_from_html(html_text: str, source_name: str = '', url: str = 
             
     return ''
 
+
+def _extract_published_hint_from_html(html_text: str) -> str:
+    if not scrapling_available or not _Selector:
+        return ''
+    try:
+        page = _Selector(html_text)
+        for selector, attr in (
+            ("meta[property='article:published_time']", 'content'),
+            ("meta[property='og:published_time']", 'content'),
+            ("meta[name='pubdate']", 'content'),
+            ("meta[name='publishdate']", 'content'),
+            ("meta[name='date']", 'content'),
+            ("meta[itemprop='datePublished']", 'content'),
+            ("time[datetime]", 'datetime'),
+        ):
+            try:
+                matches = page.css(selector)
+                if matches:
+                    value = matches[0].attrib.get(attr, '').strip()
+                    if value:
+                        return value
+            except Exception as exc:
+                logging.debug(f'[Scrapling] published hint 选择器 {selector} 未命中: {exc}')
+
+        match = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html_text)
+        if match:
+            return match.group(1).strip()
+    except Exception as exc:
+        logging.debug(f'[Scrapling] published hint 提取失败: {exc}')
+    return ''
+
 def enrich_article_url(url: str, source_name: str = '', return_meta: bool = False):
     """一手源正文深挖——增强版。
 
@@ -294,6 +326,7 @@ def enrich_article_url(url: str, source_name: str = '', return_meta: bool = Fals
             'resolved_url': '',
             'tls_mode': 'strict',
             'insecure_fetch': False,
+            'published_at': '',
         }
 
         for fetch_url in fetch_urls:
@@ -307,10 +340,14 @@ def enrich_article_url(url: str, source_name: str = '', return_meta: bool = Fals
                     'resolved_url': fetch_url,
                     'tls_mode': tls_policy['tls_mode'],
                     'insecure_fetch': tls_policy['insecure_fetch'],
+                    'published_at': '',
                 }
                 resp = _safe_requests_get(fetch_url, headers=HEADERS, timeout=12, verify=tls_policy['verify'])
                 if resp.status_code >= 400:
                     continue
+                published_hint = _extract_published_hint_from_html(resp.text)
+                if published_hint:
+                    last_meta['published_at'] = published_hint
                 content = extract_content_from_html(resp.text, source_name=source_name, url=url)
                 if content and len(content) > 100:
                     return (content, last_meta) if return_meta else content
@@ -329,6 +366,7 @@ def enrich_article_url(url: str, source_name: str = '', return_meta: bool = Fals
             'resolved_url': '',
             'tls_mode': 'strict',
             'insecure_fetch': False,
+            'published_at': '',
         }
         return ('', empty_meta) if return_meta else ''
 

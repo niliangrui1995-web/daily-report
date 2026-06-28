@@ -93,6 +93,15 @@ _WEB_DATE_PATTERNS = [
 
 _DATE_ONLY_RE = re.compile(r'^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$')
 _URL_DATE_RE = re.compile(r'(?P<y>20\d{2})[/-](?P<m>\d{1,2})[/-](?P<d>\d{1,2})')
+_COMPACT_URL_DATE_RE = re.compile(r'(?<!\d)(?P<y>20\d{2})(?P<m>\d{2})(?P<d>\d{2})(?!\d)')
+_WEB_TIME_STAT_KEYS = (
+    ('time_recent', 'recent'),
+    ('time_unknown', 'unknown_time'),
+    ('time_stale', 'stale'),
+    ('time_parse_failed', 'parse_failed'),
+    ('time_future', 'future'),
+    ('time_invalid', 'invalid_time'),
+)
 
 
 def _normalize_web_datetime(raw_text: str) -> str:
@@ -188,11 +197,12 @@ def _extract_web_published_at(page_html: str, raw_link: str, link: str, title: s
     for candidate in (raw_link, link):
         if not candidate:
             continue
-        match = _URL_DATE_RE.search(candidate)
-        if match:
-            normalized = _normalize_web_datetime(f"{match.group('y')}-{match.group('m')}-{match.group('d')}")
-            if normalized:
-                return normalized
+        for pattern in (_URL_DATE_RE, _COMPACT_URL_DATE_RE):
+            match = pattern.search(candidate)
+            if match:
+                normalized = _normalize_web_datetime(f"{match.group('y')}-{match.group('m')}-{match.group('d')}")
+                if normalized:
+                    return normalized
 
     return ''
 
@@ -391,6 +401,38 @@ def _entries_to_p1_result(entries: list[dict], category: str, source_name: str, 
         'time_window_stats': time_window_stats,
     }
 
+
+def _reset_web_time_stats(stats: dict) -> None:
+    for key, _ in _WEB_TIME_STAT_KEYS:
+        stats[key] = 0
+
+
+def _add_web_time_stats(stats: dict, time_window_stats: dict) -> None:
+    for key, source_key in _WEB_TIME_STAT_KEYS:
+        stats[key] += int(time_window_stats.get(source_key, 0))
+
+
+def _rebuild_web_time_stats(stats: dict, results: list[dict]) -> None:
+    _reset_web_time_stats(stats)
+    for result in results:
+        _add_web_time_stats(stats, result.get('time_window_stats', {}))
+
+
+def _normalize_enrich_result(enriched) -> tuple[str, dict]:
+    if isinstance(enriched, tuple) and len(enriched) == 2:
+        content, meta = enriched
+        return content or '', meta if isinstance(meta, dict) else {}
+    return enriched or '', {}
+
+
+def _fill_entry_published_at_from_meta(entry: dict, meta: dict) -> None:
+    if entry.get('published_at'):
+        return
+    published_hint = meta.get('published_at', '') if isinstance(meta, dict) else ''
+    normalized = _normalize_web_datetime(published_hint)
+    if normalized:
+        entry['published_at'] = normalized
+
 def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
     hours = parse_backtrack_hours(backtrack)
     stats = {
@@ -453,13 +495,7 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
                 result, status, reason = future.result()
                 if status == 'ok' and result:
                     n_items = len(result['grounding_sources'])
-                    time_window_stats = result.get('time_window_stats', {})
-                    stats['time_recent'] += int(time_window_stats.get('recent', 0))
-                    stats['time_unknown'] += int(time_window_stats.get('unknown_time', 0))
-                    stats['time_stale'] += int(time_window_stats.get('stale', 0))
-                    stats['time_parse_failed'] += int(time_window_stats.get('parse_failed', 0))
-                    stats['time_future'] += int(time_window_stats.get('future', 0))
-                    stats['time_invalid'] += int(time_window_stats.get('invalid_time', 0))
+                    _add_web_time_stats(stats, result.get('time_window_stats', {}))
                     all_results.append(result)
                     stats['success'].append((source_name, n_items))
                     logging.info(f'  ✅ {source_name}: {n_items} 条')
@@ -500,7 +536,7 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
             
             def _process_one_web_item(item):
                 entry, url, source_name = item
-                return entry, enrich_article_url(url, source_name)
+                return entry, enrich_article_url(url, source_name, return_meta=True)
                 
             total_items = len(work_items)
             processed = 0
@@ -510,7 +546,9 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
                 
                 for future in as_completed(futures):
                     try:
-                        entry_ref, content = future.result()
+                        entry_ref, enriched = future.result()
+                        content, meta = _normalize_enrich_result(enriched)
+                        _fill_entry_published_at_from_meta(entry_ref, meta)
                         if content:
                             # Why: 深挖内容直接回填 entry['content']，确保进入 _entries_to_p1_result 主文本
                             entry_ref['content'] = content
@@ -539,6 +577,7 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
                 if refreshed:
                     rebuilt_results.append(refreshed)
             all_results = rebuilt_results
+            _rebuild_web_time_stats(stats, all_results)
 
     # 清理内部字段，避免外部调用方感知中间态结构
     for result in all_results:

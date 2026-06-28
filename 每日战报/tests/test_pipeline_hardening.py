@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -228,6 +228,54 @@ class TestP1WebTimeParsing:
         assert result is not None
         assert result["grounding_sources"][0]["time_status"] == "unknown_time"
         assert "unknown_time" in result["text"]
+
+    def test_web_phase2_published_hint_refreshes_time_stats(self, monkeypatch):
+        import p1_web
+
+        bj_tz = timezone(timedelta(hours=8))
+        published_hint = (datetime.now(bj_tz) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+
+        monkeypatch.setattr(p1_web, "_parser_available", True)
+        monkeypatch.setattr(
+            p1_web,
+            "V2_WEB_SOURCES",
+            [
+                {
+                    "name": "ExampleWeb",
+                    "url": "https://example.com/source",
+                    "selector": "article a",
+                    "category": "网页采集",
+                }
+            ],
+        )
+        monkeypatch.setattr(p1_web.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(p1_web.random, "uniform", lambda start, end: 0)
+        monkeypatch.setattr(p1_web.random, "shuffle", lambda items: None)
+        monkeypatch.setattr(
+            p1_web,
+            "_scrape_one_source",
+            lambda source_cfg: [
+                {
+                    "title": "Fresh article",
+                    "content": "",
+                    "url": "https://example.com/news/fresh-article",
+                    "published_at": "",
+                    "source": "ExampleWeb",
+                }
+            ],
+        )
+        monkeypatch.setattr(
+            p1_web,
+            "enrich_article_url",
+            lambda url, source_name, return_meta=False: ("fresh article body", {"published_at": published_hint}),
+        )
+
+        results, stats = p1_web.collect_from_web("24h")
+
+        assert stats["time_recent"] == 1
+        assert stats["time_unknown"] == 0
+        assert results[0]["grounding_sources"][0]["time_status"] == "recent"
+        assert "unknown_time" not in results[0]["text"]
 
 
 class TestManifestContext:
@@ -741,6 +789,54 @@ class TestPreflightChecks:
         assert run_state["status"] == "not_entered_main_flow"
         assert run_state["root_cause"] == "preflight_failed"
         assert run_state["main_flow_entered"] is False
+
+    def test_run_command_invokes_orchestrator_after_successful_preflight(self, monkeypatch):
+        import pipeline_cli
+
+        calls = []
+        successful_result = {
+            "checks": [],
+            "summary": {
+                "total": 0,
+                "failed": 0,
+                "warnings": 0,
+                "exit_code": pipeline_cli.EXIT_OK,
+            },
+        }
+
+        @contextmanager
+        def fake_lock(**kwargs):
+            calls.append(("lock", kwargs))
+            yield {"command": kwargs.get("command")}
+
+        monkeypatch.setattr(
+            pipeline_cli,
+            "_collect_preflight",
+            lambda strict: calls.append(("preflight", strict)) or successful_result,
+        )
+        monkeypatch.setattr(pipeline_cli, "set_preflight_summary", lambda summary: calls.append(("summary", summary)))
+        monkeypatch.setattr(
+            pipeline_cli,
+            "explain_preflight_and_record",
+            lambda result: calls.append(("agent", result["summary"]["exit_code"])),
+        )
+        monkeypatch.setattr(pipeline_cli, "update_manifest_context", lambda **kwargs: calls.append(("context", kwargs)))
+        monkeypatch.setattr(pipeline_cli, "configure_run_logging", lambda: calls.append(("logging",)))
+        monkeypatch.setattr(pipeline_cli, "acquire_run_lock", fake_lock)
+        monkeypatch.setitem(
+            sys.modules,
+            "orchestrator",
+            SimpleNamespace(orchestrator_main=lambda flags: calls.append(("orchestrator", list(flags)))),
+        )
+
+        result = pipeline_cli.main(["run"])
+
+        call_names = [call[0] for call in calls]
+        assert result == pipeline_cli.EXIT_OK
+        assert ("preflight", True) in calls
+        assert calls[call_names.index("lock")][1]["command"] == "run"
+        assert call_names.index("lock") < call_names.index("orchestrator")
+        assert ("orchestrator", []) in calls
 
     def test_status_prints_manifest_root_cause(self, monkeypatch, tmp_path, capsys):
         import pipeline_cli

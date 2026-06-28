@@ -29,7 +29,7 @@ from config import (
     WEB_SCRAPE_SOURCES as V2_WEB_SOURCES,
     FAKE_UA,
 )
-from utils import parse_backtrack_hours
+from utils import normalize_common_text_mojibake, parse_backtrack_hours
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -361,8 +361,8 @@ def _entries_to_p1_result(entries: list[dict], category: str, source_name: str, 
     grounding_sources = []
     
     for i, entry in enumerate(filtered, 1):
-        title = entry.get('title', '').strip()
-        content = entry.get('content', '').strip()
+        title = normalize_common_text_mojibake(entry.get('title', '')).strip()
+        content = normalize_common_text_mojibake(entry.get('content', '')).strip()
         url = entry.get('url', '')
         source = entry.get('source', source_name)
         published_at = entry.get('published_at', '')

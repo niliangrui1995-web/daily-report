@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 
 from artifact_store import write_text_artifact
+from config import P3_JINNANG_1_MAX_TARGETS, P3_JINNANG_1_RECOVERY_SOURCES
 from intel_structuring import normalize_p3_structured_items, render_p3_structured_markdown
 from search_engine import raw_gemini_search
 from settings import SEARCH_API_KEY_POOL, load_prompt
@@ -190,6 +191,11 @@ PRIORITY_KEYWORDS = [
     "robotics",
     "具身智能",
 ]
+
+JINNANG_1_RECOVERY_SOURCE_KEYS = {
+    source.strip().lower()
+    for source in P3_JINNANG_1_RECOVERY_SOURCES
+}
 
 
 def _call_gemini_search(prompt: str, max_retries: int = 3) -> dict:
@@ -439,29 +445,40 @@ def _format_failed_article_lines(targets: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _filter_priority_targets(failed_urls: list[dict], max_targets: int = 10) -> list[dict]:
+def _filter_priority_targets(failed_urls: list[dict], max_targets: int | None = None) -> list[dict]:
     if not failed_urls:
         return []
 
+    limit = P3_JINNANG_1_MAX_TARGETS if max_targets is None else max_targets
     scored_targets = []
+    source_eligible_count = 0
     for item in failed_urls:
+        source_key = (item.get("source", "") or "").strip().lower()
+        if source_key not in JINNANG_1_RECOVERY_SOURCE_KEYS:
+            continue
+        source_eligible_count += 1
         title = item.get("title", "")
         score = sum(1 for keyword in PRIORITY_KEYWORDS if keyword in title)
         if score > 0:
             scored_targets.append((item, score))
 
     scored_targets.sort(key=lambda row: row[1], reverse=True)
-    selected = [item for item, _ in scored_targets[:max_targets]]
+    selected = [item for item, _ in scored_targets[:limit]]
 
     if selected:
         logging.info(
-            "[P3 jinnang_1] selected %s high-value targets from %s failed urls",
+            "[P3 jinnang_1] selected %s high-value targets from %s failed urls (%s source-eligible)",
             len(selected),
             len(failed_urls),
+            source_eligible_count,
         )
         return selected
 
-    logging.info("[P3 jinnang_1] no high-value failed url matched the priority keyword set")
+    logging.info(
+        "[P3 jinnang_1] no high-value failed url matched recovery sources + priority keywords (%s/%s source-eligible)",
+        source_eligible_count,
+        len(failed_urls),
+    )
     return []
 
 

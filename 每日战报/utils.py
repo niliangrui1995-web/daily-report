@@ -13,6 +13,53 @@ import json
 import re
 from typing import Any
 
+_COMMON_MOJIBAKE_REPLACEMENTS = {
+    "\u00e2\u0080\u0098": "\u2018",
+    "\u00e2\u0080\u0099": "\u2019",
+    "\u00e2\u0080\u009c": "\u201c",
+    "\u00e2\u0080\u009d": "\u201d",
+    "\u00e2\u0080\u0093": "\u2013",
+    "\u00e2\u0080\u0094": "\u2014",
+    "\u00e2\u0080\u00a6": "\u2026",
+    "\u00e2\u0080\u00a2": "\u2022",
+    "\u00e2\u0084\u00a2": "\u2122",
+    "\u00e2\u20ac\u02dc": "\u2018",
+    "\u00e2\u20ac\u2122": "\u2019",
+    "\u00e2\u20ac\u0153": "\u201c",
+    "\u00e2\u20ac\u009d": "\u201d",
+    "\u00e2\u20ac\ufffd": "\u201d",
+    "\u00e2\u20ac\u201c": "\u2013",
+    "\u00e2\u20ac\u201d": "\u2014",
+    "\u00e2\u20ac\u00a6": "\u2026",
+    "\u00e2\u20ac\u00a2": "\u2022",
+    "\u00e2\u201e\u00a2": "\u2122",
+}
+
+
+def normalize_common_text_mojibake(text: str) -> str:
+    """Repair narrow UTF-8 punctuation mojibake commonly seen in scraped text."""
+    if not isinstance(text, str) or "\u00e2" not in text:
+        return text
+    normalized = text
+    for dirty, clean in _COMMON_MOJIBAKE_REPLACEMENTS.items():
+        normalized = normalized.replace(dirty, clean)
+    return normalized
+
+
+def normalize_common_mojibake_artifacts(value: Any) -> Any:
+    if isinstance(value, str):
+        return normalize_common_text_mojibake(value)
+    if isinstance(value, dict):
+        return {
+            normalize_common_text_mojibake(key) if isinstance(key, str) else key: normalize_common_mojibake_artifacts(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [normalize_common_mojibake_artifacts(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(normalize_common_mojibake_artifacts(item) for item in value)
+    return value
+
 
 def parse_backtrack_hours(backtrack: str, default: int = 24) -> int:
     """统一解析回溯窗口字符串为小时数。

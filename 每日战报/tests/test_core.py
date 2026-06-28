@@ -517,13 +517,25 @@ class TestP1WebTimeWindow:
         assert "TotalTelecom" in sources_by_name
         assert "entry-title" in sources_by_name["TotalTelecom"]["selector"]
 
-    def test_digitimes_has_fast_web_fallback(self):
-        from config import WEB_SCRAPE_SOURCES
+    def test_low_yield_web_sources_are_disabled_but_kept_for_recheck(self):
+        from config import DISABLED_WEB_SCRAPE_SOURCES, WEB_SCRAPE_SOURCES
         from p1_web import SOURCE_TIMEOUT
 
-        source = next(source for source in WEB_SCRAPE_SOURCES if source["name"] == "DIGITIMES_TW")
-        assert source["timeout"] < SOURCE_TIMEOUT
-        assert source["fallback_urls"] == ["https://www.digitimes.com/tech/"]
+        active_sources = {source["name"] for source in WEB_SCRAPE_SOURCES}
+        disabled_by_name = {source["name"]: source for source in DISABLED_WEB_SCRAPE_SOURCES}
+
+        assert "DIGITIMES_TW" not in active_sources
+        assert "Lightwave" not in active_sources
+        assert disabled_by_name["DIGITIMES_TW"]["timeout"] < SOURCE_TIMEOUT
+        assert disabled_by_name["DIGITIMES_TW"]["fallback_urls"] == ["https://www.digitimes.com/tech/"]
+        assert disabled_by_name["Lightwave"]["url"] == "https://www.lightwaveonline.com/home"
+
+    def test_reddit_amd_is_disabled_but_kept_for_recheck(self):
+        from config import DISABLED_REDDIT_SUBS, REDDIT_SUBS
+
+        disabled_by_name = {source["name"]: source for source in DISABLED_REDDIT_SUBS}
+        assert REDDIT_SUBS == ["hardware", "nvidia"]
+        assert disabled_by_name["Reddit/r/amd"]["sub"] == "amd"
 
     def test_scrape_one_source_uses_fallback_url_after_timeout(self, monkeypatch):
         import p1_web
@@ -745,6 +757,33 @@ class TestP1WebTimeWindow:
         assert result["time_window_stats"]["invalid_time"] == 1
 
 
+class TestP3JinnangRecovery:
+    def test_jinnang_1_filters_low_value_sources_before_keyword_scoring(self):
+        from p3_agent import _filter_priority_targets
+
+        targets = _filter_priority_targets(
+            [
+                {"title": "HBM shortage rumor from AMD forum", "url": "https://example.com/amd", "source": "Reddit/r/amd"},
+                {"title": "Apple HBM memory price story", "url": "https://example.com/tc", "source": "TechCrunch"},
+                {"title": "NVIDIA HBM shortage deep supply note", "url": "https://example.com/th", "source": "TomsHardware"},
+                {"title": "CPO optical module deployment update", "url": "https://example.com/dck", "source": "DataCenterKnowledge"},
+            ],
+            max_targets=10,
+        )
+
+        assert {target["source"] for target in targets} == {"TomsHardware", "DataCenterKnowledge"}
+
+    def test_jinnang_1_default_target_limit_is_tight(self):
+        from p3_agent import _filter_priority_targets
+
+        failed_urls = [
+            {"title": f"NVIDIA HBM shortage supply note {idx}", "url": f"https://example.com/{idx}", "source": "TomsHardware"}
+            for idx in range(8)
+        ]
+
+        assert len(_filter_priority_targets(failed_urls)) == 5
+
+
 class TestP1RssTimeWindow:
     def test_rss_time_window_parses_fierceelectronics_dates(self):
         import p1_rss
@@ -783,6 +822,29 @@ class TestP1RssTimeWindow:
         assert p1_rss._is_within_window("2026-06-22T07:00:00 (北京时间)", hours) is True
         assert p1_rss._is_within_window("2026-06-24T08:30:00 (北京时间)", hours) is False
         assert p1_rss._is_within_window("6856-01-12T23:59:59 (北京时间)", hours) is False
+
+    def test_rss_result_normalizes_common_utf8_mojibake(self):
+        import p1_rss
+
+        result = p1_rss._entries_to_p1_result(
+            [
+                {
+                    "title": "OpenAI\u00e2\u0080\u0099s release",
+                    "content": "supply risks\u00e2\u0080\u0094read now",
+                    "url": "https://example.com/openai",
+                    "published_at": "",
+                    "source": "Example",
+                }
+            ],
+            "RSS",
+            "Example",
+            24,
+        )
+
+        assert result is not None
+        assert "OpenAI’s release — supply risks—read now" in result["text"]
+        assert "\u00e2\u0080" not in result["text"]
+        assert result["grounding_sources"][0]["title"] == "OpenAI’s release"
 
 
 # =====================================================================
@@ -1065,6 +1127,24 @@ class TestParseBacktrackHours:
         """自定义默认值"""
         from utils import parse_backtrack_hours
         assert parse_backtrack_hours('', default=48) == 48
+
+
+class TestTextMojibakeNormalization:
+    def test_common_utf8_punctuation_mojibake_is_repaired_recursively(self):
+        from utils import normalize_common_mojibake_artifacts, normalize_common_text_mojibake
+
+        dirty_text = "OpenAI\u00e2\u0080\u0099s release\u00e2\u0080\u0094read now"
+        assert normalize_common_text_mojibake(dirty_text) == "OpenAI’s release—read now"
+
+        dirty_payload = {
+            "summary": "investor\u00e2\u20ac\u2122s update",
+            "items": ["risk\u00e2\u0080\u0093reward", {"body": "wait\u00e2\u0080\u00a6"}],
+        }
+
+        assert normalize_common_mojibake_artifacts(dirty_payload) == {
+            "summary": "investor’s update",
+            "items": ["risk–reward", {"body": "wait…"}],
+        }
 
 
 # =====================================================================

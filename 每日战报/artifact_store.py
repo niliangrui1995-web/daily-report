@@ -14,6 +14,7 @@ from typing import Any
 
 from settings import OUTPUT_DIR, SEARCH_API_KEY_POOL, get_tls_policy_summary, get_today_output_dir
 from trading_calendar import get_calendar_mode
+from utils import normalize_common_mojibake_artifacts, normalize_common_text_mojibake
 
 RUN_TIMESTAMP_ENV = "VCP_RUN_TS"
 PREFLIGHT_SUMMARY_ENV = "VCP_PREFLIGHT_SUMMARY_JSON"
@@ -146,7 +147,7 @@ def write_text_artifact(
 ) -> str:
     path = build_artifact_path(prefix, "md", timestamp=timestamp, category=category)
     with open(path, "w", encoding=UTF8_FILE_ENCODING) as f:
-        f.write(content)
+        f.write(normalize_common_text_mojibake(content))
     return path
 
 
@@ -159,7 +160,7 @@ def write_json_artifact(
 ) -> str:
     path = build_artifact_path(prefix, "json", timestamp=timestamp, category=category)
     with open(path, "w", encoding=UTF8_FILE_ENCODING) as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(normalize_common_mojibake_artifacts(data), f, ensure_ascii=False, indent=2)
     return path
 
 

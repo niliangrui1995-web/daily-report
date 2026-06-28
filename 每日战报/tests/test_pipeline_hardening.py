@@ -110,6 +110,7 @@ class TestPipelineRuntimeTimeout:
             {
                 "report": "战报",
                 "mapping": {"track": "先进封装与混合键合"},
+                "dirty": "OpenAI\u00e2\u0080\u0099s release\u00e2\u0080\u0094read now",
                 "non_serializable": object(),
             },
             str(context_path),
@@ -119,6 +120,7 @@ class TestPipelineRuntimeTimeout:
         assert pipeline_runtime._read_context_from_file(str(context_path)) == {
             "report": "战报",
             "mapping": {"track": "先进封装与混合键合"},
+            "dirty": "OpenAI’s release—read now",
         }
         assert not context_path.exists()
 
@@ -229,6 +231,30 @@ class TestP1WebTimeParsing:
         assert result["grounding_sources"][0]["time_status"] == "unknown_time"
         assert "unknown_time" in result["text"]
 
+    def test_web_result_normalizes_common_utf8_mojibake(self):
+        from p1_web import _entries_to_p1_result
+
+        result = _entries_to_p1_result(
+            [
+                {
+                    "title": "Investor\u00e2\u20ac\u2122s update",
+                    "content": "risk\u00e2\u0080\u0094reward",
+                    "url": "https://example.com/update",
+                    "published_at": "",
+                    "source": "Example",
+                }
+            ],
+            "网页采集",
+            "Example",
+            24,
+        )
+
+        assert result is not None
+        assert "Investor’s update — risk—reward" in result["text"]
+        assert "\u00e2\u0080" not in result["text"]
+        assert "\u00e2\u20ac" not in result["text"]
+        assert result["grounding_sources"][0]["title"] == "Investor’s update"
+
     def test_web_phase2_published_hint_refreshes_time_stats(self, monkeypatch):
         import p1_web
 
@@ -318,6 +344,27 @@ class TestManifestContext:
         manifest = artifact_store.load_run_manifest()
         assert manifest["stages"]["p6"]["metrics"]["note"] == "中文 manifest 正常"
         assert manifest["stages"]["p6"]["files"]["json"].endswith("P6_映射_20260616083006.json")
+
+    def test_artifact_writes_normalize_common_mojibake(self, monkeypatch, tmp_path):
+        import artifact_store
+
+        monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+        monkeypatch.setenv(artifact_store.RUN_TIMESTAMP_ENV, "20260626083007")
+
+        report_path = Path(
+            artifact_store.write_text_artifact("战报", "# 战报\nOpenAI\u00e2\u0080\u0099s release\u00e2\u0080\u0094read now")
+        )
+        json_path = Path(
+            artifact_store.write_json_artifact(
+                "P1_RSS原始数据",
+                [{"text": "investor\u00e2\u20ac\u2122s update", "nested": {"body": "risk\u00e2\u0080\u0094reward"}}],
+            )
+        )
+
+        assert "OpenAI’s release—read now" in report_path.read_text(encoding=artifact_store.UTF8_FILE_ENCODING)
+        payload = json.loads(json_path.read_text(encoding=artifact_store.UTF8_FILE_ENCODING))
+        assert payload[0]["text"] == "investor’s update"
+        assert payload[0]["nested"]["body"] == "risk—reward"
 
     def test_manifest_root_contains_runtime_context_and_preflight(self, monkeypatch, tmp_path):
         import artifact_store

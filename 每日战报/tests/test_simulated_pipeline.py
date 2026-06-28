@@ -397,8 +397,8 @@ class TestP8AndP9Simulation:
                             {
                                 "source": "P2",
                                 "significance": "高优先级",
-                                "title": "HBM 交期拉长",
-                                "body": "覆铜板和载板同步吃紧。",
+                                "title": "HBM\u00e2\u0080\u0099s 交期拉长",
+                                "body": "覆铜板和载板同步吃紧\u00e2\u0080\u0094需要跟踪。",
                                 "confidence": 0.81,
                                 "evidence_refs": ["P2-1", "P5-1"],
                             }
@@ -408,7 +408,7 @@ class TestP8AndP9Simulation:
                                 "priority": "★★★",
                                 "name": "生益科技",
                                 "code": "600183",
-                                "reason": "覆铜板涨价传导",
+                                "reason": "覆铜板涨价\u00e2\u20ac\u2122传导",
                                 "strategy": "只做分歧低吸",
                                 "confidence": "76%",
                                 "evidence_refs": ["P6-1"],
@@ -439,6 +439,10 @@ class TestP8AndP9Simulation:
 
         assert report
         assert "600183" in report
+        assert "HBM’s 交期拉长" in report
+        assert "同步吃紧—需要跟踪" in report
+        assert "\u00e2\u0080" not in report
+        assert "\u00e2\u20ac" not in report
         assert run_ts
 
         p9_reporter.send_report_email(report, run_ts)

@@ -30,7 +30,7 @@ from config import (
     SUMMARY_LEN,
 )
 from scraper_utils import is_article_url as _is_article_url, _safe_external_requests_get
-from utils import parse_backtrack_hours
+from utils import normalize_common_text_mojibake, parse_backtrack_hours
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 _FUTURE_TIME_GRACE = timedelta(minutes=10)
@@ -251,8 +251,8 @@ def _entries_to_p1_result(entries: list[dict], category: str, source_name: str, 
     lines = []
     grounding_sources = []
     for i, entry in enumerate(filtered, 1):
-        title = entry.get('title', '').strip()
-        content = entry.get('content', '').strip()
+        title = normalize_common_text_mojibake(entry.get('title', '')).strip()
+        content = normalize_common_text_mojibake(entry.get('content', '')).strip()
         url = entry.get('url', '')
         pub = entry.get('published_at', 'N/A')
         source = entry.get('source', source_name)

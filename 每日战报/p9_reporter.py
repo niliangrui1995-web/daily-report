@@ -16,7 +16,7 @@ from p9_email import send_report_via_email
 from p9_rendering import build_report_markdown
 from settings import EMAIL_ADDRESS, EMAIL_PASSWORD, RECEIVER_EMAIL, opus_adapter, require_prompt
 from tdx_stock_universe import load_tdx_stock_code_map, lookup_tdx_stock_code
-from utils import extract_json_from_llm_response
+from utils import extract_json_from_llm_response, normalize_common_mojibake_artifacts, normalize_common_text_mojibake
 
 _HARD_EVIDENCE_LAYERS = {"P4", "P5", "P6", "P7", "P7A", "P8"}
 _SOFT_EVIDENCE_LAYERS = {"P2", "P3", "P7.5"}
@@ -489,6 +489,15 @@ def p9_risk_analysis(
         logging.warning("[P9] price data is insufficient; the technical section may be incomplete")
         price_data = "（本次运行未获取到可用的技术面价格数据）"
 
+    p5_evidence = normalize_common_text_mojibake(p5_evidence or "")
+    p7_deep = normalize_common_text_mojibake(p7_deep or "")
+    p75_supplement = normalize_common_text_mojibake(p75_supplement or "")
+    p6_mapping = normalize_common_text_mojibake(p6_mapping or "")
+    price_data = normalize_common_text_mojibake(price_data or "")
+    p2_x_intel_data = normalize_common_text_mojibake(p2_x_intel_data or "")
+    p3_intel_data = normalize_common_text_mojibake(p3_intel_data or "")
+    p4_yfinance = normalize_common_text_mojibake(p4_yfinance or "")
+
     logging.info("[P9] building final report")
 
     if p7_deep:
@@ -559,7 +568,7 @@ def p9_risk_analysis(
         return "", run_ts
 
     try:
-        data = _parse_report_payload(raw_content)
+        data = normalize_common_mojibake_artifacts(_parse_report_payload(raw_content))
         data, guardrail_metrics = _apply_evidence_guardrails(data)
         if any(guardrail_metrics.values()):
             logging.info("[P9] applied evidence guardrails: %s", guardrail_metrics)
@@ -576,7 +585,7 @@ def p9_risk_analysis(
         p8_backfill_metrics = _backfill_sniper_tables_from_p8(data)
         if p8_backfill_metrics.get("p8_backfilled_targets"):
             logging.info("[P9] backfilled sniper table fields from P8: %s", p8_backfill_metrics)
-        result = build_report_markdown(data, today_str)
+        result = normalize_common_text_mojibake(build_report_markdown(data, today_str))
         logging.info("[P9] rendered markdown report (%s chars)", len(result))
 
         try:
@@ -667,6 +676,7 @@ def send_report_email(content, now_str: str = "") -> dict[str, Any]:
         update_run_manifest("p9", status=status)
         return {"ok": False, "status": status, "report_path": "", "email_sent": False}
 
+    content = normalize_common_text_mojibake(content)
     now = datetime.now()
     file_ts = now_str or get_run_timestamp()
     try:

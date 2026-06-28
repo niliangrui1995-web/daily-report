@@ -17,6 +17,7 @@ from artifact_store import (
     get_pipeline_log_path,
     update_run_manifest,
 )
+from utils import normalize_common_mojibake_artifacts
 
 StageHandler = Callable[[dict[str, Any]], None]
 
@@ -348,6 +349,7 @@ def _write_context_to_file(context: dict[str, Any], file_path: str) -> None:
     """
     serializable_context = {}
     for key, value in context.items():
+        value = normalize_common_mojibake_artifacts(value)
         try:
             json.dumps(value, ensure_ascii=False)
             serializable_context[key] = value

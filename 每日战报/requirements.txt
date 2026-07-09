@@ -3,7 +3,7 @@
 
 # === 核心 ===
 google-genai>=1.0.0          # Gemini API (搜索 + Pro 审计)
-anthropic>=0.87.0             # Claude Opus (P6/P9 分析) - patched CVE
+anthropic>=0.87.0             # Anthropic SDK compatibility - patched CVE
 openai>=1.0.0                 # OpenAI 兼容协议兜底 (native_llm_adapter)
 requests>=2.31.0
 certifi>=2023.5.7            # P4/亚洲行情证书路径稳定化（代码直接 import）

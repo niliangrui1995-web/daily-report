@@ -1,9 +1,9 @@
 """
-P6 Opus A 股映射 — 产业链情报→A股标的映射。
+P6 GPT-5.5 XHigh A 股映射 — 产业链情报→A股标的映射。
 
 从 daily_report.py 拆分，包含：
 - format_evidence(): 搜索数据格式化
-- generate_report(): P6 Opus 映射（产业链情报→A股标的表格）
+- generate_report(): P6 GPT-5.5 XHigh 映射（产业链情报→A股标的表格）
 
 已拆分至独立模块（此处不再包含）：
 - fetch_vanguard_prices → p4_vanguard.py
@@ -123,13 +123,13 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
     if thinking_content:
         try:
             thinking_body = (
-                '# P6 Opus Thinking 推理链\n\n'
+                '# P6 GPT-5.5 XHigh Reasoning 推理链\n\n'
                 f'> 生成时间: {datetime.now().isoformat()}\n'
                 f'> 推理链长度: {len(thinking_content)} 字符\n\n---\n\n'
                 f'{thinking_content}'
             )
-            thinking_fname = write_text_artifact('P6_Opus推理链', thinking_body)
-            logging.info(f'🧠 [P6] Opus 推理链已保存: {thinking_fname} ({len(thinking_content)} 字符)')
+            thinking_fname = write_text_artifact('P6_GPT55_XHigh推理链', thinking_body)
+            logging.info(f'🧠 [P6] GPT-5.5 XHigh 推理链已保存: {thinking_fname} ({len(thinking_content)} 字符)')
         except Exception as e:
             logging.warning(f'[P6] 推理链保存失败: {e}')
             thinking_fname = ''
@@ -189,7 +189,7 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
         stock_count = len(stock_pattern.findall(report))
         if len(report) < 1000 or stock_count < 5:
             if _retry_count < 1:
-                logging.warning(f'⚠️ [P6 映射] 渲染不完整（{len(report)} 字, {stock_count} 只标的），疑似 Opus 返回了压缩版，自动重试第 {_retry_count + 1} 次...')
+                logging.warning(f'⚠️ [P6 映射] 渲染不完整（{len(report)} 字, {stock_count} 只标的），疑似 GPT-5.5 XHigh 返回了压缩版，自动重试第 {_retry_count + 1} 次...')
                 time.sleep(10)
                 return generate_report(evidence_text, _retry_count=_retry_count + 1)
             else:

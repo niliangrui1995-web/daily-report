@@ -169,6 +169,52 @@ def _grok_native_reasoning_effort() -> str:
     ).strip().lower()
 
 
+def _collect_response_text(parts: List[str], value: Any) -> None:
+    if isinstance(value, str):
+        if value:
+            parts.append(value)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_response_text(parts, item)
+        return
+    if isinstance(value, dict):
+        for key in ('text', 'summary', 'content'):
+            if key in value:
+                _collect_response_text(parts, value.get(key))
+
+
+def _extract_openai_responses_payload(data: Dict[str, Any]) -> tuple[str, str]:
+    text_parts: List[str] = []
+    reasoning_parts: List[str] = []
+
+    output_text = data.get('output_text')
+    if isinstance(output_text, str) and output_text:
+        text_parts.append(output_text)
+
+    for item in data.get('output') or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get('type')
+        if item_type == 'reasoning':
+            for key in ('summary', 'content', 'text'):
+                if key in item:
+                    _collect_response_text(reasoning_parts, item.get(key))
+            continue
+        if item_type == 'message' and not text_parts:
+            _collect_response_text(text_parts, item.get('content'))
+
+    return '\n'.join(text_parts).strip(), '\n'.join(reasoning_parts).strip()
+
+
+def _openai_responses_incomplete_reason(data: Dict[str, Any]) -> str:
+    details = data.get('incomplete_details') or {}
+    if isinstance(details, dict):
+        reason = details.get('reason')
+        return str(reason or 'unknown')
+    return str(details or 'unknown')
+
+
 @dataclass
 class FakeAIMessage:
     """模拟 LangChain 的 AIMessage，支持 .content / .tool_calls / .thinking_content"""
@@ -675,6 +721,8 @@ class NativeLLMAdapter(RunnableSerializable):
         # 如果是 Grok，挂载特种 Responses API 来支持原生 X_search
         if 'grok' in self.model.lower():
             return self._call_grok_native(system_prompt, user_prompt), ''
+        if (self.extra_kwargs or {}).get('use_responses_api'):
+            return self._call_openai_responses(system_prompt, user_prompt)
 
         # Why: 惰性缓存 OpenAI Client，与 _call_anthropic/_call_gemini 保持一致，避免每次调用都新建连接
         if getattr(self, '_openai_client', None) is None:
@@ -700,6 +748,9 @@ class NativeLLMAdapter(RunnableSerializable):
                 max_tokens = _openai_compat_max_tokens(self.model)
                 if max_tokens is not None:
                     kwargs['max_tokens'] = max_tokens
+                reasoning_effort = (self.extra_kwargs or {}).get('reasoning_effort')
+                if reasoning_effort:
+                    kwargs['reasoning_effort'] = reasoning_effort
                 response = client.chat.completions.create(**kwargs)
                 message = response.choices[0].message
                 text = message.content or ''
@@ -714,6 +765,78 @@ class NativeLLMAdapter(RunnableSerializable):
                     break
 
         logger.error(f"❌ [OpenAI兼容] 调用失败，最后错误分类: {self.last_error_category or 'unknown_error'}")
+        return '', ''
+
+    def _call_openai_responses(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
+        import requests
+
+        base_url = self.base_url + '/v1' if not self.base_url.endswith('/v1') else self.base_url
+        url = f"{base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "input": user_prompt,
+        }
+        if system_prompt:
+            payload["instructions"] = system_prompt
+        extra_kwargs = self.extra_kwargs or {}
+        reasoning: Dict[str, Any] = {}
+        reasoning_effort = extra_kwargs.get('reasoning_effort')
+        if reasoning_effort:
+            reasoning["effort"] = reasoning_effort
+        reasoning_summary = extra_kwargs.get('reasoning_summary')
+        if reasoning_summary:
+            reasoning["summary"] = reasoning_summary
+        if reasoning:
+            payload["reasoning"] = reasoning
+        max_tokens = _openai_compat_max_tokens(self.model)
+        if max_tokens is not None:
+            payload["max_output_tokens"] = max_tokens
+
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+                response.raise_for_status()
+                data = response.json()
+                text, reasoning = _extract_openai_responses_payload(data)
+
+                if reasoning:
+                    logger.info(f"🧠 [OpenAI Responses] 捕获 reasoning 推理链: {len(reasoning)} 字符")
+
+                if data.get('status') == 'incomplete':
+                    reason = _openai_responses_incomplete_reason(data)
+                    self._set_last_error('incomplete_response', reason)
+                    logger.warning(
+                        "[OpenAI Responses] 响应未完成: reason=%s, partial_text_chars=%s, reasoning_chars=%s",
+                        reason,
+                        len(text),
+                        len(reasoning),
+                    )
+                    if attempt < self.max_retries - 1:
+                        wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
+                        logger.warning(
+                            "[OpenAI Responses] 等待 %.1fs 后重试未完成响应（%s/%s）",
+                            wait,
+                            attempt + 1,
+                            self.max_retries,
+                        )
+                        time.sleep(wait)
+                        continue
+
+                    return text, reasoning
+
+                if self.last_error_category:
+                    self._reset_last_error()
+                return text, reasoning
+            except Exception as e:
+                if not self._handle_provider_error('OpenAI Responses', e, attempt):
+                    break
+
+        logger.error(f"❌ [OpenAI Responses] 调用失败，最后错误分类: {self.last_error_category or 'unknown_error'}")
         return '', ''
 
     def __repr__(self):

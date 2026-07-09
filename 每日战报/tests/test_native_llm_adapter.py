@@ -202,10 +202,11 @@ class TestProviderErrorClassification:
         monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
 
         adapter = NativeLLMAdapter(
-            model="claude-opus-4-6-thinking",
-            base_url="http://127.0.0.1:7861/antigravity/v1",
+            model="gpt-5.5",
+            base_url="http://127.0.0.1:8317/v1",
             api_key="pwd",
             max_retries=1,
+            reasoning_effort="xhigh",
         )
 
         result = adapter.invoke("只回复OK")
@@ -214,6 +215,163 @@ class TestProviderErrorClassification:
         assert result.thinking_content == "trace"
         assert client_kwargs["max_retries"] == 0
         assert "max_tokens" not in create_kwargs
+        assert create_kwargs["reasoning_effort"] == "xhigh"
+
+    def test_openai_compat_can_use_responses_api(self, monkeypatch):
+        import requests
+
+        from native_llm_adapter import NativeLLMAdapter
+
+        monkeypatch.delenv("OPENAI_COMPAT_MAX_TOKENS", raising=False)
+        calls = []
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "output": [
+                        {
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "trace"}],
+                        },
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "OK"}],
+                        },
+                    ]
+                }
+
+        def fake_post(*args, **kwargs):
+            calls.append((args, kwargs))
+            return FakeResponse()
+
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        adapter = NativeLLMAdapter(
+            model="gpt-5.5",
+            base_url="http://127.0.0.1:8317/v1",
+            api_key="pwd",
+            max_retries=1,
+            reasoning_effort="xhigh",
+            reasoning_summary="auto",
+            use_responses_api=True,
+        )
+
+        result = adapter.invoke("Return OK")
+
+        assert result.content == "OK"
+        assert result.thinking_content == "trace"
+        assert calls[0][0][0] == "http://127.0.0.1:8317/v1/responses"
+        assert calls[0][1]["json"]["model"] == "gpt-5.5"
+        assert calls[0][1]["json"]["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+        assert "max_output_tokens" not in calls[0][1]["json"]
+        assert "messages" not in calls[0][1]["json"]
+
+    def test_openai_responses_marks_final_incomplete_response(self, monkeypatch):
+        import requests
+
+        from native_llm_adapter import NativeLLMAdapter
+
+        monkeypatch.delenv("OPENAI_COMPAT_MAX_TOKENS", raising=False)
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": '{"partial": true'}],
+                        }
+                    ],
+                }
+
+        monkeypatch.setattr(requests, "post", lambda *args, **kwargs: FakeResponse())
+
+        adapter = NativeLLMAdapter(
+            model="gpt-5.5",
+            base_url="http://127.0.0.1:8317/v1",
+            api_key="pwd",
+            max_retries=1,
+            reasoning_effort="xhigh",
+            reasoning_summary="auto",
+            use_responses_api=True,
+        )
+
+        result = adapter.invoke("Return partial JSON")
+
+        assert result.content == '{"partial": true'
+        assert adapter.last_error_category == "incomplete_response"
+        assert adapter.last_error_message == "max_output_tokens"
+
+    def test_openai_responses_retries_transient_incomplete_response(self, monkeypatch):
+        import requests
+
+        import native_llm_adapter
+        from native_llm_adapter import NativeLLMAdapter
+
+        monkeypatch.delenv("OPENAI_COMPAT_MAX_TOKENS", raising=False)
+        monkeypatch.setattr(native_llm_adapter.time, "sleep", lambda *_args, **_kwargs: None)
+        responses = [
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": ""}],
+                    }
+                ],
+            },
+            {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "OK"}],
+                    }
+                ],
+            },
+        ]
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.payload
+
+        def fake_post(*args, **kwargs):
+            calls.append((args, kwargs))
+            return FakeResponse(responses.pop(0))
+
+        monkeypatch.setattr(requests, "post", fake_post)
+
+        adapter = NativeLLMAdapter(
+            model="gpt-5.5",
+            base_url="http://127.0.0.1:8317/v1",
+            api_key="pwd",
+            max_retries=2,
+            reasoning_effort="xhigh",
+            reasoning_summary="auto",
+            use_responses_api=True,
+        )
+
+        result = adapter.invoke("Return OK")
+
+        assert result.content == "OK"
+        assert len(calls) == 2
+        assert adapter.last_error_category == ""
 
     def test_openai_compat_omits_default_max_tokens_for_non_thinking(self, monkeypatch):
         import types

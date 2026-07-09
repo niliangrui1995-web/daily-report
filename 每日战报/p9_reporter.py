@@ -552,7 +552,7 @@ def p9_risk_analysis(
     out_fn = ""
     if thinking_content:
         try:
-            out_fn = write_text_artifact("P9_Opus推理链", thinking_content)
+            out_fn = write_text_artifact("P9_GPT55_XHigh推理链", thinking_content)
             logging.info("[P9] saved reasoning trace to %s", out_fn)
         except Exception as exc:
             logging.error("[P9] failed to save reasoning trace: %s", exc)

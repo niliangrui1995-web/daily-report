@@ -85,8 +85,8 @@ notepad .\每日战报\.env
 | 变量 | 用途 |
 | --- | --- |
 | `ANTIGRAVITY_BASE_URL` | 本地/远端 OpenAI 兼容模型服务地址，默认 `http://127.0.0.1:8045` |
-| `ANTIGRAVITY_API_KEY` | Pro/Opus/Agent 兼容模型鉴权 |
-| `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 覆盖 Pro/Opus 模型服务；未配置时沿用 Antigravity 配置 |
+| `ANTIGRAVITY_API_KEY` | Pro/GPT-5.5/Agent 兼容模型鉴权 |
+| `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 覆盖 P6/P9 GPT-5.5 XHigh 模型服务；未配置时沿用 Antigravity 配置 |
 | `GEMINI_SEARCH_API_KEYS` | Gemini 搜索 key 池，逗号分隔 |
 | `GEMINI_SEARCH_BASE_URL` | Gemini 搜索代理地址 |
 | `AUDIT_MODEL` | P5/P7a/P7.5 审计模型，默认 `claude-sonnet-4-6`；兼容旧变量 `GEMINI_PRO_MODEL` |

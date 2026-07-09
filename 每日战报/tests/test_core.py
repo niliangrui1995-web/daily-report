@@ -211,7 +211,7 @@ class TestIndustryDict:
         assert not any(ticker.endswith((".SZ", ".SS")) for ticker in VANGUARD_TICKERS.values())
 
     def test_public_listed_oligarchs_have_p4_tickers(self):
-        """已上市寡头必须进入 P4 核心行情池，供 Opus 推理使用"""
+        """已上市寡头必须进入 P4 核心行情池，供 GPT-5.5 XHigh 推理使用"""
         from industry_dict import VANGUARD_TICKERS
 
         expected = {
@@ -931,7 +931,10 @@ class TestSettings:
         """LLM 适配器应正确初始化"""
         from settings import pro_adapter, opus_adapter
         assert pro_adapter.model == "claude-sonnet-4-6"
-        assert opus_adapter.model == "claude-opus-4-6-thinking"
+        assert opus_adapter.model == "gpt-5.5"
+        assert opus_adapter.extra_kwargs["reasoning_effort"] == "xhigh"
+        assert opus_adapter.extra_kwargs["reasoning_summary"] == "auto"
+        assert opus_adapter.extra_kwargs["use_responses_api"] is True
 
     def test_output_dir_exists(self):
         """输出目录应存在"""

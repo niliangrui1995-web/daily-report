@@ -112,7 +112,7 @@ pydantic==2.13.4
     #   google-genai
     #   openai
     #   vcp-hunter-daily-report
-pydantic-core==2.46.4
+pydantic-core==2.47.0
     # via pydantic
 pygments==2.20.0
     # via rich
@@ -173,7 +173,7 @@ w3lib==2.4.1
     # via scrapling
 webencodings==0.5.1
     # via bleach
-websockets==16.0
+websockets==16.1
     # via
     #   google-genai
     #   yfinance

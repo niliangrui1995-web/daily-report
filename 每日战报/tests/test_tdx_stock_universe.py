@@ -23,7 +23,7 @@ TNF_NAME_OFFSET = 31
 
 
 def test_default_tdx_root_points_to_huatai_data_source():
-    assert PureWindowsPath(DEFAULT_TDX_ROOT) == PureWindowsPath(r'C:\zd_huatai')
+    assert PureWindowsPath(DEFAULT_TDX_ROOT) == PureWindowsPath(r'D:\HT')
 
 
 def test_resolve_tdx_root_honors_environment_override(monkeypatch, tmp_path):

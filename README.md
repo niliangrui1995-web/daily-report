@@ -85,7 +85,7 @@ notepad .\每日战报\.env
 
 | 变量 | 用途 |
 | --- | --- |
-| `TDX_ROOT` | 本地通达信数据根，默认 `C:\zd_huatai`；需包含 `T0002\hq_cache` 和 `vipdoc` |
+| `TDX_ROOT` | 本地通达信数据根，默认 `D:\HT`；需包含 `T0002\hq_cache` 和 `vipdoc` |
 | `ANTIGRAVITY_BASE_URL` | 本地/远端 OpenAI 兼容模型服务地址，默认 `http://127.0.0.1:8045` |
 | `ANTIGRAVITY_API_KEY` | Pro/GPT-5.6 Sol/Agent 兼容模型鉴权 |
 | `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 覆盖 P6/P9 GPT-5.6 Sol Max 模型服务；未配置时沿用 Antigravity 配置 |
@@ -236,7 +236,7 @@ uv sync --locked --no-dev --python C:\Python314\python.exe
 .\ops\migrate_scheduled_task.ps1 -Apply -AcceptUnrotatedCredentialsRisk
 ```
 
-脚本会导出原任务和 ACL，先禁用原触发器并取得流水线维护锁，再创建强制密码、随机密码的专用标准账户。源码和代理程序仅授予读取/执行，输出目录可写；`C:\zd_huatai` 通过专用账号的 deny-write ACE 保持有效只读，不改变其他用户现有权限。`CLIProxyAPI` 目标目录在复制任何凭据前即锁定为私有 ACL，仅 `auths` 子目录允许专用账号修改。
+脚本会导出原任务和 ACL，先禁用原触发器并取得流水线维护锁，再创建强制密码、随机密码的专用标准账户。源码和代理程序仅授予读取/执行，输出目录可写；`D:\HT` 通过专用账号的 deny-write ACE 保持有效只读，不改变其他用户现有权限。`CLIProxyAPI` 目标目录在复制任何凭据前即锁定为私有 ACL，仅 `auths` 子目录允许专用账号修改。
 
 迁移依次完成 8318 隔离 canary、8317 live canary、正式 `cmd.exe` Action 的 `preflight` 实跑，最后才替换正式任务主体。回滚只删除本次创建的资源，并恢复本次实际修改的任务、ACL 和桌面代理。
 

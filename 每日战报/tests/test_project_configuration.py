@@ -78,12 +78,12 @@ def test_local_tdx_source_defaults_to_huatai_install() -> None:
     )
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "TDX_ROOT=C:\\zd_huatai" in env_template
-    assert '[string]$TdxRoot = "C:\\zd_huatai"' in migration_script
+    assert "TDX_ROOT=D:\\HT" in env_template
+    assert '[string]$TdxRoot = "D:\\HT"' in migration_script
     assert "`TDX_ROOT`" in readme
-    assert "`C:\\zd_huatai`" in readme
-    old_tdx_root = "D:" + "\\HT"
-    assert old_tdx_root not in migration_script
+    assert "`D:\\HT`" in readme
+    obsolete_tdx_root = "C:" + "\\zd_huatai"
+    assert obsolete_tdx_root not in migration_script
 
 
 def test_scheduled_task_migration_is_guarded_and_reversible() -> None:

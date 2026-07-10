@@ -2,7 +2,7 @@ r"""Local Tongdaxin stock universe loader.
 
 The P6 mapper must not trust model-generated stock codes.  It resolves the
 final A-share code from the local Tongdaxin security tables under
-C:\zd_huatai by default.
+D:\HT by default.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterator
 
-DEFAULT_TDX_ROOT = r'C:\zd_huatai'
+DEFAULT_TDX_ROOT = r'D:\HT'
 TNF_MARKET_FILES = ('shs.tnf', 'szs.tnf', 'bjs.tnf')
 TNF_HEADER_SIZE = 50
 TNF_RECORD_SIZE = 360

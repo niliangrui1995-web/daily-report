@@ -9,7 +9,7 @@ param(
     [string]$ProxyTaskName = "VCPHunter_CLIProxyAPI",
     [string]$AccountName = "VCPHunterRunner",
     [string]$ProjectRoot = "D:\vcp_hunter\每日战报",
-    [string]$TdxRoot = "C:\zd_huatai",
+    [string]$TdxRoot = "D:\HT",
     [string]$MachinePython = "C:\Python314",
     [string]$ProxySourceRoot = "C:\Users\Administrator\Desktop\CLIProxyAPI",
     [string]$ProxyTargetRoot = "C:\ProgramData\VCPHunter\CLIProxyAPI",

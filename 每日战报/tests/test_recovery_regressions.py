@@ -402,7 +402,7 @@ def test_inner_thread_timeouts_do_not_claim_hard_deadlines():
     assert "ThreadPoolExecutor" not in market_source
     assert "ThreadPoolExecutor" not in report_source
     assert ".result(timeout=" not in research_source
-    assert registry["market_mapping"].timeout_seconds == 600
+    assert registry["market_mapping"].timeout_seconds == 900
     assert registry["research"].timeout_seconds == 900
-    assert registry["report"].timeout_seconds == 600
+    assert registry["report"].timeout_seconds == 900
     assert "timeout=180" in inspect.getsource(search_engine._post_search_request)

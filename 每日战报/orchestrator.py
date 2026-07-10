@@ -66,10 +66,10 @@ CONTROL_STAGE_START = {
 CONTROL_STAGE_TIMEOUTS = {
     "collect_intel": 900,
     "audit_evidence": 480,
-    "market_mapping": 600,
+    "market_mapping": 900,
     "research": 900,
     "technical": 300,
-    "report": 600,
+    "report": 900,
     "delivery_resume": 600,
     "roi": 180,
 }

@@ -4,15 +4,42 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path, PureWindowsPath
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tdx_stock_universe import load_tdx_stock_code_map, lookup_tdx_stock_code
+from p8_extractors import find_tdx_vipdoc
+from tdx_stock_universe import (
+    DEFAULT_TDX_ROOT,
+    load_tdx_stock_code_map,
+    lookup_tdx_stock_code,
+    resolve_tdx_root,
+)
 
 TNF_HEADER_SIZE = 50
 TNF_RECORD_SIZE = 360
 TNF_CODE_OFFSET = 0
 TNF_NAME_OFFSET = 31
+
+
+def test_default_tdx_root_points_to_huatai_data_source():
+    assert PureWindowsPath(DEFAULT_TDX_ROOT) == PureWindowsPath(r'C:\zd_huatai')
+
+
+def test_resolve_tdx_root_honors_environment_override(monkeypatch, tmp_path):
+    override_root = tmp_path / 'tdx-override'
+    monkeypatch.setenv('TDX_ROOT', str(override_root))
+
+    assert resolve_tdx_root() == override_root
+
+
+def test_find_tdx_vipdoc_uses_configured_root(monkeypatch, tmp_path):
+    override_root = tmp_path / 'tdx-override'
+    vipdoc = override_root / 'vipdoc'
+    vipdoc.mkdir(parents=True)
+    monkeypatch.setenv('TDX_ROOT', str(override_root))
+
+    assert Path(find_tdx_vipdoc()) == vipdoc
 
 
 def _write_fake_tnf(path, records):

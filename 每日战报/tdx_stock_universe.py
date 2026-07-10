@@ -1,7 +1,8 @@
 r"""Local Tongdaxin stock universe loader.
 
 The P6 mapper must not trust model-generated stock codes.  It resolves the
-final A-share code from the local Tongdaxin security tables under D:\HT.
+final A-share code from the local Tongdaxin security tables under
+C:\zd_huatai by default.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterator
 
-DEFAULT_TDX_ROOT = os.environ.get('TDX_ROOT', r'D:\HT')
+DEFAULT_TDX_ROOT = r'C:\zd_huatai'
 TNF_MARKET_FILES = ('shs.tnf', 'szs.tnf', 'bjs.tnf')
 TNF_HEADER_SIZE = 50
 TNF_RECORD_SIZE = 360
@@ -24,6 +25,13 @@ TNF_NAME_SIZE = 40
 INFOHARBOR_CODE_FILE = 'infoharbor_ex.code'
 COMPANY_ALIAS_SUFFIXES = ('科技', '股份')
 COMPANY_ALIAS_MARKERS = ('科技', '股份', '集团', '控股')
+
+
+def resolve_tdx_root(tdx_root: str | os.PathLike[str] | None = None) -> Path:
+    if tdx_root is None:
+        configured_root = os.environ.get('TDX_ROOT', '').strip()
+        tdx_root = configured_root or DEFAULT_TDX_ROOT
+    return Path(tdx_root)
 
 
 def normalize_stock_name(name: str) -> str:
@@ -184,8 +192,10 @@ def _add_unique_alias(stock_code_map: dict[str, str], alias: str, code: str) -> 
 
 
 @lru_cache(maxsize=4)
-def load_tdx_stock_code_map(tdx_root: str | os.PathLike[str] = DEFAULT_TDX_ROOT) -> dict[str, str]:
-    hq_cache = Path(tdx_root) / 'T0002' / 'hq_cache'
+def load_tdx_stock_code_map(
+    tdx_root: str | os.PathLike[str] | None = None,
+) -> dict[str, str]:
+    hq_cache = resolve_tdx_root(tdx_root) / 'T0002' / 'hq_cache'
     stock_code_map: dict[str, str] = {}
     stock_codes: set[str] = set()
 

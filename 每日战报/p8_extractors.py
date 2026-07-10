@@ -7,19 +7,13 @@ import os
 import re
 import struct
 
-_TDX_VIPDOC_CANDIDATES = [
-    'D:\\HT\\vipdoc',
-    'D:\\vcp_qt\\vipdoc',
-    'C:\\new_tdx\\vipdoc',
-    'D:\\new_tdx\\vipdoc',
-    'C:\\HT\\vipdoc',
-]
+from tdx_stock_universe import resolve_tdx_root
 
 
 def find_tdx_vipdoc():
-    for candidate in _TDX_VIPDOC_CANDIDATES:
-        if os.path.isdir(candidate):
-            return candidate
+    vipdoc = resolve_tdx_root() / 'vipdoc'
+    if vipdoc.is_dir():
+        return str(vipdoc)
     return None
 
 

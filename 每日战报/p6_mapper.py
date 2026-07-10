@@ -26,7 +26,7 @@ from settings import opus_adapter, OPUS_MODEL, require_prompt
 from industry_dict import OLIGARCH_DICT
 from utils import extract_json_from_llm_response
 from p7_deep_research import build_recent_topic_guardrail
-from tdx_stock_universe import load_tdx_stock_code_map, lookup_tdx_stock_code
+from tdx_stock_universe import load_tdx_stock_code_map, lookup_tdx_stock_code, resolve_tdx_root
 
 P6_JSON_RETRY_LIMIT = 1
 P6_OUTPUT_LIMITS = """
@@ -48,6 +48,7 @@ P6_UNTRUSTED_INPUT_NOTICE = """
 
 def _apply_tdx_stock_codes(data: dict) -> dict[str, int]:
     stock_code_map = load_tdx_stock_code_map()
+    tdx_root = resolve_tdx_root()
     metrics = {
         'accepted_targets': 0,
         'rejected_targets': 0,
@@ -86,9 +87,9 @@ def _apply_tdx_stock_codes(data: dict) -> dict[str, int]:
 
             metrics['rejected_targets'] += 1
             if raw_code:
-                logging.warning(f'⚠️ [P6本地标的拒绝] {name} 未命中 D:\\HT 股票主数据，已移除模型 code={raw_code}')
+                logging.warning(f'⚠️ [P6本地标的拒绝] {name} 未命中 {tdx_root} 股票主数据，已移除模型 code={raw_code}')
             else:
-                logging.warning(f'⚠️ [P6本地标的拒绝] {name} 未命中 D:\\HT 股票主数据，已从结果移除')
+                logging.warning(f'⚠️ [P6本地标的拒绝] {name} 未命中 {tdx_root} 股票主数据，已从结果移除')
 
         if accepted_targets:
             event['targets'] = accepted_targets

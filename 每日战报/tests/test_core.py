@@ -290,7 +290,7 @@ class TestIndustryDict:
             assert "AI PCB设备与关键耗材" in prompt_text
 
     def test_ai_pcb_equipment_a_share_code_guardrail(self):
-        r"""P6 不应再维护模型纠错表，股票代码统一来自 D:\HT。"""
+        r"""P6 不应再维护模型纠错表，股票代码统一来自 C:\zd_huatai。"""
         import p6_mapper
 
         assert not hasattr(p6_mapper, "HALLUCINATION_MAP")

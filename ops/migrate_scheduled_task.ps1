@@ -9,7 +9,7 @@ param(
     [string]$ProxyTaskName = "VCPHunter_CLIProxyAPI",
     [string]$AccountName = "VCPHunterRunner",
     [string]$ProjectRoot = "D:\vcp_hunter\每日战报",
-    [string]$TdxRoot = "D:\HT",
+    [string]$TdxRoot = "C:\zd_huatai",
     [string]$MachinePython = "C:\Python314",
     [string]$ProxySourceRoot = "C:\Users\Administrator\Desktop\CLIProxyAPI",
     [string]$ProxyTargetRoot = "C:\ProgramData\VCPHunter\CLIProxyAPI",
@@ -1066,7 +1066,7 @@ if (-not $Apply) {
         planned_changes = @(
             "disable the existing trigger and hold the pipeline maintenance lock",
             "create a dedicated standard local account with a random Task Scheduler password",
-            "grant source read/execute, output modify, and a runner-specific D:\HT deny-write ACE",
+            "grant source read/execute, output modify, and a runner-specific $TdxRoot deny-write ACE",
             "copy CLIProxyAPI only after its ProgramData directory has a private ACL",
             "grant proxy app/config read-execute and only auths modify access",
             "run real inference, external API, SMTP login, TDX write-denial, and strict preflight canaries",

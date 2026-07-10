@@ -71,6 +71,21 @@ def test_readme_documents_uv_as_the_primary_environment() -> None:
     assert "自动定位包含 `pipeline_cli.py` 的项目子目录" not in readme
 
 
+def test_local_tdx_source_defaults_to_huatai_install() -> None:
+    env_template = (REPO_ROOT / "每日战报" / ".env.example").read_text(encoding="utf-8")
+    migration_script = (REPO_ROOT / "ops" / "migrate_scheduled_task.ps1").read_text(
+        encoding="utf-8"
+    )
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "TDX_ROOT=C:\\zd_huatai" in env_template
+    assert '[string]$TdxRoot = "C:\\zd_huatai"' in migration_script
+    assert "`TDX_ROOT`" in readme
+    assert "`C:\\zd_huatai`" in readme
+    old_tdx_root = "D:" + "\\HT"
+    assert old_tdx_root not in migration_script
+
+
 def test_scheduled_task_migration_is_guarded_and_reversible() -> None:
     script_path = REPO_ROOT / "ops" / "migrate_scheduled_task.ps1"
 

@@ -29,7 +29,7 @@ from artifact_store import (
     write_json_artifact,
     write_text_artifact,
 )
-from checkpoint import detect_checkpoint
+from checkpoint import P6_HASHED_RESEARCH_STAGES, compute_file_sha256, detect_checkpoint
 from contribution_metrics import build_layer_roi_report, render_layer_roi_markdown
 from pipeline_runtime import StageSpec, StageTimeoutError, run_stage_registry
 from run_config import get_run_config, get_schedule_decision
@@ -59,6 +59,8 @@ CONTROL_STAGE_START = {
     "p6": "market_mapping",
     "p8_resume": "market_mapping",
     "p9_resume": "market_mapping",
+    "delivery_resume": "delivery_resume",
+    "roi_resume": "roi",
 }
 
 CONTROL_STAGE_TIMEOUTS = {
@@ -68,6 +70,7 @@ CONTROL_STAGE_TIMEOUTS = {
     "research": 900,
     "technical": 300,
     "report": 600,
+    "delivery_resume": 600,
     "roi": 180,
 }
 
@@ -153,6 +156,39 @@ def _checkpoint_older_than_any(ckpt: dict, file_key: str, upstream_keys: tuple[s
     return any(_checkpoint_file_mtime(ckpt, upstream_key) > target_mtime for upstream_key in upstream_keys)
 
 
+def _checkpoint_p6_hash_matches(ckpt: dict, file_key: str) -> bool:
+    if file_key not in P6_HASHED_RESEARCH_STAGES:
+        return True
+    path = ckpt.get("files", {}).get(file_key, "")
+    if not path:
+        return True
+    hashes = ckpt.get("p6_input_sha256", {})
+    expected = str(hashes.get(file_key) or "").strip().lower() if isinstance(hashes, dict) else ""
+    actual = compute_file_sha256(ckpt.get("files", {}).get("p6", ""))
+    return bool(expected and actual and expected == actual)
+
+
+def _read_fresh_text_checkpoint(
+    ckpt: dict,
+    file_key: str,
+    label: str,
+    *,
+    upstream_keys: tuple[str, ...],
+) -> str:
+    if not _checkpoint_p6_hash_matches(ckpt, file_key):
+        logging.warning("%s checkpoint P6 input hash is missing or stale; ignoring it", label)
+        return ""
+    remaining_upstreams = tuple(key for key in upstream_keys if key != "p6")
+    if _checkpoint_older_than_any(ckpt, file_key, remaining_upstreams):
+        logging.warning("%s checkpoint is older than upstream input; ignoring it", label)
+        return ""
+    return _read_text_checkpoint(ckpt.get("files", {}).get(file_key, ""), label)
+
+
+def _context_p6_input_sha256(context: dict[str, Any]) -> str:
+    return compute_file_sha256(context.get("ckpt", {}).get("files", {}).get("p6", ""))
+
+
 def _parse_flags(argv: list[str]) -> tuple[bool, bool]:
     force_run = "--force" in argv or "--force-run" in argv
     force_restart = "--force" in argv or "--force-restart" in argv
@@ -164,7 +200,7 @@ def _resolve_start_stage(resume_from: str) -> str | None:
 
 
 def _build_context(now: datetime, run_ts: str, ckpt: dict, resume_from: str) -> dict[str, Any]:
-    return {
+    context = {
         "now": now,
         "run_ts": run_ts,
         "ckpt": ckpt,
@@ -202,6 +238,39 @@ def _build_context(now: datetime, run_ts: str, ckpt: dict, resume_from: str) -> 
         "final_report": "",
         "report_ts": "",
     }
+
+    if resume_from in {"delivery_resume", "roi_resume"}:
+        context["final_report"] = _read_text_checkpoint(
+            ckpt.get("files", {}).get("war_report", ""),
+            "saved P9 report",
+        )
+        context["report_ts"] = run_ts
+
+    if resume_from == "roi_resume":
+        context["p2_data"], context["p3_data"] = _recover_p2_p3_from_checkpoint(ckpt)
+        context["p4_data"] = _read_text_checkpoint(ckpt.get("files", {}).get("p4", ""), "P4 market snapshot")
+        context["p6_mapping"] = _read_text_checkpoint(ckpt.get("files", {}).get("p6", ""), "P6 mapping")
+        context["p7_deep"] = _read_fresh_text_checkpoint(
+            ckpt,
+            "p7",
+            "P7 deep research",
+            upstream_keys=("p6",),
+        )
+        context["p75_supplement"] = _read_fresh_text_checkpoint(
+            ckpt,
+            "p75",
+            "P7.5 supplement",
+            upstream_keys=("p6",),
+        )
+        if context["p7_deep"]:
+            context["p7a_audited"] = _read_fresh_text_checkpoint(
+                ckpt,
+                "p7a",
+                "P7a audited research",
+                upstream_keys=("p6", "p7"),
+            )
+
+    return context
 
 
 def _build_p1_stats(
@@ -319,26 +388,25 @@ def _stage_collect_intel(context: dict[str, Any]) -> None:
         p3_future = pool.submit(collect_p3_parallel_only, context["backtrack"])
 
         try:
-            # Why: 加 timeout 防止单个采集任务挂死拖住整个阶段
-            rss_results, rss_stats = rss_future.result(timeout=300)
+            rss_results, rss_stats = rss_future.result()
             p1_results.extend(rss_results)
             p1_failed_urls.extend(rss_stats.get("failed_urls", []))
         except Exception as exc:
             logging.warning("RSS collection failed: %s", exc)
 
         try:
-            web_results, web_stats = web_future.result(timeout=300)
+            web_results, web_stats = web_future.result()
             p1_results.extend(web_results)
         except Exception as exc:
             logging.warning("web collection failed: %s", exc)
 
         try:
-            p2_data, _ = x_future.result(timeout=300)
+            p2_data, _ = x_future.result()
         except Exception as exc:
             logging.warning("X collection failed: %s", exc)
 
         try:
-            p3_data, p3_stats = p3_future.result(timeout=300)
+            p3_data, p3_stats = p3_future.result()
         except Exception as exc:
             logging.warning("P3 collection failed: %s", exc)
 
@@ -442,9 +510,25 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
             context["p4_data"] = _read_text_checkpoint(ckpt["files"].get("p4", ""), "P4 market snapshot")
             if not context["p2_data"] or not context["p3_data"]:
                 context["p2_data"], context["p3_data"] = _recover_p2_p3_from_checkpoint(ckpt)
-            context["p7_deep"] = _read_text_checkpoint(ckpt["files"].get("p7", ""), "P7 deep research")
-            context["p7a_audited"] = _read_text_checkpoint(ckpt["files"].get("p7a", ""), "P7a audited research")
-            context["p75_supplement"] = _read_text_checkpoint(ckpt["files"].get("p75", ""), "P7.5 supplement")
+            context["p7_deep"] = _read_fresh_text_checkpoint(
+                ckpt,
+                "p7",
+                "P7 deep research",
+                upstream_keys=("p6",),
+            )
+            context["p75_supplement"] = _read_fresh_text_checkpoint(
+                ckpt,
+                "p75",
+                "P7.5 supplement",
+                upstream_keys=("p6",),
+            )
+            if context["p7_deep"]:
+                context["p7a_audited"] = _read_fresh_text_checkpoint(
+                    ckpt,
+                    "p7a",
+                    "P7a audited research",
+                    upstream_keys=("p6", "p7"),
+                )
             context["price_data"] = _read_text_checkpoint(ckpt["files"].get("p8", ""), "P8 technical data")
             return
 
@@ -483,18 +567,14 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
 
     with log_heartbeat("P6 mapping"):
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(generate_report, combined_evidence)
-                context["p6_mapping"] = future.result(timeout=600)
-        except concurrent.futures.TimeoutError:
-            logging.error("[P6] mapping timed out")
-            context["p6_mapping"] = ""
+            context["p6_mapping"] = generate_report(combined_evidence)
         except Exception as exc:
             logging.error("[P6] mapping failed: %s", exc)
             context["p6_mapping"] = ""
 
     if context["p6_mapping"]:
         p6_path = write_text_artifact("P6_映射", context["p6_mapping"])
+        context["ckpt"].setdefault("files", {})["p6"] = p6_path
         update_run_manifest(
             "p6",
             status="completed",
@@ -508,7 +588,6 @@ def _stage_research(context: dict[str, Any]) -> None:
         return
 
     resume_from = context["resume_from"]
-    ckpt = context["ckpt"]
     try:
         research_plan = build_research_plan(
             context["p6_mapping"],
@@ -544,11 +623,13 @@ def _stage_research(context: dict[str, Any]) -> None:
     search_queries = list(research_plan.get("supplement_queries") or [])
     need_run_p7 = bool(research_plan.get("should_run_p7"))
     need_run_p75 = bool(research_plan.get("should_run_p75"))
+    p6_input_sha256 = _context_p6_input_sha256(context)
+    p6_hash_metrics = {"p6_input_sha256": p6_input_sha256} if p6_input_sha256 else {}
 
-    if resume_from in {"p8_resume", "p9_resume"}:
+    if resume_from in {"p6", "p8_resume", "p9_resume"}:
         if context.get("p7_deep", "").strip():
             need_run_p7 = False
-        if ckpt["files"].get("p75") or not search_queries:
+        if context.get("p75_supplement", "").strip() or not search_queries:
             need_run_p75 = False
 
     p75_started = None
@@ -575,11 +656,8 @@ def _stage_research(context: dict[str, Any]) -> None:
 
                 if p7_future is not None:
                     try:
-                        p7_result = p7_future.result(timeout=600)
+                        p7_result = p7_future.result()
                         context["p7_deep"] = p7_result.get("text", "")
-                    except concurrent.futures.TimeoutError:
-                        logging.warning("[P7] deep research timed out")
-                        context["p7_deep"] = ""
                     except Exception as exc:
                         logging.error("[P7] deep research failed: %s", exc)
                         context["p7_deep"] = ""
@@ -593,7 +671,11 @@ def _stage_research(context: dict[str, Any]) -> None:
                             "p75",
                             status="raw_ready",
                             files={"raw": raw_path},
-                            metrics={"queries": len(capped_queries), "raw_chars": len(raw_text)},
+                            metrics={
+                                "queries": len(capped_queries),
+                                "raw_chars": len(raw_text),
+                                **p6_hash_metrics,
+                            },
                         )
                         with log_heartbeat("P7.5 audit"):
                             audited = gemini_pro_audit(raw_text, audit_type="p7.5", backtrack="")
@@ -625,7 +707,7 @@ def _stage_research(context: dict[str, Any]) -> None:
             "p7",
             status="completed",
             files=p7_files,
-            metrics={"output_chars": len(context["p7_deep"])},
+            metrics={"output_chars": len(context["p7_deep"]), **p6_hash_metrics},
         )
 
     if context.get("p7a_audited"):
@@ -633,6 +715,8 @@ def _stage_research(context: dict[str, Any]) -> None:
     if context.get("p7_deep", "").strip() and len(context["p7_deep"].strip()) > 200:
         with log_heartbeat("P7a audit"):
             try:
+                if p6_hash_metrics:
+                    update_run_manifest("p7a", status="running", metrics=p6_hash_metrics)
                 context["p7a_audited"] = p7a_deep_research_audit(context["p7_deep"])
             except Exception as exc:
                 logging.error("[P7a] audit failed unexpectedly; passing through raw P7 data: %s", exc)
@@ -812,22 +896,16 @@ def _run_agent_report_review(context: dict[str, Any]) -> None:
 def _stage_report(context: dict[str, Any]) -> None:
     with log_heartbeat("P9 report"):
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(
-                    p9_risk_analysis,
-                    p5_evidence=context.get("p5_evidence", ""),
-                    p7_deep=context.get("p7a_audited", ""),
-                    p75_supplement=context.get("p75_supplement", ""),
-                    p6_mapping=context.get("p6_mapping", ""),
-                    price_data=context.get("price_data", ""),
-                    p2_x_intel_data=context.get("p2_data", ""),
-                    p3_intel_data=context.get("p3_data", ""),
-                    p4_yfinance=context.get("p4_data", ""),
-                )
-                final_report, report_ts = future.result(timeout=600)
-        except concurrent.futures.TimeoutError:
-            logging.error("[P9] report generation timed out")
-            raise RuntimeError("report generation timed out") from None
+            final_report, report_ts = p9_risk_analysis(
+                p5_evidence=context.get("p5_evidence", ""),
+                p7_deep=context.get("p7a_audited", ""),
+                p75_supplement=context.get("p75_supplement", ""),
+                p6_mapping=context.get("p6_mapping", ""),
+                price_data=context.get("price_data", ""),
+                p2_x_intel_data=context.get("p2_data", ""),
+                p3_intel_data=context.get("p3_data", ""),
+                p4_yfinance=context.get("p4_data", ""),
+            )
         except Exception as exc:
             logging.error("[P9] report generation failed: %s", exc)
             raise RuntimeError(f"report generation failed: {exc}") from exc
@@ -845,8 +923,45 @@ def _stage_report(context: dict[str, Any]) -> None:
     _run_agent_report_review(context)
 
 
+def _stage_delivery_resume(context: dict[str, Any]) -> None:
+    if context.get("resume_from") != "delivery_resume":
+        return
+
+    final_report = context.get("final_report", "")
+    report_ts = context.get("report_ts", "") or context.get("run_ts", "")
+    if not final_report or not final_report.strip():
+        raise RuntimeError("saved report is missing or empty; delivery cannot resume")
+
+    delivery = send_report_email(final_report, report_ts)
+    if not delivery.get("ok"):
+        raise RuntimeError(f"report delivery failed: {delivery.get('status', 'unknown')}")
+
+    update_run_manifest(
+        "report",
+        status="completed_recovered",
+        metrics={
+            "recovered_delivery": True,
+            "delivery_status": delivery.get("status", ""),
+            "report_chars": len(final_report),
+        },
+    )
+
+
 def _stage_roi(context: dict[str, Any]) -> None:
     ckpt = context["ckpt"]
+    if context.get("resume_from") == "roi_resume":
+        final_report = context.get("final_report", "")
+        if not final_report or not final_report.strip():
+            raise RuntimeError("saved report is missing or empty; ROI cannot resume")
+        update_run_manifest(
+            "report",
+            status="completed_recovered",
+            metrics={
+                "recovered_for_roi": True,
+                "report_chars": len(final_report),
+            },
+        )
+
     p1_results = context.get("p1_results") or []
     if not p1_results and ckpt.get("files", {}).get("p1"):
         recovered_results = _read_json_checkpoint(ckpt["files"].get("p1", ""), "P1 raw results")
@@ -965,6 +1080,12 @@ def _build_stage_registry() -> list[StageSpec]:
             handler=_stage_report,
             timeout_seconds=CONTROL_STAGE_TIMEOUTS["report"],
             description="P9 report generation",
+        ),
+        StageSpec(
+            name="delivery_resume",
+            handler=_stage_delivery_resume,
+            timeout_seconds=CONTROL_STAGE_TIMEOUTS["delivery_resume"],
+            description="Retry delivery of an existing P9 report",
         ),
         StageSpec(
             name="roi",

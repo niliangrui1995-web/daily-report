@@ -1,25 +1,20 @@
 @echo off
+chcp 65001 >nul
 setlocal EnableExtensions EnableDelayedExpansion
 
 set "ROOT_DIR=%~dp0"
 for %%I in ("%ROOT_DIR%.") do set "ROOT_DIR=%%~fI\"
 
-set "APP_DIR="
+set "APP_DIR=%ROOT_DIR%每日战报"
 if not defined PYTHON_EXE set "PYTHON_EXE=%ROOT_DIR%.venv\Scripts\python.exe"
+set "PYTHONDONTWRITEBYTECODE=1"
 set "SCHEDULED_LAUNCHER="
 set "PIPELINE_CLI="
 if not defined RUN_DAILY_HOLD_SECONDS set "RUN_DAILY_HOLD_SECONDS=15"
-if not defined RUN_DAILY_PREFLIGHT set "RUN_DAILY_PREFLIGHT=strict"
 if not defined RUN_DAILY_AUTO_RESUME set "RUN_DAILY_AUTO_RESUME=on"
 if not defined RUN_DAILY_RESUME_DELAY_SECONDS set "RUN_DAILY_RESUME_DELAY_SECONDS=10"
 if not defined PYTHONUTF8 set "PYTHONUTF8=1"
 if not defined PYTHONIOENCODING set "PYTHONIOENCODING=utf-8:replace"
-
-for /d %%D in ("%ROOT_DIR%*") do (
-    if exist "%%~fD\pipeline_cli.py" (
-        set "APP_DIR=%%~fD"
-    )
-)
 
 call :merge_no_proxy
 
@@ -31,8 +26,8 @@ if not exist "%PYTHON_EXE%" (
     goto :fail
 )
 
-if not defined APP_DIR (
-    echo [ERROR] pipeline_cli.py not found under "%ROOT_DIR%"
+if not exist "%APP_DIR%\pipeline_cli.py" (
+    echo [ERROR] pipeline_cli.py not found at canonical app path: "%APP_DIR%"
     goto :fail
 )
 
@@ -47,16 +42,6 @@ if errorlevel 1 (
 
 set "PRIMARY_COMMAND=run"
 if not "%~1"=="" set "PRIMARY_COMMAND=%~1"
-
-call :maybe_preflight
-if errorlevel 1 (
-    set "EXIT_CODE=!errorlevel!"
-    popd
-    echo.
-    echo [ERROR] Preflight failed with code: !EXIT_CODE!
-    echo.
-    goto :hold
-)
 
 if "%~1"=="" (
     call :run_default_entry
@@ -95,23 +80,6 @@ if not "%RUN_DAILY_HOLD_SECONDS%"=="0" (
 )
 
 exit /b %EXIT_CODE%
-
-:maybe_preflight
-if /I not "%PRIMARY_COMMAND%"=="run" exit /b 0
-
-set "PREFLIGHT_MODE=%RUN_DAILY_PREFLIGHT%"
-if /I "%PREFLIGHT_MODE%"=="0" exit /b 0
-if /I "%PREFLIGHT_MODE%"=="off" exit /b 0
-if /I "%PREFLIGHT_MODE%"=="false" exit /b 0
-if /I "%PREFLIGHT_MODE%"=="skip" exit /b 0
-
-set "PREFLIGHT_COMMAND=doctor"
-if /I "%PREFLIGHT_MODE%"=="strict" set "PREFLIGHT_COMMAND=preflight"
-if /I "%PREFLIGHT_MODE%"=="preflight" set "PREFLIGHT_COMMAND=preflight"
-
-echo [%date% %time%] Preflight: %PREFLIGHT_COMMAND%
-"%PYTHON_EXE%" -u "%APP_DIR%\pipeline_cli.py" %PREFLIGHT_COMMAND%
-exit /b %errorlevel%
 
 :maybe_auto_resume
 if /I not "%PRIMARY_COMMAND%"=="run" exit /b 0

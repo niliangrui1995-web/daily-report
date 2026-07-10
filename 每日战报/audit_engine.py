@@ -1,5 +1,5 @@
 """
-P5 / P7a / P7.5 审计层 — Sonnet/GPT-5.5/Gemini 独立审计引擎。
+P5 / P7a / P7.5 审计层 — Sonnet/GPT-5.6 Sol/Gemini 独立审计引擎。
 
 从 daily_report.py 拆分。负责对 P1 原始数据、P7 深度研究和 P7.5 补充搜索结果进行
 可信度打分、时效性验证、去重汇总与数据清洗。
@@ -8,12 +8,11 @@ P5 / P7a / P7.5 审计层 — Sonnet/GPT-5.5/Gemini 独立审计引擎。
 1. 严禁擅自绕过或修改时效性窗口（如 24h/48h/72h/120h）的强制拦截逻辑，过期旧闻必须直接被判死刑剔除。
 2. 剥离和解析大模型返回的 JSON 结果时，必须强制保留现有的正则宽容解析（容忍前后出现 md 标记或乱码）与 try-catch 兜底，绝不能假定大模型每次都会吐出完美合规的 JSON。
 3. P5 与 P7.5 的 JSON 结果落盘阶段，必须严格按照层级变量隔离文件名前缀，严禁互相覆盖污染数据轴。
-4. 调用 Gemini Pro 时使用 `ThreadPoolExecutor(max_workers=1)` + `timeout=480s` 做超时保护，是从生产事故（Gemini 首次调用偶发无限挂起 10 分钟）中沉淀的机制。严禁"觉得用线程池包一层太重"而改成直接调用——那样会在某些边际条件下把整条流水线卡死。
+4. Gemini Pro 的单次请求必须保留 SDK 传输超时；审计阶段的墙钟硬截止由 orchestrator 的可终止子进程统一执行，禁止用线程池 `future.result(timeout=...)` 冒充可终止超时。
 5. P7a 是 P7 深度研究 → P9 战报之间的「数据压缩器」，产出纯 Markdown（非 JSON），
    直接替代 P7 原始数据传递给 P9，避免 P9 输入中 P7 占比过大稀释注意力。
 """
 
-import concurrent.futures
 import json
 import logging
 import time
@@ -98,20 +97,10 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
     ) + AUDIT_OUTPUT_LIMITS
 
     t0 = time.time()
-    _AUDIT_TIMEOUT_SECONDS = 480
-
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
-            _future = _pool.submit(pro_adapter.invoke, prompt)
-            resp = _future.result(timeout=_AUDIT_TIMEOUT_SECONDS)
-    except concurrent.futures.TimeoutError:
-        logging.error(f'🚨 [{layer_name} 审计] Gemini Pro 响应超时（{_AUDIT_TIMEOUT_SECONDS}s），降级跳过审计')
-        update_run_manifest(
-            stage_key,
-            status='failed_timeout',
-            metrics={'input_chars': len(raw_data), 'timeout_seconds': _AUDIT_TIMEOUT_SECONDS},
-        )
-        return ''
+        # NativeLLMAdapter enforces the provider transport timeout. The enclosing
+        # pipeline stage runs in a subprocess and supplies the hard wall-clock deadline.
+        resp = pro_adapter.invoke(prompt)
     except Exception as e:
         logging.error(f'🚨 [{layer_name} 审计] 调用异常: {e}')
         update_run_manifest(
@@ -172,7 +161,7 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
         clean_text = '\n'.join(clean_lines).strip()
 
         deleted_lines = []
-        deleted_lines.append('## 🔴 删除清单（不传给 GPT-5.5 XHigh，仅记录）')
+        deleted_lines.append('## 🔴 删除清单（不传给 GPT-5.6 Sol Max，仅记录）')
         deleted = data.get('deleted', [])
         if deleted:
             for d in deleted:
@@ -235,7 +224,7 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
     """P7a 深度研究审计 — 对 P7 原始搜索数据做去重、降噪、结构化汇总。
 
     Why: P7 原始输出通常 40K+ 字，跨 3 轮搜索存在大量重复信息和搜索噪声。
-         如果直接送入 P9，会占据 GPT-5.5 XHigh 近一半的注意力窗口，稀释战报质量。
+         如果直接送入 P9，会占据 GPT-5.6 Sol Max 近一半的注意力窗口，稀释战报质量。
          P7a 用独立审计模型做一次审计汇总，将信息密度提升 3~5 倍，
          输出 8~12K 字的精炼 Markdown 报告替代原始数据送入 P9。
 
@@ -277,22 +266,10 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
     )
 
     t0 = time.time()
-    _P7A_TIMEOUT_SECONDS = 480
-
     try:
-        # Why: 复用与 P5/P7.5 相同的 ThreadPoolExecutor + timeout 保护模式，
-        #       防止 Gemini 首次调用偶发无限挂起
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
-            _future = _pool.submit(pro_adapter.invoke, prompt)
-            resp = _future.result(timeout=_P7A_TIMEOUT_SECONDS)
-    except concurrent.futures.TimeoutError:
-        logging.error(f'🚨 [P7a 审计] Gemini Pro 响应超时（{_P7A_TIMEOUT_SECONDS}s），降级透传原始数据')
-        update_run_manifest(
-            'p7a',
-            status='failed_timeout',
-            metrics={'input_chars': len(raw_deep_research), 'timeout_seconds': _P7A_TIMEOUT_SECONDS},
-        )
-        return raw_deep_research
+        # Transport timeout is enforced by the adapter; the research stage process
+        # remains the killable hard deadline for a provider that ignores cancellation.
+        resp = pro_adapter.invoke(prompt)
     except Exception as e:
         logging.error(f'🚨 [P7a 审计] 调用异常: {e}，降级透传原始数据')
         update_run_manifest(

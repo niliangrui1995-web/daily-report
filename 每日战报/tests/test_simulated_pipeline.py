@@ -173,12 +173,12 @@ class TestScheduledLauncherSimulation:
 
 
 class TestRunDailyBatchSimulation:
-    def test_run_daily_defaults_to_strict_preflight(self):
+    def test_run_daily_delegates_preflight_to_pipeline_cli(self):
         source_batch = Path(__file__).resolve().parents[2] / "run_daily.bat"
         source = source_batch.read_text(encoding="utf-8")
 
         assert 'if not defined PYTHON_EXE set "PYTHON_EXE=%ROOT_DIR%.venv\\Scripts\\python.exe"' in source
-        assert 'if not defined RUN_DAILY_PREFLIGHT set "RUN_DAILY_PREFLIGHT=strict"' in source
+        assert "call :maybe_preflight" not in source
 
     def test_run_daily_default_uses_scheduled_launcher_after_preflight(self, tmp_path):
         if os.name != "nt":
@@ -188,7 +188,7 @@ class TestRunDailyBatchSimulation:
         batch_path = tmp_path / "run_daily.bat"
         batch_path.write_text(source_batch.read_text(encoding="utf-8"), encoding="utf-8")
 
-        app_dir = tmp_path / "app"
+        app_dir = tmp_path / "每日战报"
         app_dir.mkdir(parents=True, exist_ok=True)
         (app_dir / "scheduled_launcher.py").write_text(
             (
@@ -240,7 +240,6 @@ class TestRunDailyBatchSimulation:
         calls = json.loads((app_dir / "calls.json").read_text(encoding="utf-8"))
         assert result.returncode == 0
         assert calls == [
-            ["pipeline_cli", "preflight"],
             ["scheduled_launcher"],
             ["pipeline_cli", "run"],
         ]
@@ -253,7 +252,7 @@ class TestRunDailyBatchSimulation:
         batch_path = tmp_path / "run_daily.bat"
         batch_path.write_text(source_batch.read_text(encoding="utf-8"), encoding="utf-8")
 
-        app_dir = tmp_path / "app"
+        app_dir = tmp_path / "每日战报"
         app_dir.mkdir(parents=True, exist_ok=True)
         (app_dir / "pipeline_cli.py").write_text(
             (
@@ -298,7 +297,7 @@ class TestRunDailyBatchSimulation:
         batch_path = tmp_path / "run_daily.bat"
         batch_path.write_text(source_batch.read_text(encoding="utf-8"), encoding="utf-8")
 
-        app_dir = tmp_path / "app"
+        app_dir = tmp_path / "每日战报"
         app_dir.mkdir(parents=True, exist_ok=True)
         (app_dir / "scheduled_launcher.py").write_text(
             (
@@ -393,6 +392,8 @@ class TestP8AndP9Simulation:
             lambda prompt: SimpleNamespace(
                 content=json.dumps(
                     {
+                        "x_intel_snipe": [],
+                        "p3_machine_intel": [],
                         "core_signals": [
                             {
                                 "source": "P2",
@@ -403,6 +404,8 @@ class TestP8AndP9Simulation:
                                 "evidence_refs": ["P2-1", "P5-1"],
                             }
                         ],
+                        "sniper_tables": [],
+                        "fund_pathway": [],
                         "today_advice": [
                             {
                                 "priority": "★★★",

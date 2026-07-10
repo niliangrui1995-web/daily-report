@@ -86,7 +86,7 @@ def is_insecure_tls_allowed(url: str) -> bool:
 ANTIGRAVITY_BASE_URL = os.environ.get('ANTIGRAVITY_BASE_URL', 'http://127.0.0.1:8045')
 ANTIGRAVITY_API_KEY = os.environ.get('ANTIGRAVITY_API_KEY', '')
 if not ANTIGRAVITY_API_KEY:
-    logging.warning('⚠️ ANTIGRAVITY_API_KEY 未配置！请检查 .env 文件。Pro/GPT-5.5 模型调用将鉴权失败。')
+    logging.warning('⚠️ ANTIGRAVITY_API_KEY 未配置！请检查 .env 文件。Pro/GPT-5.6 Sol 模型调用将鉴权失败。')
 PRO_OPUS_BASE_URL = os.environ.get('PRO_OPUS_BASE_URL', ANTIGRAVITY_BASE_URL)
 PRO_OPUS_API_KEY = os.environ.get('PRO_OPUS_API_KEY', ANTIGRAVITY_API_KEY)
 
@@ -107,8 +107,8 @@ if not SEARCH_API_KEY_POOL:
 GEMINI_SEARCH_MODEL = os.environ.get('GEMINI_SEARCH_MODEL', 'gemini-2.5-flash').strip() or 'gemini-2.5-flash'
 AUDIT_MODEL = os.environ.get('AUDIT_MODEL', os.environ.get('GEMINI_PRO_MODEL', 'claude-sonnet-4-6')).strip() or 'claude-sonnet-4-6'
 GEMINI_PRO_MODEL = AUDIT_MODEL
-OPUS_MODEL = 'gpt-5.5'
-OPUS_REASONING_EFFORT = 'xhigh'
+OPUS_MODEL = 'gpt-5.6-sol'
+OPUS_REASONING_EFFORT = 'max'
 OPUS_REASONING_SUMMARY = 'auto'
 OPUS_USE_RESPONSES_API = True
 AGENT_ASSIST_ENABLED = os.environ.get('AGENT_ASSIST_ENABLED', '').strip().lower() in {'1', 'true', 'yes', 'on'}

@@ -832,10 +832,9 @@ class TestPreflightChecks:
         assert result == pipeline_cli.EXIT_CHECK_FAILED
         assert "lock" not in calls
         assert not any(call[0] == "orchestrator" for call in calls if isinstance(call, tuple))
-        run_state = [call[1] for call in calls if isinstance(call, tuple) and call[0] == "run_state"][-1]
-        assert run_state["status"] == "not_entered_main_flow"
-        assert run_state["root_cause"] == "preflight_failed"
-        assert run_state["main_flow_entered"] is False
+        assert not any(call[0] == "run_state" for call in calls if isinstance(call, tuple))
+        assert not any(call[0] == "context" for call in calls if isinstance(call, tuple))
+        assert "agent" not in calls
 
     def test_run_command_invokes_orchestrator_after_successful_preflight(self, monkeypatch):
         import pipeline_cli
@@ -882,6 +881,8 @@ class TestPreflightChecks:
         assert result == pipeline_cli.EXIT_OK
         assert ("preflight", True) in calls
         assert calls[call_names.index("lock")][1]["command"] == "run"
+        assert call_names.index("lock") < call_names.index("context")
+        assert call_names.index("lock") < call_names.index("agent")
         assert call_names.index("lock") < call_names.index("orchestrator")
         assert ("orchestrator", []) in calls
 
@@ -1104,6 +1105,7 @@ class TestPreflightChecks:
             "pid": 22016,
             "command": "run",
             "started_at": "2026-06-23T00:30:06+00:00",
+            "run_day": "20260623",
         }
 
         monkeypatch.setattr(pipeline_cli, "get_output_root_dir", lambda: str(output_root))
@@ -1129,6 +1131,47 @@ class TestPreflightChecks:
         assert "lock: stale" in output
         assert "stale_reason=pid_not_running" in output
 
+    def test_status_day_does_not_apply_unrelated_global_lock_to_history(self, monkeypatch, tmp_path, capsys):
+        import pipeline_cli
+
+        output_root = tmp_path / "output"
+        day_dir = output_root / "20260623"
+        day_dir.mkdir(parents=True)
+        manifest_path = day_dir / "run_manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "run_timestamp": "20260623083006",
+                    "status": "running",
+                    "root_cause": "orchestrator_started",
+                    "main_flow_entered": True,
+                    "runtime_context": {},
+                    "stages": {},
+                    "preflight": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        unrelated_lock = {
+            "pid": 9999,
+            "command": "run",
+            "started_at": "2026-07-10T00:00:00+00:00",
+            "heartbeat_at": "2026-07-10T00:00:30+00:00",
+            "run_day": "20260710",
+        }
+
+        monkeypatch.setattr(pipeline_cli, "get_output_root_dir", lambda: str(output_root))
+        monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: unrelated_lock)
+        monkeypatch.setattr(pipeline_cli, "is_trading_day", lambda _: True)
+
+        assert pipeline_cli.cmd_status(SimpleNamespace(day="20260623")) == 0
+
+        output = capsys.readouterr().out
+        unchanged = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        assert unchanged["status"] == "running"
+        assert "lock: unrelated" in output
+        assert "target_day=20260623" in output
+
     def test_preflight_strict_returns_lock_exit_code(self, monkeypatch, tmp_path):
         import pipeline_cli
 
@@ -1144,6 +1187,11 @@ class TestPreflightChecks:
         monkeypatch.setattr(pipeline_cli, "SEARCH_API_KEY_POOL", ["key-1"])
         monkeypatch.setattr(pipeline_cli, "ANTIGRAVITY_API_KEY", "secret")
         monkeypatch.setattr(pipeline_cli, "GROK_API_KEY", "optional")
+        monkeypatch.setattr(pipeline_cli, "PRO_OPUS_BASE_URL", "http://127.0.0.1:8317/v1")
+        monkeypatch.setattr(pipeline_cli, "PRO_OPUS_API_KEY", "secret")
+        monkeypatch.setattr(pipeline_cli, "EMAIL_ADDRESS", "sender@example.com")
+        monkeypatch.setattr(pipeline_cli, "EMAIL_PASSWORD", "smtp-secret")
+        monkeypatch.setattr(pipeline_cli, "_probe_local_model_endpoint", lambda _url, _key: (True, "authenticated status=200"))
         monkeypatch.setattr(pipeline_cli, "INSECURE_TLS_ALLOWLIST", ("self-signed.local",))
         monkeypatch.setattr(
             pipeline_cli.importlib,
@@ -1179,6 +1227,11 @@ class TestPreflightChecks:
         monkeypatch.setattr(pipeline_cli, "require_prompt", lambda name: "ok")
         monkeypatch.setattr(pipeline_cli, "SEARCH_API_KEY_POOL", ["key-1"])
         monkeypatch.setattr(pipeline_cli, "ANTIGRAVITY_API_KEY", "secret")
+        monkeypatch.setattr(pipeline_cli, "PRO_OPUS_BASE_URL", "http://127.0.0.1:8317/v1")
+        monkeypatch.setattr(pipeline_cli, "PRO_OPUS_API_KEY", "secret")
+        monkeypatch.setattr(pipeline_cli, "EMAIL_ADDRESS", "sender@example.com")
+        monkeypatch.setattr(pipeline_cli, "EMAIL_PASSWORD", "smtp-secret")
+        monkeypatch.setattr(pipeline_cli, "_probe_local_model_endpoint", lambda _url, _key: (True, "authenticated status=200"))
         monkeypatch.setattr(pipeline_cli, "GROK_API_KEY", "optional")
         monkeypatch.setattr(pipeline_cli, "INSECURE_TLS_ALLOWLIST", ())
         monkeypatch.setattr(

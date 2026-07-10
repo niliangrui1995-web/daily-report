@@ -19,7 +19,7 @@ import time
 import random
 from datetime import datetime, timedelta, timezone
 import feedparser
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, ALL_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
 
 from config import (
     RSS_FEEDS as V2_RSS_FEEDS,
@@ -34,6 +34,9 @@ from utils import normalize_common_text_mojibake, parse_backtrack_hours
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 _FUTURE_TIME_GRACE = timedelta(minutes=10)
+HN_FETCH_BUDGET_SECONDS = 60
+RSS_PHASE1_BUDGET_SECONDS = 180
+RSS_ENRICH_BUDGET_SECONDS = 180
 
 try:
     from scraper_utils import scrapling_available as _scrapling_available
@@ -154,9 +157,10 @@ def _fetch_hackernews() -> list[dict]:
             return None
 
     entries = []
-    with ThreadPoolExecutor(max_workers=10) as pool:
+    pool = ThreadPoolExecutor(max_workers=10)
+    try:
         futures = {pool.submit(_fetch_one_hn_story, item_id): item_id for item_id in ids}
-        done, not_done = wait(futures.keys(), timeout=60, return_when=ALL_COMPLETED)
+        done, not_done = wait(futures.keys(), timeout=HN_FETCH_BUDGET_SECONDS, return_when=ALL_COMPLETED)
 
         for future in done:
             try:
@@ -170,6 +174,8 @@ def _fetch_hackernews() -> list[dict]:
             future.cancel()
             item_id = futures[future]
             logging.debug(f'Ignored timeout item_id exception: {item_id}')
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     return entries
 def _parse_published_datetime(published_at: str) -> datetime | None:
@@ -339,9 +345,10 @@ def collect_from_rss(backtrack: str = '24h') -> tuple[list[dict], dict]:
         except Exception as exc:
             return [], 'error', str(exc)
             
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    pool = ThreadPoolExecutor(max_workers=8)
+    try:
         futures = {pool.submit(_run_task, t): t for t in tasks}
-        done, not_done = wait(futures.keys(), timeout=180, return_when=ALL_COMPLETED)
+        done, not_done = wait(futures.keys(), timeout=RSS_PHASE1_BUDGET_SECONDS, return_when=ALL_COMPLETED)
 
         for future in done:
             task_info = futures[future]
@@ -372,9 +379,11 @@ def collect_from_rss(backtrack: str = '24h') -> tuple[list[dict], dict]:
             task_info = futures[future]
             source_name = task_info[3]
             future.cancel()
-            reason = '采集任务超时（180s），已保留其他已完成结果'
+            reason = f'采集任务超时（{RSS_PHASE1_BUDGET_SECONDS}s），已保留其他已完成结果'
             stats['failed'].append((source_name, reason))
             logging.warning(f'  ⏱️ {source_name}: {reason}')
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
                 
     logging.info(f'\n[P1 Phase 1 完毕] 成功: {len(stats["success"])}/{stats["total"]} | 发现: {len(all_entries)} 篇')
     
@@ -436,9 +445,15 @@ def collect_from_rss(backtrack: str = '24h') -> tuple[list[dict], dict]:
         def _process_one_entry(entry):
             return entry, _enrich_article(entry)
             
-        with ThreadPoolExecutor(max_workers=10) as pool:
+        pool = ThreadPoolExecutor(max_workers=10)
+        try:
             futures = {pool.submit(_process_one_entry, e): e for e in shuffled_entries}
-            for future in as_completed(futures):
+            done, not_done = wait(
+                futures.keys(),
+                timeout=RSS_ENRICH_BUDGET_SECONDS,
+                return_when=ALL_COMPLETED,
+            )
+            for future in done:
                 entry = futures[future]
                 try:
                     entry_ref, scrapled = future.result()
@@ -454,7 +469,25 @@ def collect_from_rss(backtrack: str = '24h') -> tuple[list[dict], dict]:
                 processed_count += 1
                 if processed_count % 10 == 0 or processed_count == total_len:
                     logging.info(f'  Phase 2 进度: {processed_count}/{total_len} | ✅ {enrich_ok} | ❌ {enrich_fail}')
-                    
+
+            for future in not_done:
+                entry = futures[future]
+                future.cancel()
+                enrich_fail += 1
+                failed_urls.append({
+                    'title': entry.get('title', ''),
+                    'url': entry.get('url', ''),
+                    'source': entry.get('_feed_name', entry.get('source', '')),
+                })
+            if not_done:
+                logging.warning(
+                    '[P1 Phase 2] %s 个正文任务超过 %ss 截止时间，结果已丢弃',
+                    len(not_done),
+                    RSS_ENRICH_BUDGET_SECONDS,
+                )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
         logging.info(f'[P1 Phase 2 完毕] ✅ {enrich_ok} / ❌ {enrich_fail} ({(enrich_ok * 100 // (enrich_ok + enrich_fail)) if (enrich_ok + enrich_fail) else 0}%)')
     elif not _scrapling_available:
         logging.warning('[P1 Phase 2] Scrapling 不可用，跳过正文深挖')

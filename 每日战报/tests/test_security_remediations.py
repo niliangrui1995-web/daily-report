@@ -143,7 +143,7 @@ def test_safe_requests_get_applies_default_timeout(monkeypatch):
 
     scraper_utils._safe_requests_get("https://example.com/news", headers={}, verify=True)
 
-    assert calls[0]["timeout"] == 12
+    assert calls[0]["timeout"] == (5.0, 12.0)
 
 
 def test_safe_requests_get_rechecks_dns_on_each_request(monkeypatch):

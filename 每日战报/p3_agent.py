@@ -580,19 +580,13 @@ def collect_p3_parallel_only(backtrack: str = "24h") -> tuple[str, dict]:
         future_3 = pool.submit(run_jinnang_3, hours)
 
         try:
-            jinnang_2_results = future_2.result(timeout=300)
-        except concurrent.futures.TimeoutError:
-            logging.warning("[P3] jinnang_2 timed out after 300s")
-            jinnang_2_results = []
+            jinnang_2_results = future_2.result()
         except Exception as exc:
             logging.warning("[P3] jinnang_2 failed: %s", exc)
             jinnang_2_results = []
 
         try:
-            jinnang_3_results = future_3.result(timeout=300)
-        except concurrent.futures.TimeoutError:
-            logging.warning("[P3] jinnang_3 timed out after 300s")
-            jinnang_3_results = []
+            jinnang_3_results = future_3.result()
         except Exception as exc:
             logging.warning("[P3] jinnang_3 failed: %s", exc)
             jinnang_3_results = []

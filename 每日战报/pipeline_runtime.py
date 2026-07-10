@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import multiprocessing
@@ -200,97 +201,131 @@ def _run_stage_in_subprocess(stage: StageSpec, context: dict[str, Any]) -> dict[
     # Why: Queue 只传极小的状态信号和文件路径，不传 context 数据本身
     result_queue: multiprocessing.queues.Queue = mp_context.Queue(maxsize=1)
 
-    # Why: 在主进程侧创建临时文件路径，子进程往里写，主进程从里读
+    # Reserve a private random directory so concurrent/retried stages cannot
+    # collide or consume a stale result left by another process.
     tmp_dir = tempfile.gettempdir()
-    result_file_path = os.path.join(tmp_dir, f"vcp_stage_{stage.name}_{os.getpid()}.json")
-    _cleanup_temp_file(result_file_path)
-
-    process = mp_context.Process(
-        target=_stage_process_entrypoint,
-        args=(stage, context, result_queue, result_file_path),
-        name=f"stage-{stage.name}",
-    )
-    process.start()
-
-    # Why: 先尝试非阻塞读取 Queue（Python 文档建议 drain queue before join），
-    #      防止子进程因 put() 阻塞而无法退出
-    result_signal: dict[str, Any] | None = None
-    deadline = time.time() + (stage.timeout_seconds or 900)
-    while process.is_alive() and time.time() < deadline:
-        try:
-            result_signal = result_queue.get(timeout=2.0)
-            break
-        except Exception:
-            continue
-
-    # Why: Queue 已经读取（或超时），现在安全地等待子进程退出
-    remaining_timeout = max(0.1, deadline - time.time())
-    process.join(timeout=min(remaining_timeout, 30))
-
-    if process.is_alive():
-        logging.error(
-            "[control] stage %s exceeded timeout_seconds=%s; terminating subprocess pid=%s",
-            stage.name,
-            stage.timeout_seconds,
-            process.pid,
-        )
-        process.terminate()
-        process.join(timeout=5)
-        if process.is_alive():
-            process.kill()
-            process.join(timeout=5)
-        _cleanup_temp_file(result_file_path)
-        return {"status": "timeout"}
-
-    # Why: 如果循环中没读到信号，再做一次最终尝试
-    if result_signal is None:
-        try:
-            result_signal = result_queue.get_nowait()
-        except Exception:
-            result_signal = None
+    result_dir = tempfile.mkdtemp(prefix="vcp_stage_", dir=tmp_dir)
+    result_file_path = os.path.join(result_dir, "context.json")
 
     try:
-        result_queue.close()
-        result_queue.join_thread()
-    except Exception:
-        pass
+        process = mp_context.Process(
+            target=_stage_process_entrypoint,
+            args=(stage, context, result_queue, result_file_path),
+            name=f"stage-{stage.name}",
+        )
+        process.start()
 
-    if result_signal is None:
-        if process.exitcode == 0:
+        # Drain the tiny status signal before join so the child cannot block on
+        # a full multiprocessing pipe.
+        result_signal: dict[str, Any] | None = None
+        deadline = time.time() + (stage.timeout_seconds or 900)
+        while process.is_alive() and time.time() < deadline:
+            try:
+                result_signal = result_queue.get(timeout=2.0)
+                break
+            except Exception:
+                continue
+
+        remaining_timeout = max(0.1, deadline - time.time())
+        process.join(timeout=min(remaining_timeout, 30))
+
+        if process.is_alive():
+            logging.error(
+                "[control] stage %s exceeded timeout_seconds=%s; terminating subprocess pid=%s",
+                stage.name,
+                stage.timeout_seconds,
+                process.pid,
+            )
+            process.terminate()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+            return {"status": "timeout"}
+
+        if result_signal is None:
+            try:
+                result_signal = result_queue.get_nowait()
+            except Exception:
+                result_signal = None
+
+        try:
+            result_queue.close()
+            result_queue.join_thread()
+        except Exception:
+            pass
+
+        if result_signal is None:
+            if process.exitcode != 0:
+                return {
+                    "status": "error",
+                    "error": f"stage subprocess exited unexpectedly with code={process.exitcode}",
+                }
             updated_context = _read_context_from_file(result_file_path)
-            if updated_context is not None:
-                return {"status": "success", "context": updated_context}
-            return {"status": "success", "context": context}
-        _cleanup_temp_file(result_file_path)
-        return {
-            "status": "error",
-            "error": f"stage subprocess exited unexpectedly with code={process.exitcode}",
-        }
+            if updated_context is None:
+                return {
+                    "status": "error",
+                    "error": "stage subprocess produced no valid context result",
+                }
+            return {"status": "success", "context": updated_context}
 
-    status = result_signal.get("status", "error")
+        if not isinstance(result_signal, dict):
+            return {"status": "error", "error": "stage subprocess returned an invalid status signal"}
 
-    if status == "error":
-        _cleanup_temp_file(result_file_path)
-        return result_signal
+        status = result_signal.get("status", "error")
+        if status == "error":
+            return result_signal
+        if status != "success":
+            return {"status": "error", "error": f"stage subprocess returned unknown status={status}"}
 
-    # Why: 从临时文件读取完整 context，这比通过管道传输安全得多
-    updated_context = _read_context_from_file(result_file_path)
-    if updated_context is not None:
+        updated_context = _read_context_from_file(
+            result_file_path,
+            expected_sha256=str(result_signal.get("context_sha256") or "") or None,
+        )
+        if updated_context is None:
+            return {
+                "status": "error",
+                "error": "stage subprocess context result is missing, corrupt, or failed validation",
+            }
         return {"status": "success", "context": updated_context}
-    else:
-        # Why: 文件读取失败时降级为使用入参 context（handler 已完成，数据通过 manifest 持久化了）
-        logging.warning("[control] stage %s: 临时文件读取失败，使用原始 context 降级", stage.name)
-        return {"status": "success", "context": context}
+    finally:
+        _cleanup_temp_file(result_file_path)
+        try:
+            os.rmdir(result_dir)
+        except OSError:
+            pass
 
 
-def _read_context_from_file(file_path: str) -> dict[str, Any] | None:
+def _context_sha256(context: dict[str, Any]) -> str:
+    canonical = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _read_context_from_file(
+    file_path: str,
+    *,
+    expected_sha256: str | None = None,
+) -> dict[str, Any] | None:
     """从临时文件读取子进程序列化的 context。"""
     try:
         if not os.path.exists(file_path):
             return None
         with open(file_path, "r", encoding=UTF8_FILE_ENCODING) as f:
             data = json.load(f)
-        return data
+        if isinstance(data, dict) and data.get("context_file_version") == 1:
+            saved_context = data.get("context")
+            saved_sha256 = str(data.get("sha256") or "")
+            if not isinstance(saved_context, dict) or not saved_sha256:
+                raise ValueError("context result envelope is incomplete")
+            actual_sha256 = _context_sha256(saved_context)
+            if saved_sha256 != actual_sha256:
+                raise ValueError("context result checksum mismatch")
+            if expected_sha256 and expected_sha256 != actual_sha256:
+                raise ValueError("context result signal checksum mismatch")
+            return saved_context
+        if expected_sha256:
+            raise ValueError("context result envelope is missing")
+        return data if isinstance(data, dict) else None
     except Exception as exc:
         logging.warning("[control] 读取临时 context 文件失败: %s", exc)
         return None
@@ -324,13 +359,10 @@ def _stage_process_entrypoint(
         stage.handler(context)
 
         # Why: 先落盘再发信号，确保主进程读到信号时文件已就绪
-        try:
-            _write_context_to_file(context, result_file_path)
-        except Exception as write_exc:
-            logging.warning("[control] 写入临时 context 文件失败: %s", write_exc)
+        context_sha256 = _write_context_to_file(context, result_file_path)
 
-        # Why: 只通过 Queue 发送极小的状态信号 → 永远不会阻塞管道
-        result_queue.put({"status": "success"})
+        # The signal binds the child result to the validated on-disk envelope.
+        result_queue.put({"status": "success", "context_sha256": context_sha256})
     except Exception as exc:
         result_queue.put(
             {
@@ -341,7 +373,7 @@ def _stage_process_entrypoint(
         )
 
 
-def _write_context_to_file(context: dict[str, Any], file_path: str) -> None:
+def _write_context_to_file(context: dict[str, Any], file_path: str) -> str:
     """将 context 序列化到临时文件。
 
     Why: context 可能包含不可 JSON 序列化的对象（如 datetime），
@@ -361,5 +393,20 @@ def _write_context_to_file(context: dict[str, Any], file_path: str) -> None:
             else:
                 logging.debug("[control] context key '%s' 不可序列化，跳过", key)
 
-    with open(file_path, "w", encoding=UTF8_FILE_ENCODING) as f:
-        json.dump(serializable_context, f, ensure_ascii=False)
+    context_sha256 = _context_sha256(serializable_context)
+    envelope = {
+        "context_file_version": 1,
+        "context": serializable_context,
+        "sha256": context_sha256,
+    }
+    target_dir = os.path.dirname(os.path.abspath(file_path))
+    fd, temp_path = tempfile.mkstemp(prefix=".context_", suffix=".tmp", dir=target_dir)
+    try:
+        with os.fdopen(fd, "w", encoding=UTF8_FILE_ENCODING) as f:
+            json.dump(envelope, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, file_path)
+    finally:
+        _cleanup_temp_file(temp_path)
+    return context_sha256

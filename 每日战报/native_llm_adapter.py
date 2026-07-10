@@ -619,15 +619,20 @@ class NativeLLMAdapter(RunnableSerializable):
         if getattr(self, '_gemini_client', None) is None:
             from google import genai
             from google.genai import types
+
+            timeout_ms = max(1, int(self.timeout * 1000))
             
             if _is_official_gemini_direct_model(self.model):
                 # 官方 Gemini 模型走默认 URL，避免把 3.5 误送进本地 3.1 反代。
-                client = genai.Client(api_key=self.api_key)
+                client = genai.Client(
+                    api_key=self.api_key,
+                    http_options=types.HttpOptions(timeout=timeout_ms),
+                )
             else:
                 # 旧版 3.x 兼容模型走反代逻辑 (通过 http_options.base_url 挂载)
                 client = genai.Client(
                     api_key=self.api_key,
-                    http_options=types.HttpOptions(base_url=self.base_url)
+                    http_options=types.HttpOptions(base_url=self.base_url, timeout=timeout_ms)
                 )
             object.__setattr__(self, '_gemini_client', client)
         

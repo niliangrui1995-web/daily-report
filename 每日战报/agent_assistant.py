@@ -94,6 +94,8 @@ def _invoke_json(prompt_name: str, payload: dict[str, Any], *, kind: str) -> dic
 
 def explain_preflight(preflight_result: dict[str, Any]) -> dict[str, Any]:
     result = _invoke_json(PROMPT_PREFLIGHT, {"preflight": preflight_result}, kind="preflight")
+    if result.get("reason") in {"disabled", "adapter_unavailable"}:
+        return result
     artifacts = safe_write_agent_artifact("Agent_预检解释", result)
     result.update(artifacts)
     return result
@@ -108,6 +110,8 @@ def diagnose_failure(stage: str, error_text: str, manifest: dict[str, Any], log_
     }
     result = _invoke_json(PROMPT_FAILURE, payload, kind="failure_diagnosis")
     result.setdefault("stage", stage)
+    if result.get("reason") in {"disabled", "adapter_unavailable"}:
+        return result
     artifacts = safe_write_agent_artifact("Agent_失败诊断", result)
     result.update(artifacts)
     return result
@@ -119,6 +123,8 @@ def review_final_report(report_md: str, context: dict[str, Any] | None = None) -
         "context": context or {},
     }
     result = _invoke_json(PROMPT_REVIEW, payload, kind="report_review")
+    if result.get("reason") in {"disabled", "adapter_unavailable"}:
+        return result
     artifacts = safe_write_agent_artifact("Agent_终稿审校", result)
     result.update(artifacts)
     return result

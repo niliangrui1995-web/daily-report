@@ -404,6 +404,8 @@ def test_p9_risk_analysis_applies_guardrails_before_rendering(monkeypatch):
         lambda prompt: SimpleNamespace(
             content=json.dumps(
                 {
+                    "x_intel_snipe": [],
+                    "p3_machine_intel": [],
                     "core_signals": [
                         {
                             "source": "P2",
@@ -414,6 +416,8 @@ def test_p9_risk_analysis_applies_guardrails_before_rendering(monkeypatch):
                             "evidence_refs": ["P2-1"],
                         }
                     ],
+                    "sniper_tables": [],
+                    "fund_pathway": [],
                     "today_advice": [
                         {
                             "priority": "★★★",

@@ -2,7 +2,7 @@
 
 > 按 A 股交易日运行的多阶段情报流水线：采集北美 AI 产业链信息，审计证据，映射 A 股受益方向，生成战报并邮件分发。
 
-Last verified: 2026-05-09
+Last verified: 2026-07-10
 
 ---
 
@@ -18,11 +18,10 @@ Last verified: 2026-05-09
 
 - 根目录 `run_daily.bat` 是 Windows 手工运行和计划任务入口。
 - 项目主体位于 `每日战报/` 子目录，控制面入口是 `pipeline_cli.py`。
-- `run_daily.bat` 默认先跑严格预检：`RUN_DAILY_PREFLIGHT=strict`。
+- `pipeline_cli.py run/resume/force-run/restart` 在取得运行锁后记录严格 preflight，通过后才进入 orchestrator。
 - `run_daily.bat` 默认失败后自动 `resume` 一次：`RUN_DAILY_AUTO_RESUME=on`，延迟 `10` 秒。
 - 无参数或参数为 `run` 时，`run_daily.bat` 优先进入 `scheduled_launcher.py`。
 - `scheduled_launcher.py` 会先判断当天是否为 A 股交易日；当前代码规则是 `schedule_rule=run_every_trading_day`，交易日运行，非交易日跳过。
-- `pipeline_cli.py run/resume/force-run/restart` 内部都会执行严格 preflight，通过后才进入 orchestrator。
 - `pipeline_lock.py` 使用全局 run lock 防止重复启动。
 - `run_manifest.json` 固定写入当日输出目录根部，记录阶段状态、运行上下文和 preflight 摘要。
 
@@ -33,6 +32,8 @@ Last verified: 2026-05-09
 ```text
 D:\vcp_hunter\每日战报\
 ├── run_daily.bat                 # Windows 入口：计划任务/双击/手工命令
+├── pyproject.toml                # 直接依赖、测试和静态检查配置
+├── uv.lock                       # 跨机器可复现的完整依赖锁
 ├── .venv\                        # 本地虚拟环境
 ├── 每日战报\                     # Python 流水线源码
 │   ├── pipeline_cli.py            # 控制面：run/resume/status/doctor/preflight/clean/prune
@@ -58,17 +59,17 @@ cd D:\vcp_hunter\每日战报
 
 ### 2. 安装依赖
 
-优先使用根目录虚拟环境：
+使用根目录锁文件创建或同步虚拟环境：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r .\每日战报\requirements.txt
+uv sync --locked
 ```
 
-如果虚拟环境不存在，先创建：
+`uv` 会按 `.python-version` 准备 Python 3.14，并创建根目录 `.venv`。兼容旧 pip 环境时，可安装由同一锁文件导出的根目录清单：
 
 ```powershell
 py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r .\每日战报\requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
 ```
 
 ### 3. 配置 `.env`
@@ -85,8 +86,8 @@ notepad .\每日战报\.env
 | 变量 | 用途 |
 | --- | --- |
 | `ANTIGRAVITY_BASE_URL` | 本地/远端 OpenAI 兼容模型服务地址，默认 `http://127.0.0.1:8045` |
-| `ANTIGRAVITY_API_KEY` | Pro/GPT-5.5/Agent 兼容模型鉴权 |
-| `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 覆盖 P6/P9 GPT-5.5 XHigh 模型服务；未配置时沿用 Antigravity 配置 |
+| `ANTIGRAVITY_API_KEY` | Pro/GPT-5.6 Sol/Agent 兼容模型鉴权 |
+| `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 覆盖 P6/P9 GPT-5.6 Sol Max 模型服务；未配置时沿用 Antigravity 配置 |
 | `GEMINI_SEARCH_API_KEYS` | Gemini 搜索 key 池，逗号分隔 |
 | `GEMINI_SEARCH_BASE_URL` | Gemini 搜索代理地址 |
 | `AUDIT_MODEL` | P5/P7a/P7.5 审计模型，默认 `claude-sonnet-4-6`；兼容旧变量 `GEMINI_PRO_MODEL` |
@@ -113,15 +114,15 @@ notepad .\每日战报\.env
 ### 查看运行状态
 
 ```powershell
-.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py status
+uv run python .\每日战报\pipeline_cli.py status
 ```
 
 ### 自检
 
 ```powershell
-.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py doctor
-.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py doctor --strict
-.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py preflight
+uv run python .\每日战报\pipeline_cli.py doctor
+uv run python .\每日战报\pipeline_cli.py doctor --strict
+uv run python .\每日战报\pipeline_cli.py preflight
 ```
 
 退出码约定：
@@ -141,10 +142,10 @@ notepad .\每日战报\.env
 ### 直接运行控制面
 
 ```powershell
-.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py run
-.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py resume
-.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py force-run
-.\.venv\Scripts\python.exe .\每日战报\pipeline_cli.py restart
+uv run python .\每日战报\pipeline_cli.py run
+uv run python .\每日战报\pipeline_cli.py resume
+uv run python .\每日战报\pipeline_cli.py force-run
+uv run python .\每日战报\pipeline_cli.py restart
 ```
 
 命令含义：
@@ -170,13 +171,12 @@ notepad .\每日战报\.env
 
 ## `run_daily.bat` 行为
 
-`run_daily.bat` 会自动定位包含 `pipeline_cli.py` 的项目子目录，并使用根目录 `.venv\Scripts\python.exe`。
+`run_daily.bat` 固定使用自身目录下的 `每日战报\pipeline_cli.py`，并使用根目录 `.venv\Scripts\python.exe`；入口不会扫描或执行其他同级目录。
 
 默认环境变量：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RUN_DAILY_PREFLIGHT` | `strict` | `strict`/`preflight` 跑严格预检；`doctor` 跑普通自检；`off`/`0`/`false`/`skip` 跳过 |
 | `RUN_DAILY_AUTO_RESUME` | `on` | `run` 失败且退出码不是 `2` 时，自动 `resume` 一次 |
 | `RUN_DAILY_RESUME_DELAY_SECONDS` | `10` | 自动恢复前等待秒数 |
 | `RUN_DAILY_HOLD_SECONDS` | `15` | 命令结束后保留窗口秒数，设为 `0` 可立即退出 |
@@ -184,7 +184,6 @@ notepad .\每日战报\.env
 示例：
 
 ```bat
-set RUN_DAILY_PREFLIGHT=off
 set RUN_DAILY_HOLD_SECONDS=0
 run_daily.bat status
 ```
@@ -212,6 +211,39 @@ run_daily.bat status
 - PyPI 包名：`chinesecalendar`
 - Python import 名：`chinese_calendar`
 - 缺失或不支持当年数据时，会降级为仅排除周末的保守策略
+
+### 最小权限计划任务
+
+正式计划任务使用独立的 `.venv-service`，其基础解释器固定为机器级 `C:\Python314`，避免运行身份依赖 Administrator 用户目录：
+
+```powershell
+$env:UV_PROJECT_ENVIRONMENT = ".venv-service"
+uv sync --locked --no-dev --python C:\Python314\python.exe
+```
+
+迁移脚本默认只执行零副作用 readiness 检查并打印计划，不修改账户、ACL、任务、代理或防火墙。凭据尚未完成轮换、任务正在运行、锁/端口/资源有冲突时返回退出码 `2`：
+
+```powershell
+.\ops\migrate_scheduled_task.ps1
+```
+
+必须先吊销并轮换 Git 历史中暴露过的 SMTP/API 凭据。自动检查确认当前 `.env` 中的秘密均不再出现在可达 Git 历史、且没有短于 8 个字符的弱秘密，再由操作者显式确认外部凭据已吊销后，`-Apply -ConfirmCredentialsRotated` 才会请求 UAC。
+
+如果资产所有者明确接受未轮换凭据继续暴露的风险，可改用 `-AcceptUnrotatedCredentialsRisk`。该开关不会把轮换检查伪装成通过，迁移结果会永久记录风险接受；不得与 `-ConfirmCredentialsRotated` 同时使用：
+
+```powershell
+.\ops\migrate_scheduled_task.ps1 -Apply -AcceptUnrotatedCredentialsRisk
+```
+
+脚本会导出原任务和 ACL，先禁用原触发器并取得流水线维护锁，再创建强制密码、随机密码的专用标准账户。源码和代理程序仅授予读取/执行，输出目录可写；`D:\HT` 通过专用账号的 deny-write ACE 保持有效只读，不改变其他用户现有权限。`CLIProxyAPI` 目标目录在复制任何凭据前即锁定为私有 ACL，仅 `auths` 子目录允许专用账号修改。
+
+迁移依次完成 8318 隔离 canary、8317 live canary、正式 `cmd.exe` Action 的 `preflight` 实跑，最后才替换正式任务主体。回滚只删除本次创建的资源，并恢复本次实际修改的任务、ACL 和桌面代理。
+
+```powershell
+.\ops\migrate_scheduled_task.ps1 -Apply -ConfirmCredentialsRotated
+```
+
+服务账户 canary 会验证机器级 Python、临时目录、输出写入、本地 TDX 读取与写拒绝、严格 preflight、真实低 token 模型推理、Gemini/xAI 鉴权，以及 SMTP TLS 登录。SMTP 探针只登录不发信；迁移过程不会生成正式战报。
 
 ---
 
@@ -299,14 +331,16 @@ run_daily.bat status
 代码级验证：
 
 ```powershell
-.\.venv\Scripts\python.exe -m compileall .\每日战报
-.\.venv\Scripts\python.exe -m pytest .\每日战报\tests -q
+uv lock --check
+uv run ruff check .\每日战报
+uv run python -m compileall -q .\每日战报
+uv run pytest -q
 ```
 
 快速离线回归可优先跑：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest .\每日战报\tests\test_simulated_pipeline.py -q
+uv run pytest .\每日战报\tests\test_simulated_pipeline.py -q
 ```
 
 这些测试不依赖真实邮件发送、真实网页采集或 live 模型调用，适合验证控制面、调度、输出和关键拼接逻辑。

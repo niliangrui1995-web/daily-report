@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import ipaddress
 import logging
 import os
 import sys
@@ -9,6 +10,7 @@ from datetime import date, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from artifact_store import (
     UTF8_FILE_ENCODING,
@@ -21,20 +23,30 @@ from artifact_store import (
     get_today_output_dir,
     load_run_manifest,
     record_run_state,
-    set_run_timestamp,
     set_preflight_summary,
     summarize_stage_degradations,
     update_manifest_context,
     update_run_manifest,
 )
 from agent_assistant import explain_preflight
-from pipeline_lock import PipelineLockError, acquire_run_lock, get_lock_stale_reason, read_run_lock
+from pipeline_lock import (
+    DEFAULT_STALE_AFTER_SECONDS,
+    PipelineLockError,
+    acquire_run_lock,
+    get_lock_stale_reason,
+    get_run_lock_state,
+    read_run_lock,
+)
 from pipeline_maintenance import clean_workspace, prune_outputs
 from settings import (
     OUTPUT_DIR,
     ANTIGRAVITY_API_KEY,
+    EMAIL_ADDRESS,
+    EMAIL_PASSWORD,
     GROK_API_KEY,
     INSECURE_TLS_ALLOWLIST,
+    PRO_OPUS_API_KEY,
+    PRO_OPUS_BASE_URL,
     SEARCH_API_KEY_POOL,
     get_today_output_dir as settings_today_output_dir,
     require_prompt,
@@ -44,7 +56,7 @@ from trading_calendar import get_calendar_status, is_trading_day
 EXIT_OK = 0
 EXIT_CHECK_FAILED = 1
 EXIT_LOCK_ACTIVE = 2
-RUN_LOCK_STALE_AFTER_SECONDS = 6 * 60 * 60
+RUN_LOCK_STALE_AFTER_SECONDS = DEFAULT_STALE_AFTER_SECONDS
 
 REQUIRED_PROMPTS = (
     "audit.txt",
@@ -62,6 +74,45 @@ RUNTIME_IMPORTS = (
     ("openai", "openai", "error"),
     ("scrapling", "scrapling", "warning"),
 )
+
+
+def _probe_local_model_endpoint(base_url: str, api_key: str) -> tuple[bool, str]:
+    try:
+        parsed = urlparse(base_url)
+        hostname = (parsed.hostname or "").strip().lower()
+        if parsed.scheme not in {"http", "https"} or not hostname:
+            return False, "invalid model endpoint URL"
+        try:
+            is_loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            is_loopback = hostname == "localhost"
+        if not api_key:
+            return False, "model endpoint API key is missing"
+        if not is_loopback:
+            return True, f"external endpoint configured host={hostname}; live probe skipped"
+
+        import requests
+
+        session = requests.Session()
+        session.trust_env = False
+        try:
+            response = session.get(
+                f"{base_url.rstrip('/')}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=(3.0, 8.0),
+            )
+            status_code = int(response.status_code)
+            if status_code != 200:
+                return False, f"authenticated probe returned HTTP {status_code}"
+            payload = response.json()
+        finally:
+            session.close()
+        models = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(models, list) or not models:
+            return False, "authenticated probe returned no models"
+        return True, f"authenticated status=200 models={len(models)} host={hostname}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def _configure_stdio() -> None:
@@ -108,34 +159,27 @@ def configure_run_logging() -> None:
 def _run_orchestrator(flags: list[str], *, command_name: str) -> int:
     preflight_result = _collect_preflight(strict=True)
     preflight_summary = preflight_result["summary"]
-    set_preflight_summary(preflight_summary)
-    try:
-        explain_preflight_and_record(preflight_result)
-    except Exception:
-        pass
-
     preflight_exit_code = int(preflight_summary.get("exit_code", EXIT_CHECK_FAILED))
-    update_manifest_context(
-        runtime_context={"preflight_exit_code": preflight_exit_code},
-        preflight=preflight_summary,
-    )
     if preflight_exit_code != EXIT_OK:
-        record_run_state(
-            status="not_entered_main_flow",
-            root_cause="preflight_failed",
-            reason=f"preflight exit_code={preflight_exit_code}",
-            source=f"pipeline_cli:{command_name}",
-            main_flow_entered=False,
-            runtime_context={"preflight_exit_code": preflight_exit_code},
-        )
         _print_preflight(preflight_result)
         return preflight_exit_code
 
-    configure_run_logging()
-    from orchestrator import orchestrator_main
-
     try:
         with acquire_run_lock(command=command_name):
+            set_preflight_summary(preflight_summary)
+            configure_run_logging()
+            update_manifest_context(
+                runtime_context={"preflight_exit_code": preflight_exit_code},
+                preflight=preflight_summary,
+            )
+            try:
+                agent_result = explain_preflight_and_record(preflight_result)
+                _record_agent_preflight_result(agent_result)
+            except Exception:
+                pass
+
+            from orchestrator import orchestrator_main
+
             orchestrator_main(flags)
     except PipelineLockError as exc:
         info = exc.info or {}
@@ -145,15 +189,7 @@ def _run_orchestrator(flags: list[str], *, command_name: str) -> int:
             info.get("command", "unknown"),
             info.get("started_at", "unknown"),
         )
-        record_run_state(
-            status="not_entered_main_flow",
-            root_cause="run_lock_active",
-            reason="pipeline lock active",
-            source=f"pipeline_cli:{command_name}",
-            main_flow_entered=False,
-            runtime_context={"lock_info": info},
-        )
-        return 2
+        return EXIT_LOCK_ACTIVE
     return 0
 
 
@@ -220,7 +256,17 @@ def _manifest_run_state(manifest: dict[str, Any]) -> dict[str, Any]:
         )
 
     if not status:
-        if isinstance(stages, dict) and stages and "orchestrator" not in stages:
+        preflight = manifest.get("preflight", {})
+        if not isinstance(preflight, dict):
+            preflight = {}
+        preflight_exit_code = preflight.get("exit_code", runtime_context.get("preflight_exit_code"))
+        preflight_only_stages = not stages or set(stages).issubset({"agent_preflight"})
+        if preflight_exit_code == EXIT_OK and preflight_only_stages:
+            status = "preflight_passed_no_run"
+            root_cause = "preflight_only"
+            reason = "standalone preflight passed; main flow was not started"
+            main_flow_entered = False
+        elif isinstance(stages, dict) and stages and "orchestrator" not in stages:
             status = "not_entered_main_flow"
             root_cause = "missing_orchestrator_state"
             reason = "manifest has stages but no root run_state or orchestrator stage"
@@ -253,6 +299,17 @@ def _resolve_status_target(args: argparse.Namespace) -> tuple[date, Path]:
     except ValueError as exc:
         raise ValueError("--day must use YYYYMMDD, for example 20260623") from exc
     return target_day, Path(get_output_root_dir()) / raw_day
+
+
+def _lock_matches_target_day(lock_info: dict[str, Any] | None, target_day: date) -> bool:
+    if not lock_info:
+        return False
+    run_day = str(lock_info.get("run_day") or "").strip()
+    if not run_day:
+        run_day = str(lock_info.get("run_timestamp") or "").strip()[:8]
+    if run_day:
+        return run_day == target_day.strftime("%Y%m%d")
+    return target_day == date.today()
 
 
 def _maybe_close_stale_running_manifest(
@@ -294,12 +351,19 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     manifest_path = Path(get_manifest_path(day_dir=str(day_dir)))
     manifest = load_run_manifest(day_dir=str(day_dir))
-    lock_info = read_run_lock()
+    global_lock_info = read_run_lock()
+    lock_is_related = _lock_matches_target_day(global_lock_info, target_day)
+    unrelated_lock_info = global_lock_info if global_lock_info and not lock_is_related else None
+    lock_info = global_lock_info if lock_is_related else None
+    lock_state = get_run_lock_state(lock_info)
     lock_stale_reason = (
-        get_lock_stale_reason(lock_info, stale_after_seconds=RUN_LOCK_STALE_AFTER_SECONDS) if lock_info else ""
+        get_lock_stale_reason(lock_info, stale_after_seconds=RUN_LOCK_STALE_AFTER_SECONDS)
+        if lock_state != "missing"
+        else ""
     )
     target_is_trading_day = is_trading_day(target_day)
     run_state = _manifest_run_state(manifest)
+    control_plane_inconsistency = run_state["status"] == "running" and lock_state in {"missing", "invalid"}
     if _maybe_close_stale_running_manifest(
         manifest=manifest,
         run_state=run_state,
@@ -345,7 +409,13 @@ def cmd_status(args: argparse.Namespace) -> int:
             f" reason={schedule.get('reason', '')}"
         )
 
-    if lock_info:
+    if unrelated_lock_info:
+        print(
+            "lock: unrelated"
+            f" run_day={unrelated_lock_info.get('run_day', 'unknown')}"
+            f" target_day={target_day.strftime('%Y%m%d')}"
+        )
+    elif lock_state == "valid":
         stale = bool(lock_stale_reason)
         lock_state = "stale" if stale else "active"
         print(
@@ -356,8 +426,18 @@ def cmd_status(args: argparse.Namespace) -> int:
             f" stale={'yes' if stale else 'no'}"
             f" stale_reason={lock_stale_reason or 'none'}"
         )
+    elif lock_state == "invalid":
+        stale = bool(lock_stale_reason)
+        print(
+            "lock: invalid"
+            f" stale={'yes' if stale else 'no'}"
+            f" stale_reason={lock_stale_reason or 'none'}"
+            f" error={lock_info.get('error', 'unknown')}"
+        )
     else:
-        print("lock: idle")
+        print("lock: missing")
+    if control_plane_inconsistency:
+        print(f"control_plane_inconsistency: manifest=running lock={get_run_lock_state(lock_info)}")
 
     stages = manifest.get("stages", {})
     if not stages:
@@ -385,7 +465,7 @@ def _format_check_line(name: str, ok: bool, detail: str, severity: str) -> str:
     return f"[{status}] {name}: {detail}"
 
 
-def _collect_preflight(strict: bool) -> dict:
+def _collect_preflight(strict: bool, *, allow_maintenance_lock: bool = False) -> dict:
     checks: list[dict] = []
 
     def add_check(name: str, ok: bool, detail: str, severity: str = "error") -> None:
@@ -409,6 +489,14 @@ def _collect_preflight(strict: bool) -> dict:
 
     add_check("search_keys", bool(SEARCH_API_KEY_POOL), f"count={len(SEARCH_API_KEY_POOL)}")
     add_check("antigravity_key", bool(ANTIGRAVITY_API_KEY), "configured" if ANTIGRAVITY_API_KEY else "missing")
+    endpoint_ok, endpoint_detail = _probe_local_model_endpoint(PRO_OPUS_BASE_URL, PRO_OPUS_API_KEY)
+    add_check("model_endpoint", endpoint_ok, endpoint_detail)
+    email_configured = bool(EMAIL_ADDRESS and EMAIL_PASSWORD)
+    add_check(
+        "email_credentials",
+        email_configured,
+        "configured" if email_configured else "missing address or SMTP authorization code",
+    )
     add_check("grok_key", bool(GROK_API_KEY), "configured" if GROK_API_KEY else "missing", severity="warning")
     add_check(
         "tls_allowlist",
@@ -449,12 +537,21 @@ def _collect_preflight(strict: bool) -> dict:
         add_check("calendar_probe", False, str(exc))
 
     lock_info = read_run_lock()
-    if lock_info:
+    lock_state = get_run_lock_state(lock_info)
+    if lock_state == "valid":
         stale_reason = get_lock_stale_reason(lock_info, stale_after_seconds=RUN_LOCK_STALE_AFTER_SECONDS)
         if stale_reason:
             add_check("run_lock", True, f"stale_reason={stale_reason} stale={lock_info}")
+        elif allow_maintenance_lock and lock_info.get("command") == "maintenance":
+            add_check("run_lock", True, f"maintenance_allowed pid={lock_info.get('pid')}")
         else:
             add_check("run_lock", False, f"active={lock_info}", severity="lock")
+    elif lock_state == "invalid":
+        stale_reason = get_lock_stale_reason(lock_info, stale_after_seconds=RUN_LOCK_STALE_AFTER_SECONDS)
+        if stale_reason:
+            add_check("run_lock", True, f"invalid_stale_reason={stale_reason} recoverable={lock_info}")
+        else:
+            add_check("run_lock", False, f"invalid_active={lock_info}", severity="lock")
     else:
         add_check("run_lock", True, "idle")
 
@@ -498,39 +595,17 @@ def _print_preflight(result: dict) -> int:
 
 
 def explain_preflight_and_record(result: dict) -> dict:
+    """Compatibility hook; callers persist its result exactly once."""
+    return explain_preflight(result)
+
+
+def _record_agent_preflight_result(agent_result: dict[str, Any] | None) -> None:
+    if not isinstance(agent_result, dict):
+        return
+    if agent_result.get("reason") in {"disabled", "adapter_unavailable"}:
+        return
     manifest = load_run_manifest()
-    existing_run_ts = str(manifest.get("run_timestamp", "")).strip()
-    if existing_run_ts and manifest.get("stages"):
-        set_run_timestamp(existing_run_ts)
-    agent_result = explain_preflight(result)
-    status = "completed" if agent_result.get("ok") else "skipped"
-    update_run_manifest(
-        "agent_preflight",
-        status=status,
-        files={
-            key: value
-            for key, value in {
-                "json": agent_result.get("json_path", ""),
-                "md": agent_result.get("md_path", ""),
-            }.items()
-            if value
-        } or None,
-        metrics={
-            "ok": bool(agent_result.get("ok")),
-            "reason": agent_result.get("reason", ""),
-        },
-    )
-    return agent_result
-
-
-def _run_preflight_with_agent(strict: bool) -> int:
-    result = _collect_preflight(strict=strict)
-    exit_code = _print_preflight(result)
-    update_manifest_context(
-        runtime_context={"preflight_exit_code": exit_code},
-        preflight=result.get("summary", {}),
-    )
-    agent_result = explain_preflight_and_record(result)
+    existing_run_ts = str(manifest.get("run_timestamp") or "").strip()
     update_run_manifest(
         "agent_preflight",
         status="completed" if agent_result.get("ok") else "skipped",
@@ -546,7 +621,22 @@ def _run_preflight_with_agent(strict: bool) -> int:
             "ok": bool(agent_result.get("ok")),
             "reason": agent_result.get("reason", ""),
         },
+        timestamp=existing_run_ts or None,
     )
+
+
+def _run_preflight_with_agent(strict: bool, *, allow_maintenance_lock: bool = False) -> int:
+    if allow_maintenance_lock:
+        result = _collect_preflight(strict=strict, allow_maintenance_lock=True)
+    else:
+        result = _collect_preflight(strict=strict)
+    exit_code = _print_preflight(result)
+    update_manifest_context(
+        runtime_context={"preflight_exit_code": exit_code},
+        preflight=result.get("summary", {}),
+    )
+    agent_result = explain_preflight_and_record(result)
+    _record_agent_preflight_result(agent_result)
     if agent_result.get("json_path"):
         print(f"Agent preflight artifact: {agent_result['json_path']}")
     return exit_code
@@ -557,7 +647,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_preflight(_: argparse.Namespace) -> int:
-    return _run_preflight_with_agent(strict=True)
+    allow_maintenance_lock = os.environ.get("VCP_PREFLIGHT_ALLOW_MAINTENANCE_LOCK", "") == "1"
+    return _run_preflight_with_agent(
+        strict=True,
+        allow_maintenance_lock=allow_maintenance_lock,
+    )
 
 
 def cmd_clean(args: argparse.Namespace) -> int:

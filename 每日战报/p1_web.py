@@ -17,7 +17,7 @@ import time
 import random
 import re
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, ALL_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -51,6 +51,8 @@ HEADERS = {
 }
 
 SOURCE_TIMEOUT = 20
+WEB_PHASE1_BUDGET_SECONDS = 180
+WEB_ENRICH_BUDGET_SECONDS = 180
 _FUTURE_TIME_GRACE = timedelta(minutes=10)
 _ASML_NEWS_NAV_PATHS = frozenset({
     '/en/news',
@@ -484,9 +486,10 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
         except Exception as exc:
             return None, 'error', str(exc)
             
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    pool = ThreadPoolExecutor(max_workers=4)
+    try:
         futures = {pool.submit(_run_task, src): src for src in V2_WEB_SOURCES}
-        done, not_done = wait(futures.keys(), timeout=180, return_when=ALL_COMPLETED)
+        done, not_done = wait(futures.keys(), timeout=WEB_PHASE1_BUDGET_SECONDS, return_when=ALL_COMPLETED)
 
         for future in done:
             source_cfg = futures[future]
@@ -513,9 +516,11 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
             source_cfg = futures[future]
             source_name = source_cfg.get('name', 'unknown')
             future.cancel()
-            reason = '采集任务超时（180s），已保留其他已完成结果'
+            reason = f'采集任务超时（{WEB_PHASE1_BUDGET_SECONDS}s），已保留其他已完成结果'
             stats['failed'].append((source_name, reason))
             logging.warning(f'  ⏱️ {source_name}: {reason}')
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
                 
     logging.info(f'\n[P1 Web Phase 1 完毕] {len(stats["success"])}/{stats["total"]} 源成功 | 发现: {sum(n for _, n in stats["success"])} 篇')
     
@@ -541,10 +546,16 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
             total_items = len(work_items)
             processed = 0
             
-            with ThreadPoolExecutor(max_workers=10) as pool:
+            pool = ThreadPoolExecutor(max_workers=10)
+            try:
                 futures = {pool.submit(_process_one_web_item, item): item for item in work_items}
-                
-                for future in as_completed(futures):
+                done, not_done = wait(
+                    futures.keys(),
+                    timeout=WEB_ENRICH_BUDGET_SECONDS,
+                    return_when=ALL_COMPLETED,
+                )
+
+                for future in done:
                     try:
                         entry_ref, enriched = future.result()
                         content, meta = _normalize_enrich_result(enriched)
@@ -561,7 +572,19 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
                     processed += 1
                     if processed % 10 == 0 or processed == total_items:
                         logging.info(f'  [P1 Web Phase 2] 进度: {processed}/{total_items} | ✅ {enrich_ok} | ❌ {enrich_fail}')
-                        
+
+                for future in not_done:
+                    future.cancel()
+                    enrich_fail += 1
+                if not_done:
+                    logging.warning(
+                        '[P1 Web Phase 2] %s 个正文任务超过 %ss 截止时间，结果已丢弃',
+                        len(not_done),
+                        WEB_ENRICH_BUDGET_SECONDS,
+                    )
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+
             logging.info(f'[P1 Web Phase 2] 正文深挖完毕: ✅ {enrich_ok} / ❌ {enrich_fail}')
             stats['enrich_ok'] = enrich_ok
             stats['enrich_fail'] = enrich_fail

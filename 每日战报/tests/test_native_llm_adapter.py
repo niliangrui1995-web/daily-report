@@ -178,7 +178,8 @@ class TestProviderErrorClassification:
         )
 
         assert adapter._call_gemini("ping") == "OK"
-        assert client_kwargs == {"api_key": "gemini-key"}
+        assert client_kwargs["api_key"] == "gemini-key"
+        assert client_kwargs["http_options"].timeout == 300_000
         assert generate_kwargs["model"] == "gemini-3.5-flash"
 
     def test_openai_compat_preserves_reasoning_content(self, monkeypatch):
@@ -202,11 +203,11 @@ class TestProviderErrorClassification:
         monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
 
         adapter = NativeLLMAdapter(
-            model="gpt-5.5",
+            model="gpt-5.6-sol",
             base_url="http://127.0.0.1:8317/v1",
             api_key="pwd",
             max_retries=1,
-            reasoning_effort="xhigh",
+            reasoning_effort="max",
         )
 
         result = adapter.invoke("只回复OK")
@@ -215,7 +216,7 @@ class TestProviderErrorClassification:
         assert result.thinking_content == "trace"
         assert client_kwargs["max_retries"] == 0
         assert "max_tokens" not in create_kwargs
-        assert create_kwargs["reasoning_effort"] == "xhigh"
+        assert create_kwargs["reasoning_effort"] == "max"
 
     def test_openai_compat_can_use_responses_api(self, monkeypatch):
         import requests
@@ -250,11 +251,11 @@ class TestProviderErrorClassification:
         monkeypatch.setattr(requests, "post", fake_post)
 
         adapter = NativeLLMAdapter(
-            model="gpt-5.5",
+            model="gpt-5.6-sol",
             base_url="http://127.0.0.1:8317/v1",
             api_key="pwd",
             max_retries=1,
-            reasoning_effort="xhigh",
+            reasoning_effort="max",
             reasoning_summary="auto",
             use_responses_api=True,
         )
@@ -264,8 +265,8 @@ class TestProviderErrorClassification:
         assert result.content == "OK"
         assert result.thinking_content == "trace"
         assert calls[0][0][0] == "http://127.0.0.1:8317/v1/responses"
-        assert calls[0][1]["json"]["model"] == "gpt-5.5"
-        assert calls[0][1]["json"]["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+        assert calls[0][1]["json"]["model"] == "gpt-5.6-sol"
+        assert calls[0][1]["json"]["reasoning"] == {"effort": "max", "summary": "auto"}
         assert "max_output_tokens" not in calls[0][1]["json"]
         assert "messages" not in calls[0][1]["json"]
 
@@ -295,11 +296,11 @@ class TestProviderErrorClassification:
         monkeypatch.setattr(requests, "post", lambda *args, **kwargs: FakeResponse())
 
         adapter = NativeLLMAdapter(
-            model="gpt-5.5",
+            model="gpt-5.6-sol",
             base_url="http://127.0.0.1:8317/v1",
             api_key="pwd",
             max_retries=1,
-            reasoning_effort="xhigh",
+            reasoning_effort="max",
             reasoning_summary="auto",
             use_responses_api=True,
         )
@@ -358,11 +359,11 @@ class TestProviderErrorClassification:
         monkeypatch.setattr(requests, "post", fake_post)
 
         adapter = NativeLLMAdapter(
-            model="gpt-5.5",
+            model="gpt-5.6-sol",
             base_url="http://127.0.0.1:8317/v1",
             api_key="pwd",
             max_retries=2,
-            reasoning_effort="xhigh",
+            reasoning_effort="max",
             reasoning_summary="auto",
             use_responses_api=True,
         )

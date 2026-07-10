@@ -14,7 +14,9 @@ import logging
 import random
 import re
 import socket
+import threading
 import time
+from contextlib import contextmanager
 import requests
 from urllib.parse import urljoin, urlparse
 from config import SUMMARY_LEN, SOURCE_CONTENT_SELECTORS, GENERIC_CONTENT_SELECTORS, CONTENT_NOISE_KEYWORDS, FAKE_UA, URL_BLACKLIST
@@ -23,6 +25,11 @@ from http_security import get_tls_policy_for_url, log_tls_policy
 scrapling_available = False
 _Selector = None
 DEFAULT_FETCH_TIMEOUT = 12
+DEFAULT_CONNECT_TIMEOUT = 5
+DEFAULT_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+RESPONSE_CHUNK_BYTES = 64 * 1024
+_SYSTEM_GETADDRINFO = socket.getaddrinfo
+_DNS_PIN_STATE = threading.local()
 
 try:
     from scrapling import Selector as _Selector
@@ -59,8 +66,63 @@ MAX_SAFE_REDIRECTS = 5
 PROXY_FAKE_IP_NETWORKS = (ipaddress.ip_network('198.18.0.0/15'),)
 
 
-def _normalize_hostname(hostname: str) -> str:
-    return hostname.strip().strip('[]').rstrip('.').lower()
+def _normalize_hostname(hostname: str | bytes) -> str:
+    if isinstance(hostname, bytes):
+        hostname = hostname.decode('ascii')
+    normalized = hostname.strip().strip('[]').rstrip('.').lower()
+    try:
+        return normalized.encode('idna').decode('ascii')
+    except UnicodeError:
+        return normalized
+
+
+def _pinned_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    pins = getattr(_DNS_PIN_STATE, 'pins', {})
+    pinned = pins.get(_normalize_hostname(host))
+    if not pinned:
+        return _SYSTEM_GETADDRINFO(host, port, family, type, proto, flags)
+
+    resolved = []
+    for addr_family, sock_type, protocol, canonname, sockaddr in pinned:
+        if family and addr_family != family:
+            continue
+        if type and sock_type and sock_type != type:
+            continue
+        if proto and protocol and protocol != proto:
+            continue
+        target_port = port if port is not None else sockaddr[1]
+        if addr_family == socket.AF_INET6:
+            pinned_sockaddr = (sockaddr[0], target_port, *sockaddr[2:])
+        else:
+            pinned_sockaddr = (sockaddr[0], target_port)
+        resolved.append((addr_family, sock_type or type, protocol or proto, canonname, pinned_sockaddr))
+    if not resolved:
+        raise socket.gaierror(socket.EAI_NONAME, 'No pinned address matches the requested socket family')
+    return resolved
+
+
+# Requests still receives the original URL, so Host, HTTPS SNI and certificate
+# verification retain the hostname while the socket connection uses this thread's
+# pre-validated DNS result.
+socket.getaddrinfo = _pinned_getaddrinfo
+
+
+@contextmanager
+def _pin_validated_dns(hostname: str, addr_infos):
+    previous = getattr(_DNS_PIN_STATE, 'pins', None)
+    pins = dict(previous or {})
+    pins[_normalize_hostname(hostname)] = tuple(addr_infos)
+    _DNS_PIN_STATE.pins = pins
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                del _DNS_PIN_STATE.pins
+            except AttributeError:
+                pass
+        else:
+            _DNS_PIN_STATE.pins = previous
 
 
 def _parse_ip_address(hostname: str):
@@ -94,29 +156,38 @@ def _is_blocked_hostname(hostname: str) -> bool:
     return host in BLOCKED_HOSTNAMES or host.endswith(BLOCKED_HOST_SUFFIXES)
 
 
-def _host_resolves_to_public_addresses(hostname: str) -> bool:
+def _resolver_for_validation():
+    current = socket.getaddrinfo
+    return _SYSTEM_GETADDRINFO if current is _pinned_getaddrinfo else current
+
+
+def _resolve_public_addr_infos(hostname: str, port: int | None):
     try:
-        addr_infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+        addr_infos = _resolver_for_validation()(hostname, port, type=socket.SOCK_STREAM)
     except OSError as exc:
         logging.debug(f'[Scrapling] blocked unresolved fetch host {hostname}: {exc}')
-        return False
+        return ()
 
     if not addr_infos:
-        return False
+        return ()
 
     for addr_info in addr_infos:
         sockaddr = addr_info[4]
         if not sockaddr:
-            return False
+            return ()
         try:
             ip = ipaddress.ip_address(sockaddr[0])
             if _is_proxy_fake_ip_address(ip):
                 continue
             if _is_blocked_ip_address(ip):
-                return False
+                return ()
         except ValueError:
-            return False
-    return True
+            return ()
+    return tuple(addr_infos)
+
+
+def _host_resolves_to_public_addresses(hostname: str) -> bool:
+    return bool(_resolve_public_addr_infos(hostname, None))
 
 
 def _is_safe_external_url(url: str, *, resolve_dns: bool = False) -> bool:
@@ -153,21 +224,101 @@ def _safe_external_url_for_fetch(url: str) -> bool:
     return bool(url) and _is_safe_external_url(url, resolve_dns=True)
 
 
+def _url_is_safe_without_dns(url: str, url_checker) -> bool:
+    if url_checker is _safe_url_for_fetch:
+        return bool(url) and is_article_url(url) and _is_safe_external_url(url)
+    if url_checker is _safe_external_url_for_fetch:
+        return bool(url) and _is_safe_external_url(url)
+    return bool(url_checker(url))
+
+
+def _split_timeout(timeout):
+    if isinstance(timeout, tuple):
+        if len(timeout) != 2:
+            raise ValueError('timeout tuple must contain connect and read values')
+        return timeout
+    read_timeout = float(timeout)
+    return (min(float(DEFAULT_CONNECT_TIMEOUT), read_timeout), read_timeout)
+
+
+def _close_response(response) -> None:
+    close = getattr(response, 'close', None)
+    if callable(close):
+        close()
+
+
+def _read_bounded_response(response, max_response_bytes: int):
+    content_length = response.headers.get('Content-Length') if getattr(response, 'headers', None) else None
+    if content_length:
+        try:
+            if int(content_length) > max_response_bytes:
+                _close_response(response)
+                raise requests.exceptions.RequestException(
+                    f'Response Content-Length exceeds {max_response_bytes} bytes'
+                )
+        except ValueError:
+            pass
+
+    iter_content = getattr(response, 'iter_content', None)
+    if not callable(iter_content):
+        content = getattr(response, 'content', b'') or b''
+        if len(content) > max_response_bytes:
+            _close_response(response)
+            raise requests.exceptions.RequestException(f'Response body exceeds {max_response_bytes} bytes')
+        return response
+
+    chunks = []
+    total_bytes = 0
+    try:
+        for chunk in iter_content(chunk_size=RESPONSE_CHUNK_BYTES, decode_unicode=False):
+            if not chunk:
+                continue
+            total_bytes += len(chunk)
+            if total_bytes > max_response_bytes:
+                raise requests.exceptions.RequestException(f'Response body exceeds {max_response_bytes} bytes')
+            chunks.append(chunk)
+        response._content = b''.join(chunks)
+        response._content_consumed = True
+        return response
+    finally:
+        _close_response(response)
+
+
 def _safe_requests_get_checked(url: str, url_checker, **kwargs) -> requests.Response:
     current_url = url
     timeout = kwargs.pop('timeout', DEFAULT_FETCH_TIMEOUT)
+    max_response_bytes = int(kwargs.pop('max_response_bytes', DEFAULT_MAX_RESPONSE_BYTES))
+    if max_response_bytes <= 0:
+        raise ValueError('max_response_bytes must be positive')
     kwargs.pop('allow_redirects', None)
+    kwargs.pop('stream', None)
+    kwargs.pop('proxies', None)
     for _ in range(MAX_SAFE_REDIRECTS + 1):
-        if not url_checker(current_url):
+        if not _url_is_safe_without_dns(current_url, url_checker):
             raise requests.exceptions.InvalidURL(f'Blocked unsafe fetch URL: {current_url}')
 
-        response = requests.get(current_url, allow_redirects=False, timeout=timeout, **kwargs)
+        parsed = urlparse(current_url)
+        default_port = 443 if parsed.scheme.lower() == 'https' else 80
+        addr_infos = _resolve_public_addr_infos(parsed.hostname or '', parsed.port or default_port)
+        if not addr_infos:
+            raise requests.exceptions.InvalidURL(f'Blocked unsafe fetch URL: {current_url}')
+
+        with _pin_validated_dns(parsed.hostname or '', addr_infos):
+            response = requests.get(
+                current_url,
+                allow_redirects=False,
+                timeout=_split_timeout(timeout),
+                stream=True,
+                proxies={'http': '', 'https': ''},
+                **kwargs,
+            )
         if not getattr(response, 'is_redirect', False) and not getattr(response, 'is_permanent_redirect', False):
-            return response
+            return _read_bounded_response(response, max_response_bytes)
 
         location = response.headers.get('Location')
         if not location:
-            return response
+            return _read_bounded_response(response, max_response_bytes)
+        _close_response(response)
         current_url = urljoin(response.url or current_url, location)
 
     raise requests.exceptions.TooManyRedirects(f'Too many redirects for URL: {url}')

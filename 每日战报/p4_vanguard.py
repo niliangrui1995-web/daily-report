@@ -14,6 +14,7 @@ P4 全球核心标的行情层 — yfinance 产业链核心标的客观行情注
 
 import concurrent.futures
 import logging
+import multiprocessing
 import os
 import time
 import traceback
@@ -23,18 +24,20 @@ from artifact_store import update_run_manifest, write_text_artifact
 from industry_dict import VANGUARD_TICKERS, SUPER_GIANTS, STRATEGIC_GIANTS, classify_vanguard_signal
 from run_config import _get_prev_trading_day
 
-def fetch_vanguard_prices() -> str:
+P4_TOTAL_TIMEOUT_SECONDS = 180
+P4_REQUEST_TIMEOUT_SECONDS = 12
+P4_MAX_RETRIES = 2
+
+
+def _fetch_vanguard_prices_inline() -> str:
     import shutil
     import tempfile
     import certifi
     start_time = time.time()
 
-    temp_cert_dir = os.path.join(tempfile.gettempdir(), 'vcp_certs')
-    os.makedirs(temp_cert_dir, exist_ok=True)
+    temp_cert_dir = tempfile.mkdtemp(prefix='vcp_certs_')
     safe_cert_path = os.path.join(temp_cert_dir, 'cacert.pem')
-
-    if not os.path.exists(safe_cert_path):
-        shutil.copy2(certifi.where(), safe_cert_path)
+    shutil.copy2(certifi.where(), safe_cert_path)
 
     # Why: 只在本函数作用域内设置 CURL_CA_BUNDLE，退出时恢复原值，防止全局副作用
     _original_ca_bundle = os.environ.get('CURL_CA_BUNDLE')
@@ -68,12 +71,16 @@ def fetch_vanguard_prices() -> str:
                 tier = '战略核心'
             else:
                 tier = '中型标的'
-            max_retries = 3
+            max_retries = P4_MAX_RETRIES
 
             for attempt in range(max_retries):
                 try:
                     t = yf.Ticker(ticker)
-                    hist = t.history(period='1mo')
+                    hist = t.history(
+                        period='1mo',
+                        timeout=P4_REQUEST_TIMEOUT_SECONDS,
+                        raise_errors=True,
+                    )
 
                     if len(hist) == 0:
                         return f'- {name}({ticker}) [{tier}]: 暂无最新交易数据'
@@ -115,21 +122,16 @@ def fetch_vanguard_prices() -> str:
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
             futures = {name: pool.submit(_fetch_single, name, ticker) for name, ticker in VANGUARD_TICKERS.items()}
 
-            try:
-                for fut in concurrent.futures.as_completed(futures.values(), timeout=180):
-                    try:
-                        result = fut.result()
-                        if result:
-                            lines.append(result)
-                    except Exception:
-                        for name, f in futures.items():
-                            if f == fut:
-                                lines.append(f'- {name}({VANGUARD_TICKERS[name]}): 获取超时')
-            except (concurrent.futures.TimeoutError, TimeoutError):
-                logging.warning('[yfinance] 部分标的获取超时（180s），使用已获取的数据')
-                for name, fut in futures.items():
-                    if not fut.done():
-                        lines.append(f'- {name}({VANGUARD_TICKERS[name]}): 获取超时')
+            for fut in concurrent.futures.as_completed(futures.values()):
+                try:
+                    result = fut.result()
+                    if result:
+                        lines.append(result)
+                except Exception:
+                    for name, candidate in futures.items():
+                        if candidate == fut:
+                            lines.append(f'- {name}({VANGUARD_TICKERS[name]}): 获取失败')
+                            break
 
         lines.append('================================================================\n')
         report = '\n'.join(lines)
@@ -159,3 +161,62 @@ def fetch_vanguard_prices() -> str:
             os.environ['CURL_CA_BUNDLE'] = _original_ca_bundle
         elif 'CURL_CA_BUNDLE' in os.environ:
             del os.environ['CURL_CA_BUNDLE']
+        shutil.rmtree(temp_cert_dir, ignore_errors=True)
+
+
+def _p4_process_entry(send_conn) -> None:
+    try:
+        send_conn.send({'status': 'success', 'report': _fetch_vanguard_prices_inline()})
+    except BaseException as exc:
+        send_conn.send({'status': 'error', 'error': f'{type(exc).__name__}: {exc}'})
+    finally:
+        send_conn.close()
+
+
+def _stop_process(process) -> None:
+    if not process.is_alive():
+        return
+    process.terminate()
+    process.join(timeout=5)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=5)
+
+
+def fetch_vanguard_prices() -> str:
+    """Run P4 behind a killable wall-clock deadline."""
+    mp_context = multiprocessing.get_context('spawn')
+    recv_conn, send_conn = mp_context.Pipe(duplex=False)
+    process = mp_context.Process(target=_p4_process_entry, args=(send_conn,), name='p4-vanguard-fetch')
+
+    try:
+        process.start()
+        send_conn.close()
+        if not recv_conn.poll(P4_TOTAL_TIMEOUT_SECONDS):
+            logging.error('[yfinance] P4 exceeded hard timeout of %ss', P4_TOTAL_TIMEOUT_SECONDS)
+            _stop_process(process)
+            update_run_manifest(
+                'p4',
+                status='failed_timeout',
+                metrics={'timeout_seconds': P4_TOTAL_TIMEOUT_SECONDS},
+            )
+            return ''
+
+        payload = recv_conn.recv()
+        process.join(timeout=5)
+        _stop_process(process)
+    except Exception as exc:
+        _stop_process(process)
+        logging.error('[yfinance] P4 subprocess failed: %s', exc)
+        update_run_manifest('p4', status='failed_exception', metrics={'error': str(exc)})
+        return ''
+    finally:
+        recv_conn.close()
+        send_conn.close()
+
+    if payload.get('status') != 'success':
+        error = str(payload.get('error') or 'unknown P4 subprocess error')
+        logging.error('[yfinance] P4 subprocess returned error: %s', error)
+        update_run_manifest('p4', status='failed_exception', metrics={'error': error})
+        return ''
+    return str(payload.get('report') or '')

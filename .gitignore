@@ -19,6 +19,7 @@ build/
 
 # 虚拟环境
 .venv/
+.venv-service/
 venv/
 
 # IDE
@@ -34,6 +35,10 @@ Thumbs.db
 # 缓存
 .pytest_cache/
 .ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.audit-requirements.txt
 .agent/
 
 # 归档历史（已从 git 移除跟踪）

@@ -26,6 +26,11 @@ ARTIFACT_CATEGORIES = ("logs", "meta", "agent")
 STAGE_DEGRADED_STATUSES = {
     "completed_structured_degraded",
 }
+DEGRADED_SKIP_STATUSES = {
+    "skipped_missing_dependency",
+    "skipped_no_key",
+    "skipped_no_vipdoc",
+}
 DEGRADED_STATUSES = STAGE_DEGRADED_STATUSES | {
     "completed_with_stage_degradation",
 }
@@ -203,6 +208,29 @@ def _json_ready(value: Any) -> Any:
     return value
 
 
+def classify_stage_status(status: str, metrics: dict[str, Any] | None = None) -> str:
+    """Classify stage outcomes without hiding fallback failures as clean success."""
+    normalized = str(status or "").strip().lower()
+    stage_metrics = metrics if isinstance(metrics, dict) else {}
+
+    if (
+        normalized in STAGE_DEGRADED_STATUSES
+        or normalized in DEGRADED_SKIP_STATUSES
+        or bool(stage_metrics.get("structured_degraded"))
+        or "fallback" in normalized
+    ):
+        return "degraded"
+    if normalized.startswith("skipped") or normalized == "skipped":
+        return "skipped"
+    if normalized in SUCCESS_STATUSES or normalized.startswith("completed"):
+        return "success"
+    if normalized.startswith("failed") or normalized in {"error", "timeout"}:
+        return "failed"
+    if normalized in {"running", "started", "retrying", "pending"}:
+        return "active"
+    return "unknown"
+
+
 def summarize_stage_degradations(manifest: dict[str, Any]) -> list[dict[str, str]]:
     stages = manifest.get("stages", {})
     if not isinstance(stages, dict):
@@ -216,12 +244,14 @@ def summarize_stage_degradations(manifest: dict[str, Any]) -> list[dict[str, str
         metrics = payload.get("metrics", {})
         if not isinstance(metrics, dict):
             metrics = {}
-        if status not in STAGE_DEGRADED_STATUSES and not metrics.get("structured_degraded"):
+        if classify_stage_status(status, metrics) not in {"degraded", "failed"}:
             continue
         reason = str(
             metrics.get("degrade_reason")
             or metrics.get("parse_error")
             or metrics.get("fallback_reason")
+            or metrics.get("error")
+            or payload.get("error")
             or ""
         ).strip()
         degraded.append({"stage": str(stage_name), "status": status or "unknown", "reason": reason})
@@ -369,7 +399,7 @@ def update_run_manifest(
     with _MANIFEST_LOCK:
         with _manifest_file_lock():
             manifest = _load_manifest_for_write(initial_run_ts)
-            run_ts = timestamp or env_run_ts or manifest.get("run_timestamp") or initial_run_ts
+            run_ts = timestamp or manifest.get("run_timestamp") or env_run_ts or initial_run_ts
             manifest["run_timestamp"] = run_ts
             manifest["updated_at"] = datetime.now().isoformat()
             manifest["manifest_version"] = 3
@@ -432,12 +462,14 @@ def update_manifest_context(
     preflight: dict[str, Any] | None = None,
     timestamp: str | None = None,
 ) -> str:
-    run_ts = timestamp or get_run_timestamp()
     manifest_path = get_manifest_path()
+    env_run_ts = os.environ.get(RUN_TIMESTAMP_ENV, "").strip()
+    initial_run_ts = timestamp or env_run_ts or datetime.now().strftime("%Y%m%d%H%M%S")
 
     with _MANIFEST_LOCK:
         with _manifest_file_lock():
-            manifest = _load_manifest_for_write(run_ts)
+            manifest = _load_manifest_for_write(initial_run_ts)
+            run_ts = timestamp or manifest.get("run_timestamp") or env_run_ts or initial_run_ts
             manifest["run_timestamp"] = run_ts
             manifest["updated_at"] = datetime.now().isoformat()
             manifest["manifest_version"] = 3

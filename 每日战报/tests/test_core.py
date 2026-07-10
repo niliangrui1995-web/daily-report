@@ -211,7 +211,7 @@ class TestIndustryDict:
         assert not any(ticker.endswith((".SZ", ".SS")) for ticker in VANGUARD_TICKERS.values())
 
     def test_public_listed_oligarchs_have_p4_tickers(self):
-        """已上市寡头必须进入 P4 核心行情池，供 GPT-5.5 XHigh 推理使用"""
+        """已上市寡头必须进入 P4 核心行情池，供 GPT-5.6 Sol Max 推理使用"""
         from industry_dict import VANGUARD_TICKERS
 
         expected = {
@@ -587,8 +587,8 @@ class TestP1WebTimeWindow:
         )
 
         assert calls == [
-            ("https://slow.example/primary", 8),
-            ("https://fast.example/fallback", 8),
+            ("https://slow.example/primary", (5.0, 8.0)),
+            ("https://fast.example/fallback", (5.0, 8.0)),
         ]
         assert len(entries) == 1
         assert entries[0]["url"] == "https://fast.example/news/a"
@@ -919,20 +919,20 @@ class TestCircuitBreaker:
 # =====================================================================
 
 class TestSettings:
-    """测试配置加载（依赖 .env）"""
+    """测试配置加载（不依赖真实密钥）。"""
 
-    def test_env_loaded(self):
-        """关键配置应从 .env 加载"""
+    def test_env_config_shape(self):
+        """缺少本地 .env 时配置模块仍应保持可导入和类型稳定。"""
         from settings import SEARCH_API_KEY_POOL, ANTIGRAVITY_BASE_URL
-        assert len(SEARCH_API_KEY_POOL) > 0, "SEARCH_API_KEY_POOL should not be empty"
+        assert isinstance(SEARCH_API_KEY_POOL, list)
         assert ANTIGRAVITY_BASE_URL.startswith("http")
 
     def test_adapters_initialized(self):
         """LLM 适配器应正确初始化"""
         from settings import pro_adapter, opus_adapter
         assert pro_adapter.model == "claude-sonnet-4-6"
-        assert opus_adapter.model == "gpt-5.5"
-        assert opus_adapter.extra_kwargs["reasoning_effort"] == "xhigh"
+        assert opus_adapter.model == "gpt-5.6-sol"
+        assert opus_adapter.extra_kwargs["reasoning_effort"] == "max"
         assert opus_adapter.extra_kwargs["reasoning_summary"] == "auto"
         assert opus_adapter.extra_kwargs["use_responses_api"] is True
 
@@ -1174,14 +1174,14 @@ class TestCheckpoint:
         ckpt = detect_checkpoint()
         assert ckpt['stage'] == 'p1'
 
-    def test_war_report_done(self, tmp_path, monkeypatch):
-        """有战报文件应返回 stage='p9_done'"""
+    def test_war_report_without_terminal_manifest_is_not_done(self, tmp_path, monkeypatch):
+        """仅有战报文件不能证明投递和 ROI 已完成。"""
         monkeypatch.setattr('checkpoint.get_today_output_dir', lambda: str(tmp_path))
         monkeypatch.setattr('artifact_store.get_today_output_dir', lambda: str(tmp_path))
         (tmp_path / '战报_202604091200.md').write_text('done', encoding='utf-8')
         from checkpoint import detect_checkpoint
         ckpt = detect_checkpoint()
-        assert ckpt['stage'] == 'p9_done'
+        assert ckpt['stage'] == 'none'
 
     def test_stale_war_report_resumes_downstream(self, tmp_path, monkeypatch):
         """战报旧于上游 P8 时应恢复生成 P9，而不是直接跳过。"""

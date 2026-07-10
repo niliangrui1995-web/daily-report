@@ -109,7 +109,7 @@ def build_report_email_message(content: str, *, sender_email: str, receiver_emai
         <div class="wrap">
         <div class="hdr"><h1>🎯 VCP Hunter AI 产业链战报</h1><p>{today_fmt} · 北美产业链情报 · 自动生成</p></div>
         {html}
-        <div class="ftr">VCP Hunter v4.1 · 数据来源: Grok / RSS / Gemini / GPT-5.5 XHigh / 通达信 · 仅供研究参考，不构成投资建议</div>
+        <div class="ftr">VCP Hunter v4.1 · 数据来源: Grok / RSS / Gemini / GPT-5.6 Sol Max / 通达信 · 仅供研究参考，不构成投资建议</div>
         </div>
         </body></html>'''
         msg = MIMEText(html_full, 'html', 'utf-8')

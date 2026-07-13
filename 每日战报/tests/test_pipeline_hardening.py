@@ -529,11 +529,11 @@ class TestManifestContext:
         monkeypatch.delenv(artifact_store.RUN_TIMESTAMP_ENV, raising=False)
 
         artifact_store.update_run_manifest("p9", status="completed_email_sent", timestamp="20260413010101")
-        artifact_store.update_run_manifest("agent_preflight", status="skipped", metrics={"ok": False})
+        artifact_store.update_run_manifest("postcheck", status="skipped", metrics={"ok": False})
 
         manifest = artifact_store.load_run_manifest()
         assert manifest["run_timestamp"] == "20260413010101"
-        assert manifest["stages"]["agent_preflight"]["run_timestamp"] == "20260413010101"
+        assert manifest["stages"]["postcheck"]["run_timestamp"] == "20260413010101"
 
 
 class TestReportStage:
@@ -734,8 +734,6 @@ class TestReportStage:
 
         monkeypatch.setattr(orchestrator, "p9_risk_analysis", lambda **kwargs: ("", ""))
         monkeypatch.setattr(orchestrator, "send_report_email", lambda content, now_str="": {"ok": True, "status": "completed_no_email"})
-        monkeypatch.setattr(orchestrator, "_run_agent_report_review", lambda context: None)
-
         with pytest.raises(RuntimeError, match="empty report"):
             orchestrator._stage_report({})
 
@@ -748,8 +746,6 @@ class TestReportStage:
             "send_report_email",
             lambda content, now_str="": {"ok": False, "status": "completed_email_failed"},
         )
-        monkeypatch.setattr(orchestrator, "_run_agent_report_review", lambda context: None)
-
         with pytest.raises(RuntimeError, match="completed_email_failed"):
             orchestrator._stage_report({})
 
@@ -816,7 +812,6 @@ class TestPreflightChecks:
         monkeypatch.setattr(pipeline_cli, "_collect_preflight", lambda strict: failing_result)
         monkeypatch.setattr(pipeline_cli, "_print_preflight", lambda result: result["summary"]["exit_code"])
         monkeypatch.setattr(pipeline_cli, "set_preflight_summary", lambda summary: calls.append(("summary", summary)))
-        monkeypatch.setattr(pipeline_cli, "explain_preflight_and_record", lambda result: calls.append("agent"))
         monkeypatch.setattr(pipeline_cli, "update_manifest_context", lambda **kwargs: calls.append(("context", kwargs)))
         monkeypatch.setattr(pipeline_cli, "record_run_state", lambda **kwargs: calls.append(("run_state", kwargs)))
         monkeypatch.setattr(pipeline_cli, "configure_run_logging", lambda: calls.append("logging"))
@@ -834,7 +829,6 @@ class TestPreflightChecks:
         assert not any(call[0] == "orchestrator" for call in calls if isinstance(call, tuple))
         assert not any(call[0] == "run_state" for call in calls if isinstance(call, tuple))
         assert not any(call[0] == "context" for call in calls if isinstance(call, tuple))
-        assert "agent" not in calls
 
     def test_run_command_invokes_orchestrator_after_successful_preflight(self, monkeypatch):
         import pipeline_cli
@@ -861,11 +855,6 @@ class TestPreflightChecks:
             lambda strict: calls.append(("preflight", strict)) or successful_result,
         )
         monkeypatch.setattr(pipeline_cli, "set_preflight_summary", lambda summary: calls.append(("summary", summary)))
-        monkeypatch.setattr(
-            pipeline_cli,
-            "explain_preflight_and_record",
-            lambda result: calls.append(("agent", result["summary"]["exit_code"])),
-        )
         monkeypatch.setattr(pipeline_cli, "update_manifest_context", lambda **kwargs: calls.append(("context", kwargs)))
         monkeypatch.setattr(pipeline_cli, "configure_run_logging", lambda: calls.append(("logging",)))
         monkeypatch.setattr(pipeline_cli, "acquire_run_lock", fake_lock)
@@ -882,7 +871,6 @@ class TestPreflightChecks:
         assert ("preflight", True) in calls
         assert calls[call_names.index("lock")][1]["command"] == "run"
         assert call_names.index("lock") < call_names.index("context")
-        assert call_names.index("lock") < call_names.index("agent")
         assert call_names.index("lock") < call_names.index("orchestrator")
         assert ("orchestrator", []) in calls
 

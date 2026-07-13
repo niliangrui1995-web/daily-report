@@ -18,8 +18,8 @@ from artifact_store import (
     build_runtime_context,
     configure_utf8_environment,
     get_error_log_path,
-    get_preflight_summary,
     get_pipeline_log_path,
+    get_preflight_summary,
     load_run_manifest,
     record_run_state,
     set_run_timestamp,
@@ -51,7 +51,6 @@ from p8_technical import (
 from p9_reporter import p9_risk_analysis, send_report_email
 from search_engine import gemini_search
 from tdx_stock_universe import IDENTITY_VALIDATION_VERSION, normalize_rejected_stock_names
-from agent_assistant import diagnose_failure, review_final_report
 
 CONTROL_STAGE_START = {
     "none": "collect_intel",
@@ -854,121 +853,6 @@ def _stage_technical(context: dict[str, Any]) -> None:
         )
 
 
-def _read_log_excerpt(limit_chars: int = 4000) -> str:
-    try:
-        with open(get_pipeline_log_path(), "r", encoding=UTF8_FILE_ENCODING) as f:
-            return f.read()[-limit_chars:]
-    except Exception:
-        return ""
-
-
-def diagnose_failure_and_record(stage_name: str, error_text: str, manifest: dict[str, Any], log_excerpt: str = "") -> dict:
-    result = diagnose_failure(stage_name, error_text, manifest, log_excerpt)
-    update_run_manifest(
-        "agent_diagnose",
-        status="completed" if result.get("ok") else "skipped",
-        files={
-            key: value
-            for key, value in {
-                "json": result.get("json_path", ""),
-                "md": result.get("md_path", ""),
-            }.items()
-            if value
-        } or None,
-        metrics={
-            "ok": bool(result.get("ok")),
-            "reason": result.get("reason", ""),
-            "stage": stage_name,
-        },
-    )
-    return result
-
-
-def _run_agent_failure_diagnosis(stage_name: str, exc: Exception) -> None:
-    manifest = load_run_manifest()
-    log_excerpt = _read_log_excerpt()
-    result = diagnose_failure_and_record(stage_name, str(exc), manifest, log_excerpt=log_excerpt)
-    update_run_manifest(
-        "agent_diagnose",
-        status="completed" if result.get("ok") else "skipped",
-        files={
-            key: value
-            for key, value in {
-                "json": result.get("json_path", ""),
-                "md": result.get("md_path", ""),
-            }.items()
-            if value
-        } or None,
-        metrics={
-            "ok": bool(result.get("ok")),
-            "reason": result.get("reason", ""),
-            "stage": stage_name,
-        },
-    )
-    if result.get("json_path"):
-        logging.info("agent diagnosis artifact saved: %s", result["json_path"])
-
-
-def review_final_report_and_record(report_md: str, context: dict[str, Any]) -> dict:
-    review_context = {
-        "p5_evidence": context.get("p5_evidence", "")[:4000],
-        "p6_mapping": context.get("p6_mapping", "")[:4000],
-        "p7a_audited": context.get("p7a_audited", "")[:4000],
-        "p75_supplement": context.get("p75_supplement", "")[:4000],
-        "price_data": context.get("price_data", "")[:4000],
-    }
-    result = review_final_report(report_md, review_context)
-    update_run_manifest(
-        "agent_review",
-        status="completed" if result.get("ok") else "skipped",
-        files={
-            key: value
-            for key, value in {
-                "json": result.get("json_path", ""),
-                "md": result.get("md_path", ""),
-            }.items()
-            if value
-        } or None,
-        metrics={
-            "ok": bool(result.get("ok")),
-            "reason": result.get("reason", ""),
-            "report_chars": len(report_md or ""),
-        },
-    )
-    return result
-
-
-def _run_agent_report_review(context: dict[str, Any]) -> None:
-    report_md = context.get("final_report", "")
-    if not report_md or not report_md.strip():
-        update_run_manifest(
-            "agent_review",
-            status="skipped",
-            metrics={"ok": False, "reason": "empty_report"},
-        )
-        return
-    result = review_final_report_and_record(report_md, context)
-    update_run_manifest(
-        "agent_review",
-        status="completed" if result.get("ok") else "skipped",
-        files={
-            key: value
-            for key, value in {
-                "json": result.get("json_path", ""),
-                "md": result.get("md_path", ""),
-            }.items()
-            if value
-        } or None,
-        metrics={
-            "ok": bool(result.get("ok")),
-            "reason": result.get("reason", ""),
-            "report_chars": len(report_md),
-        },
-    )
-    if result.get("json_path"):
-        logging.info("agent review artifact saved: %s", result["json_path"])
-
-
 def _stage_report(context: dict[str, Any]) -> None:
     with log_heartbeat("P9 report"):
         try:
@@ -996,9 +880,6 @@ def _stage_report(context: dict[str, Any]) -> None:
     delivery = send_report_email(final_report, report_ts)
     if not delivery.get("ok"):
         raise RuntimeError(f"report delivery failed: {delivery.get('status', 'unknown')}")
-
-    _run_agent_report_review(context)
-
 
 def _stage_delivery_resume(context: dict[str, Any]) -> None:
     if context.get("resume_from") != "delivery_resume":
@@ -1306,11 +1187,6 @@ def orchestrator_main(argv: list[str] | None = None):
             runtime_context=resume_runtime_context,
             timestamp=run_ts,
         )
-        try:
-            stage_name = exc.stage_name if isinstance(exc, StageTimeoutError) else context.get("current_stage", start_at or "orchestrator")
-            _run_agent_failure_diagnosis(stage_name, exc)
-        except Exception as diagnose_exc:
-            logging.warning("agent failure diagnosis skipped: %s", diagnose_exc)
         raise
 
     total_elapsed = time.time() - total_start

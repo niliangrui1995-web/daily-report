@@ -19,7 +19,7 @@ import time
 from datetime import datetime
 
 from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
-from settings import pro_adapter, require_prompt
+from settings import get_audit_fallback_adapter, pro_adapter, require_prompt
 from industry_dict import ALL_OLIGARCHS_FLAT
 from tdx_stock_universe import (
     build_rejected_stock_guardrail,
@@ -38,6 +38,52 @@ STRICT OUTPUT LIMITS FOR MACHINE PARSING:
 - Keep deleted to at most 30 representative items; summary.deleted may still count all removed items.
 - If content is too long, prefer fewer items over invalid or truncated JSON.
 """
+
+
+def _adapter_error(adapter) -> str:
+    category = str(getattr(adapter, 'last_error_category', '') or '').strip()
+    message = str(getattr(adapter, 'last_error_message', '') or '').strip()
+    if category and message:
+        return f'{category}: {message}'
+    return message or category
+
+
+def _invoke_audit_with_fallback(prompt: str, layer_name: str, *, min_content_chars: int = 1):
+    primary_response = None
+    primary_error = ''
+    try:
+        primary_response = pro_adapter.invoke(prompt)
+    except Exception as exc:
+        primary_error = str(exc)
+
+    primary_content = str(getattr(primary_response, 'content', '') or '')
+    if len(primary_content.strip()) >= min_content_chars:
+        return primary_response, pro_adapter, {
+            'audit_fallback_used': False,
+            'audit_primary_error': '',
+        }
+
+    primary_error = primary_error or _adapter_error(pro_adapter) or 'empty_or_short_response'
+    fallback_adapter = get_audit_fallback_adapter()
+    if fallback_adapter is None:
+        if primary_response is not None:
+            return primary_response, pro_adapter, {
+                'audit_fallback_used': False,
+                'audit_primary_error': primary_error[:500],
+            }
+        raise RuntimeError(primary_error)
+
+    logging.warning(
+        '[%s 审计] 主模型接口失败，切换备用接口（model=%s, reason=%s）',
+        layer_name,
+        getattr(fallback_adapter, 'model', ''),
+        primary_error[:300],
+    )
+    fallback_response = fallback_adapter.invoke(prompt)
+    return fallback_response, fallback_adapter, {
+        'audit_fallback_used': True,
+        'audit_primary_error': primary_error[:500],
+    }
 
 def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24h', _retry_count: int = 0) -> str:
     layer_name = 'P5' if audit_type == 'p5' else 'P7.5'
@@ -106,7 +152,7 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
     try:
         # NativeLLMAdapter enforces the provider transport timeout. The enclosing
         # pipeline stage runs in a subprocess and supplies the hard wall-clock deadline.
-        resp = pro_adapter.invoke(prompt)
+        resp, active_adapter, fallback_metrics = _invoke_audit_with_fallback(prompt, layer_name)
     except Exception as e:
         logging.error(f'🚨 [{layer_name} 审计] 调用异常: {e}')
         update_run_manifest(
@@ -124,9 +170,10 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
         failure_metrics = {
             'input_chars': len(raw_data),
             'elapsed_seconds': round(elapsed, 1),
+            **fallback_metrics,
         }
-        last_error_category = getattr(pro_adapter, 'last_error_category', '')
-        last_error_message = getattr(pro_adapter, 'last_error_message', '')
+        last_error_category = getattr(active_adapter, 'last_error_category', '')
+        last_error_message = getattr(active_adapter, 'last_error_message', '')
         if last_error_category:
             failure_metrics['failure_category'] = last_error_category
         if last_error_message:
@@ -194,6 +241,7 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
                 'raw_output_chars': len(raw_content),
                 'elapsed_seconds': round(elapsed, 1),
                 'retry_count': _retry_count,
+                **fallback_metrics,
             },
         )
 
@@ -221,6 +269,7 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
                 'elapsed_seconds': round(elapsed, 1),
                 'retry_count': _retry_count,
                 'error': str(e),
+                **fallback_metrics,
             },
         )
         return raw_content
@@ -292,7 +341,11 @@ def p7a_deep_research_audit(
     try:
         # Transport timeout is enforced by the adapter; the research stage process
         # remains the killable hard deadline for a provider that ignores cancellation.
-        resp = pro_adapter.invoke(prompt)
+        resp, active_adapter, fallback_metrics = _invoke_audit_with_fallback(
+            prompt,
+            'P7a',
+            min_content_chars=100,
+        )
     except Exception as e:
         logging.error(f'🚨 [P7a 审计] 调用异常: {e}，降级透传原始数据')
         update_run_manifest(
@@ -311,9 +364,10 @@ def p7a_deep_research_audit(
             'input_chars': len(raw_deep_research),
             'elapsed_seconds': round(elapsed, 1),
             **input_identity_metrics,
+            **fallback_metrics,
         }
-        last_error_category = getattr(pro_adapter, 'last_error_category', '')
-        last_error_message = getattr(pro_adapter, 'last_error_message', '')
+        last_error_category = getattr(active_adapter, 'last_error_category', '')
+        last_error_message = getattr(active_adapter, 'last_error_message', '')
         if last_error_category:
             failure_metrics['failure_category'] = last_error_category
         if last_error_message:
@@ -425,6 +479,7 @@ def p7a_deep_research_audit(
         'topics_count': len(json_data.get('topics', [])) if isinstance(json_data, dict) else 0,
         'rejected_target_names': rejected_names,
         'rejected_identity_items_removed': rejected_identity_items_removed,
+        **fallback_metrics,
     }
     if structured_degraded:
         manifest_metrics['structured_degraded'] = True

@@ -9,6 +9,83 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+class _StubAdapter:
+    def __init__(self, response=None, error: Exception | None = None):
+        self.model = "claude-sonnet-4-6"
+        self.response = response
+        self.error = error
+        self.calls = []
+        self.last_error_category = ""
+        self.last_error_message = ""
+
+    def invoke(self, prompt):
+        self.calls.append(prompt)
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def test_audit_primary_success_does_not_use_fallback(monkeypatch):
+    import audit_engine
+
+    primary = _StubAdapter(SimpleNamespace(content="primary result", thinking_content=""))
+    monkeypatch.setattr(audit_engine, "pro_adapter", primary)
+    monkeypatch.setattr(
+        audit_engine,
+        "get_audit_fallback_adapter",
+        lambda: (_ for _ in ()).throw(AssertionError("主接口成功时不应创建备用适配器")),
+    )
+
+    response, active_adapter, metrics = audit_engine._invoke_audit_with_fallback("prompt", "P5")
+
+    assert response.content == "primary result"
+    assert active_adapter is primary
+    assert metrics["audit_fallback_used"] is False
+
+
+def test_p5_and_p75_use_fallback_when_primary_raises(monkeypatch):
+    import audit_engine
+
+    primary = _StubAdapter(error=RuntimeError("429 rate limited"))
+    fallback = _StubAdapter(SimpleNamespace(content="fallback result", thinking_content=""))
+    monkeypatch.setattr(audit_engine, "pro_adapter", primary)
+    monkeypatch.setattr(audit_engine, "get_audit_fallback_adapter", lambda: fallback)
+
+    for layer_name in ("P5", "P7.5"):
+        response, active_adapter, metrics = audit_engine._invoke_audit_with_fallback("prompt", layer_name)
+        assert response.content == "fallback result"
+        assert active_adapter is fallback
+        assert metrics["audit_fallback_used"] is True
+        assert "429 rate limited" in metrics["audit_primary_error"]
+
+
+def test_p7a_uses_fallback_when_primary_response_is_too_short(monkeypatch):
+    import audit_engine
+
+    primary = _StubAdapter(SimpleNamespace(content="too short", thinking_content=""))
+    fallback = _StubAdapter(SimpleNamespace(content="x" * 100, thinking_content=""))
+    monkeypatch.setattr(audit_engine, "pro_adapter", primary)
+    monkeypatch.setattr(audit_engine, "get_audit_fallback_adapter", lambda: fallback)
+
+    response, active_adapter, metrics = audit_engine._invoke_audit_with_fallback(
+        "prompt",
+        "P7a",
+        min_content_chars=100,
+    )
+
+    assert len(response.content) == 100
+    assert active_adapter is fallback
+    assert metrics["audit_fallback_used"] is True
+    assert metrics["audit_primary_error"] == "empty_or_short_response"
+
+
+def test_anthropic_messages_url_is_normalized_to_sdk_base_url():
+    import settings
+
+    assert settings._normalize_anthropic_base_url("https://cldapi.com/v1/messages") == "https://cldapi.com"
+    assert settings._normalize_anthropic_base_url("https://cldapi.com/v1") == "https://cldapi.com"
+
+
 def test_p5_audit_saves_invalid_raw_and_retries(monkeypatch):
     import audit_engine
 

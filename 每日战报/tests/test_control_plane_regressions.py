@@ -46,7 +46,7 @@ def _successful_preflight(pipeline_cli, monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(pipeline_cli, "is_trading_day", lambda _day: True)
 
 
-def test_standalone_preflight_preserves_run_timestamp_and_records_agent_once(monkeypatch, tmp_path):
+def test_standalone_preflight_preserves_run_timestamp(monkeypatch, tmp_path):
     import artifact_store
     import pipeline_cli
 
@@ -62,42 +62,9 @@ def test_standalone_preflight_preserves_run_timestamp_and_records_agent_once(mon
     }
     monkeypatch.setattr(pipeline_cli, "_collect_preflight", lambda strict: result)
     monkeypatch.setattr(pipeline_cli, "_print_preflight", lambda _result: 0)
-    monkeypatch.setattr(
-        pipeline_cli,
-        "explain_preflight",
-        lambda _result: {"ok": True, "json_path": "agent.json", "md_path": "agent.md"},
-    )
-
-    original_update = pipeline_cli.update_run_manifest
-    agent_updates: list[str] = []
-
-    def tracking_update(stage: str, **kwargs):
-        if stage == "agent_preflight":
-            agent_updates.append(kwargs["status"])
-        return original_update(stage, **kwargs)
-
-    monkeypatch.setattr(pipeline_cli, "update_run_manifest", tracking_update)
-
-    assert pipeline_cli._run_preflight_with_agent(strict=True) == 0
+    assert pipeline_cli._run_preflight(strict=True) == 0
     manifest = artifact_store.load_run_manifest()
     assert manifest["run_timestamp"] == "20260709083000"
-    assert agent_updates == ["completed"]
-
-
-def test_disabled_agent_does_not_write_artifacts(monkeypatch):
-    import agent_assistant
-
-    monkeypatch.setattr(agent_assistant, "AGENT_ASSIST_ENABLED", False)
-    monkeypatch.setattr(agent_assistant, "get_agent_adapter", lambda: None)
-    monkeypatch.setattr(
-        agent_assistant,
-        "safe_write_agent_artifact",
-        lambda *_args, **_kwargs: pytest.fail("disabled agent must not write artifacts"),
-    )
-
-    result = agent_assistant.explain_preflight({"summary": {"exit_code": 0}})
-
-    assert result == {"kind": "preflight", "ok": False, "reason": "disabled"}
 
 
 def test_preflight_only_manifest_has_explicit_status():
@@ -144,11 +111,6 @@ def test_run_lock_race_does_not_mutate_active_run_manifest(monkeypatch):
         pipeline_cli,
         "record_run_state",
         lambda **_kwargs: pytest.fail("lock loser must not overwrite active run state"),
-    )
-    monkeypatch.setattr(
-        pipeline_cli,
-        "explain_preflight_and_record",
-        lambda _result: pytest.fail("lock loser must not invoke agent"),
     )
     monkeypatch.setattr(
         pipeline_cli,

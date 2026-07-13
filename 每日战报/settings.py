@@ -89,6 +89,8 @@ if not ANTIGRAVITY_API_KEY:
     logging.warning('⚠️ ANTIGRAVITY_API_KEY 未配置！请检查 .env 文件。Pro/GPT-5.6 Sol 模型调用将鉴权失败。')
 PRO_OPUS_BASE_URL = os.environ.get('PRO_OPUS_BASE_URL', ANTIGRAVITY_BASE_URL)
 PRO_OPUS_API_KEY = os.environ.get('PRO_OPUS_API_KEY', ANTIGRAVITY_API_KEY)
+AUDIT_FALLBACK_BASE_URL = os.environ.get('AUDIT_FALLBACK_BASE_URL', '').strip()
+AUDIT_FALLBACK_API_KEY = os.environ.get('AUDIT_FALLBACK_API_KEY', '').strip()
 
 GEMINI_SEARCH_DIRECT_URL = 'https://generativelanguage.googleapis.com'
 GEMINI_PRO_API_KEY = os.environ.get('GEMINI_PRO_API_KEY', '').strip()
@@ -111,10 +113,6 @@ OPUS_MODEL = 'gpt-5.6-sol'
 OPUS_REASONING_EFFORT = 'max'
 OPUS_REASONING_SUMMARY = 'auto'
 OPUS_USE_RESPONSES_API = True
-AGENT_ASSIST_ENABLED = os.environ.get('AGENT_ASSIST_ENABLED', '').strip().lower() in {'1', 'true', 'yes', 'on'}
-AGENT_ASSIST_MODEL = os.environ.get('AGENT_ASSIST_MODEL', '').strip()
-AGENT_ASSIST_BASE_URL = os.environ.get('AGENT_ASSIST_BASE_URL', '').strip()
-AGENT_ASSIST_API_KEY = os.environ.get('AGENT_ASSIST_API_KEY', '').strip()
 
 TAVILY_API_KEY = os.environ.get('TAVILY_API_KEY', '')
 GROK_API_KEY = os.environ.get('GROK_API_KEY', '')
@@ -155,8 +153,8 @@ def require_prompt(name: str) -> str:
     return load_prompt(name, required=True)
 
 _pro_adapter = None
+_audit_fallback_adapter = None
 _opus_adapter = None
-_agent_adapter = None
 
 def _get_pro_adapter():
     global _pro_adapter
@@ -173,6 +171,32 @@ def _get_pro_adapter():
         _pro_adapter = NativeLLMAdapter(model=AUDIT_MODEL, base_url=PRO_OPUS_BASE_URL, api_key=pro_api_key, max_retries=3)
     return _pro_adapter
 
+
+def _normalize_anthropic_base_url(base_url: str) -> str:
+    normalized = (base_url or '').strip().rstrip('/')
+    for suffix in ('/v1/messages', '/v1'):
+        if normalized.lower().endswith(suffix):
+            normalized = normalized[:-len(suffix)].rstrip('/')
+            break
+    return normalized
+
+
+def get_audit_fallback_adapter():
+    global _audit_fallback_adapter
+    if not AUDIT_FALLBACK_BASE_URL or not AUDIT_FALLBACK_API_KEY:
+        return None
+    if _audit_fallback_adapter is None:
+        from native_llm_adapter import NativeLLMAdapter
+        _audit_fallback_adapter = NativeLLMAdapter(
+            model=AUDIT_MODEL,
+            base_url=_normalize_anthropic_base_url(AUDIT_FALLBACK_BASE_URL),
+            api_key=AUDIT_FALLBACK_API_KEY,
+            timeout=300.0,
+            max_retries=2,
+        )
+    return _audit_fallback_adapter
+
+
 def _get_opus_adapter():
     global _opus_adapter
     if _opus_adapter is None:
@@ -188,25 +212,6 @@ def _get_opus_adapter():
             use_responses_api=OPUS_USE_RESPONSES_API,
         )
     return _opus_adapter
-
-
-def get_agent_adapter():
-    global _agent_adapter
-    if not AGENT_ASSIST_ENABLED:
-        return None
-    if not AGENT_ASSIST_MODEL:
-        logging.warning('⚠️ AGENT_ASSIST_ENABLED 已开启，但 AGENT_ASSIST_MODEL 未配置；跳过 Agent 助手。')
-        return None
-    if _agent_adapter is None:
-        from native_llm_adapter import NativeLLMAdapter
-        _agent_adapter = NativeLLMAdapter(
-            model=AGENT_ASSIST_MODEL,
-            base_url=AGENT_ASSIST_BASE_URL or ANTIGRAVITY_BASE_URL,
-            api_key=AGENT_ASSIST_API_KEY or ANTIGRAVITY_API_KEY,
-            timeout=180.0,
-            max_retries=2,
-        )
-    return _agent_adapter
 
 class _LazyAdapter:
     '''属性代理，兼容 `from settings import pro_adapter` 的直接使用方式。

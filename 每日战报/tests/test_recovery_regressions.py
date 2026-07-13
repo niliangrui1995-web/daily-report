@@ -524,8 +524,6 @@ def test_research_and_report_drop_known_canonical_alias_from_rejected_names(monk
         "send_report_email",
         lambda *args, **kwargs: {"ok": True, "status": "completed_email_sent"},
     )
-    monkeypatch.setattr(orchestrator, "_run_agent_report_review", lambda _context: None)
-
     orchestrator._stage_report(context)
 
     assert captured["research_names"] == []

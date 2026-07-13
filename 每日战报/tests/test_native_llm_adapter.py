@@ -648,6 +648,7 @@ class TestAuditFailureTelemetry:
 
         monkeypatch.setattr(audit_engine, "require_prompt", lambda _: "{layer_name}\n{raw_data}")
         monkeypatch.setattr(audit_engine, "pro_adapter", DummyAdapter())
+        monkeypatch.setattr(audit_engine, "get_audit_fallback_adapter", lambda: None)
         monkeypatch.setattr(
             audit_engine,
             "update_run_manifest",

@@ -12,7 +12,7 @@ from dotenv import dotenv_values
 
 
 _SECRET_NAMES = (
-    "AGENT_ASSIST_API_KEY",
+    "AUDIT_FALLBACK_API_KEY",
     "ANTIGRAVITY_API_KEY",
     "EMAIL_PASSWORD",
     "GEMINI_PRO_API_KEY",

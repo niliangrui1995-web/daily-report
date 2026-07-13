@@ -28,7 +28,6 @@ from artifact_store import (
     update_manifest_context,
     update_run_manifest,
 )
-from agent_assistant import explain_preflight
 from pipeline_lock import (
     DEFAULT_STALE_AFTER_SECONDS,
     PipelineLockError,
@@ -172,12 +171,6 @@ def _run_orchestrator(flags: list[str], *, command_name: str) -> int:
                 runtime_context={"preflight_exit_code": preflight_exit_code},
                 preflight=preflight_summary,
             )
-            try:
-                agent_result = explain_preflight_and_record(preflight_result)
-                _record_agent_preflight_result(agent_result)
-            except Exception:
-                pass
-
             from orchestrator import orchestrator_main
 
             orchestrator_main(flags)
@@ -260,7 +253,7 @@ def _manifest_run_state(manifest: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(preflight, dict):
             preflight = {}
         preflight_exit_code = preflight.get("exit_code", runtime_context.get("preflight_exit_code"))
-        preflight_only_stages = not stages or set(stages).issubset({"agent_preflight"})
+        preflight_only_stages = not stages
         if preflight_exit_code == EXIT_OK and preflight_only_stages:
             status = "preflight_passed_no_run"
             root_cause = "preflight_only"
@@ -594,38 +587,7 @@ def _print_preflight(result: dict) -> int:
     return int(summary.get("exit_code", EXIT_CHECK_FAILED))
 
 
-def explain_preflight_and_record(result: dict) -> dict:
-    """Compatibility hook; callers persist its result exactly once."""
-    return explain_preflight(result)
-
-
-def _record_agent_preflight_result(agent_result: dict[str, Any] | None) -> None:
-    if not isinstance(agent_result, dict):
-        return
-    if agent_result.get("reason") in {"disabled", "adapter_unavailable"}:
-        return
-    manifest = load_run_manifest()
-    existing_run_ts = str(manifest.get("run_timestamp") or "").strip()
-    update_run_manifest(
-        "agent_preflight",
-        status="completed" if agent_result.get("ok") else "skipped",
-        files={
-            key: value
-            for key, value in {
-                "json": agent_result.get("json_path", ""),
-                "md": agent_result.get("md_path", ""),
-            }.items()
-            if value
-        } or None,
-        metrics={
-            "ok": bool(agent_result.get("ok")),
-            "reason": agent_result.get("reason", ""),
-        },
-        timestamp=existing_run_ts or None,
-    )
-
-
-def _run_preflight_with_agent(strict: bool, *, allow_maintenance_lock: bool = False) -> int:
+def _run_preflight(strict: bool, *, allow_maintenance_lock: bool = False) -> int:
     if allow_maintenance_lock:
         result = _collect_preflight(strict=strict, allow_maintenance_lock=True)
     else:
@@ -635,20 +597,16 @@ def _run_preflight_with_agent(strict: bool, *, allow_maintenance_lock: bool = Fa
         runtime_context={"preflight_exit_code": exit_code},
         preflight=result.get("summary", {}),
     )
-    agent_result = explain_preflight_and_record(result)
-    _record_agent_preflight_result(agent_result)
-    if agent_result.get("json_path"):
-        print(f"Agent preflight artifact: {agent_result['json_path']}")
     return exit_code
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    return _run_preflight_with_agent(strict=bool(getattr(args, "strict", False)))
+    return _run_preflight(strict=bool(getattr(args, "strict", False)))
 
 
 def cmd_preflight(_: argparse.Namespace) -> int:
     allow_maintenance_lock = os.environ.get("VCP_PREFLIGHT_ALLOW_MAINTENANCE_LOCK", "") == "1"
-    return _run_preflight_with_agent(
+    return _run_preflight(
         strict=True,
         allow_maintenance_lock=allow_maintenance_lock,
     )

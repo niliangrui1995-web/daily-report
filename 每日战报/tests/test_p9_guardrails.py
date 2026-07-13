@@ -508,3 +508,175 @@ def test_p9_risk_analysis_blocks_raw_delivery_on_invalid_json(monkeypatch):
     assert report == ""
     assert captured["raw_artifact"][0] == "P9_raw_invalid_output"
     assert captured["manifest_updates"][-1][1]["status"] == "failed_parse"
+
+
+def test_p9_blocks_rejected_identity_in_inputs_output_and_records_fallback_model(monkeypatch):
+    import p9_reporter
+
+    captured = {"prompts": [], "manifest_updates": [], "text_artifacts": []}
+    provenance = {
+        "requested_model": "gpt-5.6-sol",
+        "effective_model": "claude-opus-4-6-thinking",
+        "attempted_models": ["gpt-5.6-sol", "claude-opus-4-6-thinking"],
+        "fallback_used": True,
+        "fallback_reason_category": "rate_limit",
+        "fallback_reason": "429 Too Many Requests",
+    }
+    payload = {
+        "x_intel_snipe": [],
+        "p3_machine_intel": [],
+        "core_signals": [
+            {
+                "source": "P7a",
+                "significance": "高",
+                "title": "错误身份",
+                "body": "虚构电子（002011）已量产；国际复材认证有效。",
+                "confidence": 0.8,
+                "evidence_refs": ["P7a"],
+            },
+            {
+                "source": "P5",
+                "significance": "中",
+                "title": "有效信号",
+                "body": "中国巨石供给弹性明确。",
+                "confidence": 0.8,
+                "evidence_refs": ["P5"],
+            },
+        ],
+        "sniper_tables": [
+            {
+                "track_name": "电子布",
+                "targets": [
+                    {
+                        "name": "虚构电子",
+                        "code": "002011",
+                        "price": "10",
+                        "chg_3m": "1%",
+                        "percentile_250d": "50%",
+                        "volume": "正常",
+                        "elasticity": "中",
+                        "rs_strength": "中",
+                        "weekly_level": "中",
+                        "catalyst": "错误身份",
+                        "risk": "高",
+                    }
+                ],
+            }
+        ],
+        "fund_pathway": [],
+        "today_advice": [],
+        "risk_warning": ["警惕虚构电子身份错误。"],
+    }
+
+    monkeypatch.setattr(
+        p9_reporter,
+        "require_prompt",
+        lambda _name: "{today_str}\n{p5_evidence}\n{p7_section}\n{p6_mapping}\n{p75_section}\n{price_data}\n{p2_section}\n{p3_section}\n{yfinance_section}",
+    )
+
+    def fake_invoke(prompt):
+        captured["prompts"].append(prompt)
+        return SimpleNamespace(
+            content=json.dumps(payload, ensure_ascii=False),
+            thinking_content="fallback reasoning",
+            response_metadata={"model_provenance": provenance},
+        )
+
+    monkeypatch.setattr(p9_reporter.opus_adapter, "invoke", fake_invoke)
+    monkeypatch.setattr(
+        p9_reporter,
+        "load_tdx_stock_code_map",
+        lambda: {"中国巨石": "600176", "盾安环境": "002011"},
+    )
+    monkeypatch.setattr(p9_reporter, "_load_p8_price_db", lambda: {})
+    monkeypatch.setattr(
+        p9_reporter,
+        "write_text_artifact",
+        lambda prefix, content, **kwargs: captured["text_artifacts"].append((prefix, content)) or "p9.md",
+    )
+    monkeypatch.setattr(p9_reporter, "write_json_artifact", lambda *args, **kwargs: "report.json")
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: captured["manifest_updates"].append((args, kwargs)),
+    )
+
+    report, _ = p9_reporter.p9_risk_analysis(
+        p5_evidence="P5 中国巨石有效证据",
+        p7_deep="P7 虚构电子错误证据\nP7 中国巨石有效证据",
+        p75_supplement="P7.5 evidence",
+        p6_mapping="P6 mapping",
+        price_data="P8 price data " * 10,
+        p2_x_intel_data="P2 data",
+        p3_intel_data="P3 data",
+        p4_yfinance="P4 data",
+        rejected_target_names=["虚构电子"],
+    )
+
+    assert "P7 虚构电子错误证据" not in captured["prompts"][0]
+    assert "以下名称已被本地 TDX 股票主数据明确拒绝：虚构电子" in captured["prompts"][0]
+    assert "虚构电子" not in report
+    assert "中国巨石" in report
+    assert "国际复材认证有效" in report
+    reasoning_prefix, reasoning_body = captured["text_artifacts"][0]
+    assert reasoning_prefix == "P9_LLM推理链"
+    assert "实际模型: claude-opus-4-6-thinking" in reasoning_body
+    metrics = next(
+        kwargs["metrics"]
+        for args, kwargs in reversed(captured["manifest_updates"])
+        if args == ("p9",) and "model_provenance" in kwargs.get("metrics", {})
+    )
+    metrics_provenance = metrics["model_provenance"]
+    assert metrics_provenance["requested_model"] == provenance["requested_model"]
+    assert metrics_provenance["effective_model"] == provenance["effective_model"]
+    assert metrics_provenance["fallback_reason"] == provenance["fallback_reason"]
+    assert metrics["rejected_identity_items_removed"] >= 3
+
+
+def test_p9_short_rejected_alias_does_not_drop_longer_valid_tdx_name(monkeypatch):
+    import p9_reporter
+
+    payload = {
+        "sniper_tables": [
+            {
+                "track_name": "电子布",
+                "targets": [{"name": "宏和科技", "code": ""}],
+            }
+        ],
+        "today_advice": [{"name": "宏和科技", "code": ""}],
+    }
+    monkeypatch.setattr(p9_reporter, "load_tdx_stock_code_map", lambda: {"宏和科技": "603256"})
+
+    identity_metrics = p9_reporter._filter_rejected_identity_payload(payload, ["宏和"])
+    code_metrics = p9_reporter._apply_tdx_stock_codes_to_report(payload)
+
+    assert identity_metrics["rejected_identity_items_removed"] == 0
+    assert payload["sniper_tables"][0]["targets"][0]["name"] == "宏和科技"
+    assert payload["sniper_tables"][0]["targets"][0]["code"] == "603256"
+    assert payload["today_advice"][0]["code"] == "603256"
+    assert code_metrics["p9_rejected_targets"] == 0
+
+
+def test_p9_canonicalizes_honghe_alias_before_local_code_validation(monkeypatch):
+    import p9_reporter
+
+    payload = {
+        "sniper_tables": [
+            {
+                "track_name": "电子布",
+                "targets": [{"name": "宏和电子", "code": "002011"}],
+            }
+        ],
+        "today_advice": [{"name": "宏和电子", "code": "002011"}],
+    }
+    monkeypatch.setattr(p9_reporter, "load_tdx_stock_code_map", lambda: {"宏和科技": "603256"})
+
+    metrics = p9_reporter._apply_tdx_stock_codes_to_report(payload)
+
+    assert payload["sniper_tables"][0]["targets"][0] == {
+        "name": "宏和科技",
+        "code": "603256",
+    }
+    assert payload["today_advice"][0] == {"name": "宏和科技", "code": "603256"}
+    assert metrics["p9_model_codes_ignored"] == 2
+    assert metrics["p9_canonical_alias_rewrites"] == 2

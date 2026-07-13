@@ -16,8 +16,19 @@ from artifact_store import (
 )
 from p9_email import send_report_via_email
 from p9_rendering import build_report_markdown
-from settings import EMAIL_ADDRESS, EMAIL_PASSWORD, RECEIVER_EMAIL, opus_adapter, require_prompt
-from tdx_stock_universe import load_tdx_stock_code_map, lookup_tdx_stock_code
+from settings import EMAIL_ADDRESS, EMAIL_PASSWORD, OPUS_MODEL, RECEIVER_EMAIL, opus_adapter, require_prompt
+from native_llm_adapter import get_model_provenance
+from tdx_stock_universe import (
+    build_rejected_stock_guardrail,
+    canonicalize_stock_aliases_in_tree,
+    filter_rejected_stock_lines,
+    filter_rejected_stock_tree,
+    find_rejected_stock_names,
+    load_tdx_stock_code_map,
+    lookup_tdx_stock_code,
+    normalize_rejected_stock_names,
+    normalize_stock_name,
+)
 from utils import extract_json_from_llm_response, normalize_common_mojibake_artifacts, normalize_common_text_mojibake
 
 _HARD_EVIDENCE_LAYERS = {"P4", "P5", "P6", "P7", "P7A", "P8"}
@@ -231,15 +242,21 @@ def _lookup_tdx_stock_code(stock_code_map: dict[str, str], name: Any) -> str:
 
 def _apply_tdx_stock_codes_to_report(data: dict[str, Any]) -> dict[str, int]:
     stock_code_map = load_tdx_stock_code_map()
+    canonical_data, canonical_alias_rewrites = canonicalize_stock_aliases_in_tree(data)
+    data.clear()
+    data.update(canonical_data)
     metrics = {
         "p9_codes_filled_from_tdx": 0,
         "p9_model_codes_ignored": 0,
         "p9_unmapped_codes": 0,
+        "p9_rejected_targets": 0,
+        "p9_canonical_alias_rewrites": canonical_alias_rewrites,
     }
 
-    def apply_row(row: Any, section: str) -> None:
+    def apply_row(row: Any, section: str) -> bool:
         if not isinstance(row, dict):
-            return
+            metrics["p9_rejected_targets"] += 1
+            return False
 
         name = str(row.get("name", "")).strip()
         raw_code = str(row.get("code", "")).strip()
@@ -251,24 +268,107 @@ def _apply_tdx_stock_codes_to_report(data: dict[str, Any]) -> dict[str, int]:
             elif not raw_code:
                 metrics["p9_codes_filled_from_tdx"] += 1
             row["code"] = local_code
-            return
+            return True
 
         if raw_code and raw_code != UNMAPPED_CODE_PLACEHOLDER:
             metrics["p9_model_codes_ignored"] += 1
             logging.warning("[P9 local code missing] %s ignored model code=%s (%s)", name, raw_code, section)
-        row["code"] = UNMAPPED_CODE_PLACEHOLDER
         metrics["p9_unmapped_codes"] += 1
+        metrics["p9_rejected_targets"] += 1
+        logging.warning("[P9 local target rejected] %s missing from local TDX universe (%s)", name, section)
+        return False
 
+    accepted_tables = []
     for table_index, table in enumerate(data.get("sniper_tables", []) or []):
         targets = table.get("targets", []) if isinstance(table, dict) else []
+        accepted_targets = []
         for row_index, row in enumerate(targets):
-            apply_row(row, f"sniper_tables[{table_index}].targets[{row_index}]")
+            if apply_row(row, f"sniper_tables[{table_index}].targets[{row_index}]"):
+                accepted_targets.append(row)
+        if isinstance(table, dict) and accepted_targets:
+            table["targets"] = accepted_targets
+            accepted_tables.append(table)
+    data["sniper_tables"] = accepted_tables
 
-    for row_index, row in enumerate(data.get("sniper_table", []) or []):
-        apply_row(row, f"sniper_table[{row_index}]")
+    if "sniper_table" in data:
+        data["sniper_table"] = [
+            row
+            for row_index, row in enumerate(data.get("sniper_table", []) or [])
+            if apply_row(row, f"sniper_table[{row_index}]")
+        ]
 
-    for row_index, row in enumerate(data.get("today_advice", []) or []):
-        apply_row(row, f"today_advice[{row_index}]")
+    data["today_advice"] = [
+        row
+        for row_index, row in enumerate(data.get("today_advice", []) or [])
+        if apply_row(row, f"today_advice[{row_index}]")
+    ]
+
+    return metrics
+
+
+def _filter_rejected_identity_payload(
+    data: dict[str, Any],
+    rejected_target_names: list[str] | None,
+) -> dict[str, int]:
+    rejected_names = normalize_rejected_stock_names(rejected_target_names)
+    metrics = {"rejected_identity_items_removed": 0}
+    if not rejected_names:
+        return metrics
+
+    for section in (
+        "x_intel_snipe",
+        "p3_machine_intel",
+        "core_signals",
+        "fund_pathway",
+        "risk_warning",
+    ):
+        accepted_items = []
+        for item in data.get(section, []) or []:
+            cleaned, removed_count = filter_rejected_stock_tree(item, rejected_names)
+            metrics["rejected_identity_items_removed"] += removed_count
+            if not cleaned:
+                continue
+            if section == "core_signals" and isinstance(cleaned, dict) and not cleaned.get("body"):
+                continue
+            accepted_items.append(cleaned)
+        data[section] = accepted_items
+
+    accepted_tables = []
+    for table in data.get("sniper_tables", []) or []:
+        if not isinstance(table, dict):
+            metrics["rejected_identity_items_removed"] += 1
+            continue
+        if find_rejected_stock_names(table.get("track_name", ""), rejected_names):
+            metrics["rejected_identity_items_removed"] += 1
+            continue
+        accepted_targets = []
+        for target in table.get("targets", []) or []:
+            target_name = normalize_stock_name(target.get("name", "")) if isinstance(target, dict) else ""
+            if target_name in rejected_names or find_rejected_stock_names(target, rejected_names):
+                metrics["rejected_identity_items_removed"] += 1
+                continue
+            accepted_targets.append(target)
+        if accepted_targets:
+            table["targets"] = accepted_targets
+            accepted_tables.append(table)
+        elif table.get("targets"):
+            metrics["rejected_identity_items_removed"] += 1
+    data["sniper_tables"] = accepted_tables
+
+    accepted_advice = []
+    for item in data.get("today_advice", []) or []:
+        item_name = normalize_stock_name(item.get("name", "")) if isinstance(item, dict) else ""
+        if item_name in rejected_names or find_rejected_stock_names(item, rejected_names):
+            metrics["rejected_identity_items_removed"] += 1
+            continue
+        accepted_advice.append(item)
+    data["today_advice"] = accepted_advice
+
+    if find_rejected_stock_names(data, rejected_names):
+        filtered, removed_count = filter_rejected_stock_tree(data, rejected_names)
+        data.clear()
+        data.update(filtered)
+        metrics["rejected_identity_items_removed"] += removed_count
 
     return metrics
 
@@ -538,6 +638,7 @@ def p9_risk_analysis(
     p2_x_intel_data=None,
     p3_intel_data="",
     p4_yfinance="",
+    rejected_target_names: list[str] | None = None,
     _retry_count: int = 0,
 ):
     """
@@ -557,6 +658,33 @@ def p9_risk_analysis(
     p2_x_intel_data = normalize_common_text_mojibake(p2_x_intel_data or "")
     p3_intel_data = normalize_common_text_mojibake(p3_intel_data or "")
     p4_yfinance = normalize_common_text_mojibake(p4_yfinance or "")
+    rejected_names = normalize_rejected_stock_names(rejected_target_names)
+
+    input_identity_lines_removed = 0
+    filtered_inputs = []
+    for input_text in (
+        p5_evidence,
+        p7_deep,
+        p75_supplement,
+        p6_mapping,
+        price_data,
+        p2_x_intel_data,
+        p3_intel_data,
+        p4_yfinance,
+    ):
+        filtered_text, removed_count = filter_rejected_stock_lines(input_text, rejected_names)
+        filtered_inputs.append(filtered_text)
+        input_identity_lines_removed += removed_count
+    (
+        p5_evidence,
+        p7_deep,
+        p75_supplement,
+        p6_mapping,
+        price_data,
+        p2_x_intel_data,
+        p3_intel_data,
+        p4_yfinance,
+    ) = filtered_inputs
 
     logging.info("[P9] building final report")
 
@@ -596,6 +724,9 @@ def p9_risk_analysis(
         p3_section=p3_section,
         yfinance_section=yfinance_section,
     )
+    identity_guardrail = build_rejected_stock_guardrail(rejected_names)
+    if identity_guardrail:
+        prompt = f"{identity_guardrail}\n\n{prompt}"
     prompt = f"{P9_UNTRUSTED_INPUT_NOTICE}\n\n{prompt}"
     if _retry_count:
         prompt = (
@@ -609,11 +740,24 @@ def p9_risk_analysis(
     resp = opus_adapter.invoke(prompt)
     raw_content = getattr(resp, "content", "") or ""
     thinking_content = getattr(resp, "thinking_content", "") or ""
+    model_provenance = get_model_provenance(resp, OPUS_MODEL)
+    requested_model = str(model_provenance.get("requested_model") or OPUS_MODEL)
+    effective_model = str(model_provenance.get("effective_model") or requested_model)
 
     out_fn = ""
     if thinking_content:
         try:
-            out_fn = write_text_artifact("P9_GPT56_SolMax推理链", thinking_content)
+            thinking_body = (
+                "# P9 LLM Reasoning 推理链\n\n"
+                f"> 生成时间: {datetime.now().isoformat()}\n"
+                f"> 请求模型: {requested_model}\n"
+                f"> 实际模型: {effective_model}\n"
+                f"> 使用备模: {bool(model_provenance.get('fallback_used'))}\n"
+                f"> 备模原因: {model_provenance.get('fallback_reason', '') or '无'}\n"
+                f"> 推理链长度: {len(thinking_content)} 字符\n\n---\n\n"
+                f"{thinking_content}"
+            )
+            out_fn = write_text_artifact("P9_LLM推理链", thinking_body)
             logging.info("[P9] saved reasoning trace to %s", out_fn)
         except Exception as exc:
             logging.error("[P9] failed to save reasoning trace: %s", exc)
@@ -624,7 +768,11 @@ def p9_risk_analysis(
             "p9",
             status="failed_empty_output",
             files={"thinking": out_fn} if out_fn else None,
-            metrics={"price_data_chars": len(price_data or "")},
+            metrics={
+                "price_data_chars": len(price_data or ""),
+                "input_rejected_identity_lines_removed": input_identity_lines_removed,
+                "model_provenance": model_provenance,
+            },
         )
         return "", run_ts
 
@@ -633,9 +781,6 @@ def p9_risk_analysis(
         data, guardrail_metrics = _apply_evidence_guardrails(data)
         if any(guardrail_metrics.values()):
             logging.info("[P9] applied evidence guardrails: %s", guardrail_metrics)
-        code_metrics = _apply_tdx_stock_codes_to_report(data)
-        if any(code_metrics.values()):
-            logging.info("[P9] applied local TDX stock codes: %s", code_metrics)
         soft_intel_metrics = _backfill_soft_intel_sections(
             data,
             p2_x_intel_data=p2_x_intel_data,
@@ -643,6 +788,13 @@ def p9_risk_analysis(
         )
         if any(soft_intel_metrics.values()):
             logging.info("[P9] backfilled soft intel sections: %s", soft_intel_metrics)
+        identity_metrics = _filter_rejected_identity_payload(data, rejected_names)
+        identity_metrics["input_rejected_identity_lines_removed"] = input_identity_lines_removed
+        if any(identity_metrics.values()):
+            logging.warning("[P9] applied rejected stock identity guardrail: %s", identity_metrics)
+        code_metrics = _apply_tdx_stock_codes_to_report(data)
+        if any(code_metrics.values()):
+            logging.info("[P9] applied local TDX stock codes: %s", code_metrics)
         p8_backfill_metrics = _backfill_sniper_tables_from_p8(data)
         if p8_backfill_metrics.get("p8_backfilled_targets"):
             logging.info("[P9] backfilled sniper table fields from P8: %s", p8_backfill_metrics)
@@ -661,7 +813,9 @@ def p9_risk_analysis(
                 metrics={
                     "markdown_chars": len(result),
                     "raw_output_chars": len(raw_content),
+                    "model_provenance": model_provenance,
                     **guardrail_metrics,
+                    **identity_metrics,
                     **code_metrics,
                     **soft_intel_metrics,
                     **p8_backfill_metrics,
@@ -676,7 +830,9 @@ def p9_risk_analysis(
                 metrics={
                     "markdown_chars": len(result),
                     "raw_output_chars": len(raw_content),
+                    "model_provenance": model_provenance,
                     **guardrail_metrics,
+                    **identity_metrics,
                     **code_metrics,
                     **soft_intel_metrics,
                     **p8_backfill_metrics,
@@ -705,7 +861,13 @@ def p9_risk_analysis(
                 "p9",
                 status="retrying_parse",
                 files=manifest_files,
-                metrics={"raw_output_chars": len(raw_content), "error": str(exc), "retry_count": _retry_count},
+                metrics={
+                    "raw_output_chars": len(raw_content),
+                    "error": str(exc),
+                    "retry_count": _retry_count,
+                    "input_rejected_identity_lines_removed": input_identity_lines_removed,
+                    "model_provenance": model_provenance,
+                },
             )
             return p9_risk_analysis(
                 p5_evidence,
@@ -716,13 +878,20 @@ def p9_risk_analysis(
                 p2_x_intel_data=p2_x_intel_data,
                 p3_intel_data=p3_intel_data,
                 p4_yfinance=p4_yfinance,
+                rejected_target_names=rejected_names,
                 _retry_count=_retry_count + 1,
             )
         update_run_manifest(
             "p9",
             status="failed_parse",
             files=manifest_files,
-            metrics={"raw_output_chars": len(raw_content), "error": str(exc), "retry_count": _retry_count},
+            metrics={
+                "raw_output_chars": len(raw_content),
+                "error": str(exc),
+                "retry_count": _retry_count,
+                "input_rejected_identity_lines_removed": input_identity_lines_removed,
+                "model_provenance": model_provenance,
+            },
         )
         return "", run_ts
 

@@ -224,7 +224,7 @@ def test_research_stages_persist_p6_input_sha256(monkeypatch, tmp_path):
         lambda *args, **kwargs: {"text": "supplement evidence"},
     )
     monkeypatch.setattr(orchestrator, "gemini_pro_audit", lambda text, **kwargs: text)
-    monkeypatch.setattr(orchestrator, "p7a_deep_research_audit", lambda text: "audited " + text)
+    monkeypatch.setattr(orchestrator, "p7a_deep_research_audit", lambda text, **kwargs: "audited " + text)
     monkeypatch.setattr(orchestrator, "write_json_artifact", lambda *args, **kwargs: "plan.json")
     monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *args, **kwargs: "artifact.md")
     monkeypatch.setattr(
@@ -253,6 +253,7 @@ def test_market_mapping_does_not_load_stale_research(monkeypatch, tmp_path):
         "stage": "p8_resume",
         "run_timestamp": RUN_TS,
         "files": {"p6": p6, "p7": p7, "p7a": p7a, "p75": p75},
+        "p6_metrics": {"identity_validation_version": 2},
     }
     context = orchestrator._build_context(datetime.now(), RUN_TS, ckpt, "p8_resume")
 
@@ -406,3 +407,126 @@ def test_inner_thread_timeouts_do_not_claim_hard_deadlines():
     assert registry["research"].timeout_seconds == 900
     assert registry["report"].timeout_seconds == 900
     assert "timeout=180" in inspect.getsource(search_engine._post_search_request)
+
+
+def test_legacy_p6_rejection_without_names_is_incomplete_identity_validation(monkeypatch):
+    import orchestrator
+
+    monkeypatch.setattr(
+        orchestrator,
+        "load_run_manifest",
+        lambda: {
+            "stages": {
+                "p6": {
+                    "status": "completed",
+                    "metrics": {"rejected_targets": 1},
+                }
+            }
+        },
+    )
+
+    validation = orchestrator._load_p6_identity_validation()
+
+    assert validation["rejected_target_names"] == []
+    assert validation["complete"] is False
+    assert validation["reason"] == "legacy_rejections_missing_names"
+
+
+def test_versioned_p6_identity_validation_accepts_unnamed_malformed_targets():
+    import orchestrator
+
+    validation = orchestrator._load_p6_identity_validation(
+        {
+            "rejected_targets": 2,
+            "rejected_target_names": [],
+            "identity_validation_version": 2,
+        }
+    )
+
+    assert validation["complete"] is True
+    assert validation["reason"] == ""
+
+
+def test_previous_identity_validation_version_is_stale_after_canonical_alias_upgrade():
+    import orchestrator
+
+    validation = orchestrator._load_p6_identity_validation(
+        {
+            "rejected_targets": 1,
+            "rejected_target_names": ["宏和电子"],
+            "identity_validation_version": 1,
+        }
+    )
+
+    assert validation["complete"] is False
+    assert validation["rejected_target_names"] == []
+    assert validation["reason"] == "identity_validation_outdated"
+
+
+def test_unversioned_p6_identity_validation_is_not_reused():
+    import orchestrator
+
+    validation = orchestrator._load_p6_identity_validation({})
+
+    assert validation["complete"] is False
+    assert validation["reason"] == "identity_validation_unversioned"
+
+
+def test_research_and_report_drop_known_canonical_alias_from_rejected_names(monkeypatch):
+    import orchestrator
+
+    context = orchestrator._build_context(
+        datetime.now(),
+        RUN_TS,
+        {"stage": "none", "run_timestamp": RUN_TS, "files": {}},
+        "none",
+    )
+    context.update(
+        {
+            "p6_mapping": "DEEP_RESEARCH: 中国巨石/宏和电子/国际复材供给弹性",
+            "p5_evidence": "P5 evidence",
+            "p4_data": "P4 data",
+            "price_data": "P8 data " * 20,
+            "p2_data": "P2 data",
+            "p3_data": "P3 data",
+            "rejected_target_names": ["宏和电子"],
+        }
+    )
+    captured = {}
+
+    def fake_build_plan(*args, **kwargs):
+        captured["research_names"] = kwargs.get("rejected_target_names")
+        return {
+            "goal": "",
+            "triggers": [],
+            "deep_topics": [],
+            "supplement_queries": [],
+            "should_run_p7": False,
+            "should_run_p75": False,
+            "max_rounds": 0,
+            "round_backtracks": [],
+            "skipped_recent_topics": [],
+        }
+
+    monkeypatch.setattr(orchestrator, "build_research_plan", fake_build_plan)
+    monkeypatch.setattr(orchestrator, "write_json_artifact", lambda *args, **kwargs: "plan.json")
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda *args, **kwargs: None)
+
+    orchestrator._stage_research(context)
+
+    def fake_p9(*args, **kwargs):
+        captured["report_names"] = kwargs.get("rejected_target_names")
+        return "final report", RUN_TS
+
+    monkeypatch.setattr(orchestrator, "p9_risk_analysis", fake_p9)
+    monkeypatch.setattr(
+        orchestrator,
+        "send_report_email",
+        lambda *args, **kwargs: {"ok": True, "status": "completed_email_sent"},
+    )
+    monkeypatch.setattr(orchestrator, "_run_agent_report_review", lambda _context: None)
+
+    orchestrator._stage_report(context)
+
+    assert captured["research_names"] == []
+    assert captured["report_names"] == []

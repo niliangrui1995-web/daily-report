@@ -75,6 +75,7 @@ VANGUARD_TICKERS = {
     'KLA': 'KLAC',
     'Onto Innovation': 'ONTO',
     'SK Hynix': '000660.KS',
+    'SK Hynix ADR': 'SKHY',
     'Samsung': '005930.KS',
     'Micron': 'MU',
     'Hanmi Semi': '042700.KS',
@@ -166,6 +167,7 @@ SUPER_GIANTS = set(['Meta', 'Apple', 'Broadcom', 'NVIDIA', 'Google', 'Tesla', 'T
 
 STRATEGIC_GIANTS = set([
     'SK Hynix',
+    'SK Hynix ADR',
     'Micron',
     'AMD',
     'Oracle',

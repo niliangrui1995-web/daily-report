@@ -254,6 +254,7 @@ def detect_checkpoint() -> dict:
         "stage": "none",
         "files": {},
         "p6_input_sha256": {},
+        "p6_metrics": {},
         "run_timestamp": "",
     }
 
@@ -261,6 +262,8 @@ def detect_checkpoint() -> dict:
     if manifest:
         ckpt["run_timestamp"] = manifest.get("run_timestamp", "")
         ckpt["p6_input_sha256"] = _manifest_p6_input_hashes(manifest)
+        p6_metrics = manifest.get("stages", {}).get("p6", {}).get("metrics", {})
+        ckpt["p6_metrics"] = dict(p6_metrics) if isinstance(p6_metrics, dict) else {}
         _load_files_from_manifest(ckpt, manifest)
         ckpt["stage"] = _derive_stage(ckpt["files"], manifest)
         if ckpt["stage"] == "p9_done":

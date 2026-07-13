@@ -60,6 +60,57 @@ class TestP7ResearchPlan:
         assert "oligarch_large_move" in plan["triggers"]
         assert "low_confidence" in plan["triggers"]
 
+    def test_build_research_plan_canonicalizes_known_alias_before_rejection(self, monkeypatch):
+        import p7_deep_research as p7
+
+        monkeypatch.setattr(p7, "_recent_deep_topic_history", lambda days=5: [])
+
+        plan = p7.build_research_plan(
+            "\n".join(
+                [
+                    "DEEP_RESEARCH: 中国巨石/宏和电子/国际复材的电子布国产替代能力",
+                    "SEARCH: 宏和电子与中国巨石的产能对比",
+                ]
+            ),
+            rejected_target_names=["宏和电子"],
+        )
+
+        assert plan["deep_topics"] == ["中国巨石/宏和科技/国际复材的电子布国产替代能力"]
+        assert plan["supplement_queries"] == ["宏和科技与中国巨石的产能对比"]
+        assert plan["rejected_target_names"] == []
+        assert plan["identity_rewrites"] == 0
+
+    def test_run_deep_research_canonicalizes_known_alias_reintroduced_by_search(self, monkeypatch):
+        import p7_deep_research as p7
+
+        monkeypatch.setattr(
+            p7,
+            "iterative_deep_search",
+            lambda *args, **kwargs: {
+                "topic": "电子布供给弹性",
+                "text": "宏和电子（002011）已量产；国际复材认证有效。",
+                "status": "completed",
+                "rounds_run": 1,
+                "successful_rounds": 1,
+            },
+        )
+        plan = {
+            "should_run_p7": True,
+            "deep_topics": ["电子布供给弹性"],
+            "max_rounds": 1,
+            "round_backtracks": ["72h"],
+            "goal": "验证供给弹性",
+            "triggers": ["explicit_topics"],
+            "rejected_target_names": ["宏和电子"],
+        }
+
+        result = p7.run_deep_research(plan)
+
+        assert "宏和电子" not in result["text"]
+        assert "宏和科技（603256）已量产" in result["text"]
+        assert "国际复材认证有效" in result["text"]
+        assert result["rejected_identity_lines_removed"] == 0
+
     def test_iterative_deep_search_stops_early_with_structured_output(self, monkeypatch):
         import p7_deep_research as p7
         import search_engine

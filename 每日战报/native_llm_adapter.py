@@ -223,6 +223,63 @@ class FakeAIMessage:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     thinking_content: str = ''
+    response_metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+def get_model_provenance(message: Any, default_model: str = '') -> Dict[str, Any]:
+    model = str(default_model or '').strip()
+    has_content = bool(str(getattr(message, 'content', '') or '').strip())
+    defaults = {
+        'requested_model': model,
+        'attempted_models': [model] if model else [],
+        'fallback_used': False,
+        'fallback_model': '',
+        'fallback_reason_category': '',
+        'fallback_reason': '',
+        'response_model': model if has_content else '',
+        'effective_model': model if has_content else '',
+        'adapter_provider': '',
+        'final_error_category': '',
+        'final_error': '',
+    }
+    metadata = getattr(message, 'response_metadata', {})
+    if isinstance(metadata, dict):
+        provenance = metadata.get('model_provenance')
+        if isinstance(provenance, dict):
+            defaults.update(provenance)
+            requested_model = str(provenance.get('requested_model') or model)
+            fallback_used = bool(provenance.get('fallback_used'))
+            fallback_model = str(provenance.get('fallback_model') or '')
+
+            attempted_models = provenance.get('attempted_models')
+            if not isinstance(attempted_models, list):
+                attempted_models = []
+            attempted_models = [str(item) for item in attempted_models if str(item).strip()]
+            if requested_model and requested_model not in attempted_models:
+                attempted_models.insert(0, requested_model)
+            if fallback_used and fallback_model and fallback_model not in attempted_models:
+                attempted_models.append(fallback_model)
+
+            response_model = str(provenance.get('response_model') or '')
+            effective_model = str(provenance.get('effective_model') or '')
+            if not effective_model:
+                effective_model = response_model
+            if not effective_model and has_content:
+                effective_model = fallback_model if fallback_used and fallback_model else requested_model
+            if not response_model:
+                response_model = effective_model
+
+            defaults.update(
+                {
+                    'requested_model': requested_model,
+                    'attempted_models': attempted_models,
+                    'fallback_used': fallback_used,
+                    'fallback_model': fallback_model,
+                    'response_model': response_model,
+                    'effective_model': effective_model,
+                }
+            )
+    return defaults
 
 def _format_tool_schema(tool: Any) -> Dict[str, Any]:
     if hasattr(tool, 'name') and hasattr(tool, 'description'):
@@ -324,6 +381,7 @@ class NativeLLMAdapter(RunnableSerializable):
     extra_kwargs: Dict[str, Any] = {}
     last_error_category: str = ''
     last_error_message: str = ''
+    last_response_model: str = ''
     _bound_tools: List[Any] = None
     _tools_prompt: str = ''
 
@@ -391,11 +449,19 @@ class NativeLLMAdapter(RunnableSerializable):
         system_prompt, user_prompt = self._parse_messages(messages)
         _ = config
         self._reset_last_error()
+        self.last_response_model = ''
 
         if self._tools_prompt:
             system_prompt = system_prompt + self._tools_prompt
 
         thinking_content = ''
+        original_model = self.model
+        attempted_models = [original_model]
+        selected_model = original_model
+        fallback_used = False
+        fallback_model = ''
+        fallback_reason_category = ''
+        fallback_reason = ''
 
         if self.provider == 'anthropic':
             result = self._call_anthropic(system_prompt, user_prompt)
@@ -412,22 +478,81 @@ class NativeLLMAdapter(RunnableSerializable):
             else:
                 text = result
 
+        # Fallback logic for gpt-5.6-sol to claude-opus-4-6-thinking (quota / balance exhaustion)
+        if original_model == 'gpt-5.6-sol' and (not text or self.last_error_category):
+            err_msg_lower = self.last_error_message.lower()
+            is_quota_or_balance = (
+                self.last_error_category in ('risk_control', 'rate_limit', 'permission_denied') or
+                any(kw in err_msg_lower for kw in ('balance', 'quota', 'credit', 'insufficient', '401', '403', '429', 'limit', 'exceeded'))
+            )
+            if is_quota_or_balance:
+                fallback_used = True
+                fallback_model = 'claude-opus-4-6-thinking'
+                fallback_reason_category = self.last_error_category
+                fallback_reason = self.last_error_message
+                attempted_models.append(fallback_model)
+                logger.warning(
+                    f"⚠️ [LLM Fallback] Model {original_model} failed (category={self.last_error_category}, msg={self.last_error_message}). "
+                    f"Attempting fallback to backup model '{fallback_model}'..."
+                )
+                self._reset_last_error()
+                self.last_response_model = ''
+                object.__setattr__(self, 'model', fallback_model)
+                selected_model = fallback_model
+                try:
+                    if self.provider == 'anthropic':
+                        result = self._call_anthropic(system_prompt, user_prompt)
+                        if isinstance(result, tuple):
+                            text, thinking_content = result
+                        else:
+                            text = result
+                    elif self.provider == 'google':
+                        text = self._call_gemini(f"{system_prompt}\n\n{user_prompt}")
+                    else:
+                        result = self._call_openai_compat(system_prompt, user_prompt)
+                        if isinstance(result, tuple):
+                            text, thinking_content = result
+                        else:
+                            text = result
+                finally:
+                    object.__setattr__(self, 'model', original_model)
+        effective_model = self.last_response_model or (selected_model if text else '')
+        model_provenance = {
+            'requested_model': original_model,
+            'attempted_models': attempted_models,
+            'fallback_used': fallback_used,
+            'fallback_model': fallback_model,
+            'fallback_reason_category': fallback_reason_category,
+            'fallback_reason': fallback_reason[:2000],
+            'response_model': effective_model,
+            'effective_model': effective_model,
+            'adapter_provider': self.provider,
+            'final_error_category': self.last_error_category,
+            'final_error': self.last_error_message[:2000],
+        }
+        response_metadata = {'model_provenance': model_provenance}
+
         tool_calls = []
         if self._bound_tools:
             tool_calls = _parse_tool_calls(text)
 
         if tool_calls and HAS_LANGCHAIN and LCMessage:
-            msg = LCMessage(content='', tool_calls=tool_calls)
+            msg = LCMessage(content='', tool_calls=tool_calls, response_metadata=response_metadata)
             return msg
         elif tool_calls:
-            return FakeAIMessage(content='', tool_calls=tool_calls)
+            return FakeAIMessage(content='', tool_calls=tool_calls, response_metadata=response_metadata)
 
         if HAS_LANGCHAIN and LCMessage:
-            msg = LCMessage(content=text)
+            msg = LCMessage(content=text, response_metadata=response_metadata)
             msg.thinking_content = thinking_content
             return msg
         else:
-            return FakeAIMessage(content=text, tool_calls=[], thinking_content=thinking_content)
+            return FakeAIMessage(
+                content=text,
+                tool_calls=[],
+                thinking_content=thinking_content,
+                response_metadata=response_metadata,
+            )
 
     def bind_tools(self, tools: List[Any]) -> 'NativeLLMAdapter':
         bound = NativeLLMAdapter(
@@ -597,6 +722,8 @@ class NativeLLMAdapter(RunnableSerializable):
         for attempt in range(self.max_retries):
             try:
                 response = client.messages.create(**kwargs)
+                self._reset_last_error()
+                self.last_response_model = str(getattr(response, 'model', '') or self.model)
                 text_blocks = [b.text for b in response.content if b.type == 'text']
                 thinking_blocks = [b.thinking for b in response.content if b.type == 'thinking']
 
@@ -657,6 +784,12 @@ class NativeLLMAdapter(RunnableSerializable):
                     kwargs["config"].tools = [types.Tool(google_search=types.GoogleSearch())]
                 
                 response = client.models.generate_content(**kwargs)
+                self._reset_last_error()
+                self.last_response_model = str(
+                    getattr(response, 'model_version', '')
+                    or getattr(response, 'model', '')
+                    or self.model
+                )
                 return response.text if response.text else ''
             except Exception as e:
                 if not self._handle_provider_error('Gemini SDK', e, attempt):
@@ -694,6 +827,8 @@ class NativeLLMAdapter(RunnableSerializable):
                 resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
                 resp.raise_for_status()
                 data = resp.json()
+                self._reset_last_error()
+                self.last_response_model = str(data.get('model') or self.model)
 
                 text = ""
                 if "output" in data:
@@ -757,6 +892,8 @@ class NativeLLMAdapter(RunnableSerializable):
                 if reasoning_effort:
                     kwargs['reasoning_effort'] = reasoning_effort
                 response = client.chat.completions.create(**kwargs)
+                self._reset_last_error()
+                self.last_response_model = str(getattr(response, 'model', '') or self.model)
                 message = response.choices[0].message
                 text = message.content or ''
                 reasoning = getattr(message, 'reasoning_content', '') or ''
@@ -807,6 +944,7 @@ class NativeLLMAdapter(RunnableSerializable):
                 response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
                 response.raise_for_status()
                 data = response.json()
+                self.last_response_model = str(data.get('model') or self.model)
                 text, reasoning = _extract_openai_responses_payload(data)
 
                 if reasoning:

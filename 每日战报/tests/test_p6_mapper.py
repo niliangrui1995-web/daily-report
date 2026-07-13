@@ -282,3 +282,156 @@ def test_p6_parse_failure_never_returns_unvalidated_raw_model_text(monkeypatch):
     assert updates[-1][0] == "p6"
     assert updates[-1][1]["status"] == "failed_parse"
     assert all(update[1]["status"] != "fallback_raw_llm" for update in updates)
+
+
+def test_p6_rejected_identity_is_removed_from_research_directives(monkeypatch):
+    import p6_mapper
+
+    written_json = []
+    manifest_updates = []
+    valid_targets = [
+        {"name": name, "elasticity": "中", "reasoning": "有效标的"}
+        for name in TEST_TDX_STOCK_CODE_MAP
+    ]
+    payload = {
+        "events": [
+            {
+                "track_name": "电子布",
+                "event_summary": "电子布供给紧张",
+                "targets": [
+                    {"name": "虚构电子", "code": "002011", "elasticity": "高", "reasoning": "错误身份"},
+                    *valid_targets,
+                ],
+            }
+        ],
+        "optional_searches": ["虚构电子与佰维存储的供给对比"],
+        "deep_research": ["中国巨石/虚构电子/佰维存储的国产替代能力"],
+    }
+
+    monkeypatch.setattr(
+        p6_mapper.opus_adapter,
+        "invoke",
+        lambda _prompt: SimpleNamespace(content=json.dumps(payload, ensure_ascii=False), thinking_content=""),
+    )
+    monkeypatch.setattr(p6_mapper, "load_tdx_stock_code_map", lambda: TEST_TDX_STOCK_CODE_MAP)
+    monkeypatch.setattr(p6_mapper, "require_prompt", lambda _name: "{evidence_text}")
+    monkeypatch.setattr(p6_mapper, "build_recent_topic_guardrail", lambda days=5: "")
+    monkeypatch.setattr(
+        p6_mapper,
+        "write_json_artifact",
+        lambda _prefix, data, **_kwargs: written_json.append(data) or "p6.json",
+    )
+    monkeypatch.setattr(p6_mapper, "write_text_artifact", lambda *args, **kwargs: "p6.md")
+    monkeypatch.setattr(
+        p6_mapper,
+        "update_run_manifest",
+        lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+    )
+    monkeypatch.setattr(p6_mapper.time, "sleep", lambda _seconds: None)
+
+    report = p6_mapper.generate_report("电子布证据")
+
+    assert "虚构电子" not in report
+    assert written_json[0]["deep_research"] == ["中国巨石/佰维存储的国产替代能力"]
+    assert written_json[0]["optional_searches"] == ["与佰维存储的供给对比"]
+    metrics = manifest_updates[-1][1]["metrics"]
+    assert metrics["rejected_target_names"] == ["虚构电子"]
+    assert metrics["identity_validation_version"] == 2
+
+
+def test_p6_canonicalizes_honghe_alias_and_wrong_code(monkeypatch):
+    import p6_mapper
+
+    payload = {
+        "events": [
+            {
+                "track_name": "电子布",
+                "event_summary": "宏和电子（002011）受益于低介电电子布需求",
+                "targets": [
+                    {
+                        "name": "宏和电子",
+                        "code": "002011",
+                        "elasticity": "高",
+                        "reasoning": "宏和电子供给弹性",
+                    }
+                ],
+            }
+        ],
+        "optional_searches": ["宏和电子与中国巨石产能对比"],
+        "deep_research": ["宏和电子（002011）Low-Dk量产进展"],
+    }
+    monkeypatch.setattr(p6_mapper, "load_tdx_stock_code_map", lambda: {"宏和科技": "603256"})
+
+    metrics = p6_mapper._apply_tdx_stock_codes(payload)
+
+    target = payload["events"][0]["targets"][0]
+    assert target["name"] == "宏和科技"
+    assert target["code"] == "603256"
+    assert "宏和电子" not in str(payload)
+    assert "宏和科技（603256）" in payload["events"][0]["event_summary"]
+    assert metrics["rejected_targets"] == 0
+    assert metrics["canonical_alias_rewrites"] >= 4
+
+
+def test_p6_records_effective_fallback_model_in_manifest_and_reasoning(monkeypatch):
+    import p6_mapper
+
+    text_artifacts = []
+    manifest_updates = []
+    payload = {
+        "events": [
+            {
+                "track_name": "存储",
+                "event_summary": "存储景气",
+                "targets": [
+                    {"name": name, "elasticity": "中", "reasoning": "有效标的"}
+                    for name in TEST_TDX_STOCK_CODE_MAP
+                ],
+            }
+        ],
+        "optional_searches": [],
+        "deep_research": [],
+    }
+    provenance = {
+        "requested_model": "gpt-5.6-sol",
+        "effective_model": "claude-opus-4-6-thinking",
+        "attempted_models": ["gpt-5.6-sol", "claude-opus-4-6-thinking"],
+        "fallback_used": True,
+        "fallback_reason_category": "rate_limit",
+        "fallback_reason": "429 Too Many Requests",
+    }
+    monkeypatch.setattr(
+        p6_mapper.opus_adapter,
+        "invoke",
+        lambda _prompt: SimpleNamespace(
+            content=json.dumps(payload, ensure_ascii=False),
+            thinking_content="fallback reasoning",
+            response_metadata={"model_provenance": provenance},
+        ),
+    )
+    monkeypatch.setattr(p6_mapper, "load_tdx_stock_code_map", lambda: TEST_TDX_STOCK_CODE_MAP)
+    monkeypatch.setattr(p6_mapper, "require_prompt", lambda _name: "{evidence_text}")
+    monkeypatch.setattr(p6_mapper, "build_recent_topic_guardrail", lambda days=5: "")
+    monkeypatch.setattr(p6_mapper, "write_json_artifact", lambda *args, **kwargs: "p6.json")
+    monkeypatch.setattr(
+        p6_mapper,
+        "write_text_artifact",
+        lambda prefix, content, **kwargs: text_artifacts.append((prefix, content)) or "p6.md",
+    )
+    monkeypatch.setattr(
+        p6_mapper,
+        "update_run_manifest",
+        lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+    )
+    monkeypatch.setattr(p6_mapper.time, "sleep", lambda _seconds: None)
+
+    p6_mapper.generate_report("存储证据")
+
+    reasoning_prefix, reasoning_body = text_artifacts[0]
+    assert reasoning_prefix == "P6_LLM推理链"
+    assert "请求模型: gpt-5.6-sol" in reasoning_body
+    assert "实际模型: claude-opus-4-6-thinking" in reasoning_body
+    metrics_provenance = manifest_updates[-1][1]["metrics"]["model_provenance"]
+    assert metrics_provenance["requested_model"] == provenance["requested_model"]
+    assert metrics_provenance["effective_model"] == provenance["effective_model"]
+    assert metrics_provenance["fallback_reason"] == provenance["fallback_reason"]

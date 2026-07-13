@@ -82,7 +82,10 @@ def test_p6_drops_targets_missing_from_local_canonical_map(monkeypatch):
             "targets": [{"name": "佰维存储", "code": "688525"}],
         }
     ]
-    assert metrics == {"accepted_targets": 1, "rejected_targets": 2, "rejected_events": 1}
+    assert metrics["accepted_targets"] == 1
+    assert metrics["rejected_targets"] == 2
+    assert metrics["rejected_events"] == 1
+    assert metrics["rejected_target_names"] == ["未收录公司", "另一未知公司"]
 
 
 def test_p6_marks_external_evidence_as_untrusted(monkeypatch):

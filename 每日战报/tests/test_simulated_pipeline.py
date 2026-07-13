@@ -566,7 +566,7 @@ class TestOrchestratorSimulation:
         monkeypatch.setattr(
             orchestrator,
             "build_research_plan",
-            lambda p6_mapping, p4_data="", p5_evidence="": {
+            lambda p6_mapping, p4_data="", p5_evidence="", rejected_target_names=None: {
                 "goal": "close the supply chain loop",
                 "triggers": ["explicit_topics", "second_order_chain"],
                 "deep_topics": ["覆铜板涨价如何向A股传导"],
@@ -593,7 +593,7 @@ class TestOrchestratorSimulation:
                 ),
             },
         )
-        def fake_p7a_deep_research_audit(text):
+        def fake_p7a_deep_research_audit(text, **kwargs):
             artifact_store.update_run_manifest(
                 "p7a",
                 status="completed_structured_degraded",

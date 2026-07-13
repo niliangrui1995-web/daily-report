@@ -219,6 +219,8 @@ class TestIndustryDict:
             "MJC": "6871.T",
             "SKC": "011790.KS",
             "Murata": "6981.T",
+            "SK Hynix": "000660.KS",
+            "SK Hynix ADR": "SKHY",
         }
         for name, ticker in expected.items():
             assert VANGUARD_TICKERS[name] == ticker
@@ -335,6 +337,7 @@ class TestIndustryDict:
         from industry_dict import STRATEGIC_GIANTS, SUPER_GIANTS, VANGUARD_TICKERS
         expected = {
             "SK Hynix",
+            "SK Hynix ADR",
             "Micron",
             "AMD",
             "Oracle",

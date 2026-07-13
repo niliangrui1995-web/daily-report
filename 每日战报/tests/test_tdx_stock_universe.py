@@ -11,8 +11,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from p8_extractors import find_tdx_vipdoc
 from tdx_stock_universe import (
     DEFAULT_TDX_ROOT,
+    canonicalize_stock_aliases_in_text,
+    canonicalize_stock_identity,
+    filter_rejected_stock_tree,
+    filter_rejected_stock_lines,
     load_tdx_stock_code_map,
     lookup_tdx_stock_code,
+    normalize_rejected_stock_names,
+    remove_rejected_stock_mentions,
     resolve_tdx_root,
 )
 
@@ -120,3 +126,97 @@ def test_lookup_tdx_stock_code_falls_back_to_company_aliases(tmp_path):
     assert '庄丹' not in stock_code_map
     assert lookup_tdx_stock_code(stock_code_map, '文一科技') == '600520'
     assert lookup_tdx_stock_code(stock_code_map, '博创科技') == '300548'
+
+
+def test_honghe_alias_maps_to_official_short_name_and_code_without_touching_legal_name():
+    assert canonicalize_stock_identity('宏和电子') == ('宏和科技', '603256')
+    assert canonicalize_stock_identity('宏和电子材料科技股份有限公司') == (
+        '宏和电子材料科技股份有限公司',
+        '',
+    )
+
+    normalized, rewrite_count = canonicalize_stock_aliases_in_text(
+        '宏和电子（002011）已量产；宏和电子供给弹性；公司全称为宏和电子材料科技股份有限公司。'
+    )
+
+    assert normalized == (
+        '宏和科技（603256）已量产；宏和科技供给弹性；公司全称为宏和电子材料科技股份有限公司。'
+    )
+    assert rewrite_count == 2
+    assert lookup_tdx_stock_code({'宏和科技': '603256'}, '宏和电子') == '603256'
+
+
+def test_rejected_identity_names_keep_audit_labels_and_scalar_is_atomic():
+    assert normalize_rejected_stock_names(['AI', '中国', '电子', '虚构电子']) == [
+        'AI',
+        '中国',
+        '电子',
+        '虚构电子',
+    ]
+    assert normalize_rejected_stock_names('虚构电子') == ['虚构电子']
+    assert normalize_rejected_stock_names('宏和电子') == []
+
+
+def test_generic_rejected_labels_do_not_erase_normal_industry_prose():
+    text = 'AI服务器需求上升\n中国巨石供给弹性明确\n虚构电子（002011）身份错误'
+
+    filtered, removed = filter_rejected_stock_lines(text, ['中', 'AI', '中国', '虚构电子'])
+
+    assert removed == 1
+    assert 'AI服务器需求上升' in filtered
+    assert '中国巨石供给弹性明确' in filtered
+    assert '虚构电子' not in filtered
+
+
+def test_ascii_rejected_identity_removal_is_case_insensitive():
+    filtered, removed = remove_rejected_stock_mentions(
+        'catl 与中国巨石供给对比',
+        ['CATL'],
+    )
+
+    assert removed == ['CATL']
+    assert filtered == '与中国巨石供给对比'
+
+
+def test_rejected_identity_tree_keeps_valid_nested_evidence():
+    payload = {
+        'topics': [
+            {
+                'topic': '虚构电子/中国巨石供给弹性',
+                'findings': ['虚构电子身份错误', '中国巨石产能有效'],
+            }
+        ]
+    }
+
+    filtered, removed = filter_rejected_stock_tree(payload, ['虚构电子'])
+
+    assert removed == 2
+    assert filtered['topics'][0]['topic'] == '中国巨石供给弹性'
+    assert filtered['topics'][0]['findings'] == ['中国巨石产能有效']
+
+
+def test_rejected_identity_line_filter_keeps_valid_company_clauses():
+    text = (
+        '- A股进展：虚构电子（002011）已量产，国际复材已获认证；中国巨石产能有效。\n'
+        'DEEP_RESEARCH: 中国巨石/虚构电子/国际复材供给弹性'
+    )
+
+    filtered, removed = filter_rejected_stock_lines(text, ['虚构电子'])
+
+    assert removed == 2
+    assert '虚构电子' not in filtered
+    assert '国际复材已获认证' in filtered
+    assert '中国巨石产能有效' in filtered
+    assert '中国巨石' in filtered
+    assert '国际复材供给弹性' in filtered
+
+
+def test_short_rejected_alias_does_not_erase_longer_valid_company_name():
+    filtered, removed = filter_rejected_stock_lines(
+        '宏和科技（603256）是合法公司；宏和（002011）身份错误。',
+        ['宏和'],
+    )
+
+    assert removed == 1
+    assert '宏和科技（603256）是合法公司' in filtered
+    assert '宏和（002011）' not in filtered

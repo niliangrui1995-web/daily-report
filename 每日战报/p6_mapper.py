@@ -20,13 +20,23 @@ import re
 import time
 import logging
 from datetime import datetime
+from typing import Any
 
 from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
 from settings import opus_adapter, OPUS_MODEL, require_prompt
 from industry_dict import OLIGARCH_DICT
 from utils import extract_json_from_llm_response
 from p7_deep_research import build_recent_topic_guardrail
-from tdx_stock_universe import load_tdx_stock_code_map, lookup_tdx_stock_code, resolve_tdx_root
+from native_llm_adapter import get_model_provenance
+from tdx_stock_universe import (
+    IDENTITY_VALIDATION_VERSION,
+    canonicalize_stock_aliases_in_tree,
+    load_tdx_stock_code_map,
+    lookup_tdx_stock_code,
+    normalize_rejected_stock_names,
+    remove_rejected_stock_mentions,
+    resolve_tdx_root,
+)
 
 P6_JSON_RETRY_LIMIT = 1
 P6_OUTPUT_LIMITS = """
@@ -46,14 +56,22 @@ P6_UNTRUSTED_INPUT_NOTICE = """
 """.strip()
 
 
-def _apply_tdx_stock_codes(data: dict) -> dict[str, int]:
+def _apply_tdx_stock_codes(data: dict) -> dict[str, Any]:
     stock_code_map = load_tdx_stock_code_map()
     tdx_root = resolve_tdx_root()
+    canonical_data, canonical_alias_rewrites = canonicalize_stock_aliases_in_tree(data)
+    data.clear()
+    data.update(canonical_data)
     metrics = {
         'accepted_targets': 0,
         'rejected_targets': 0,
         'rejected_events': 0,
+        'rejected_target_names': [],
+        'identity_rewrites': 0,
+        'canonical_alias_rewrites': canonical_alias_rewrites,
+        'identity_validation_version': IDENTITY_VALIDATION_VERSION,
     }
+    rejected_target_names: list[str] = []
     accepted_events = []
     events = data.get('events', [])
     if not isinstance(events, list):
@@ -86,6 +104,8 @@ def _apply_tdx_stock_codes(data: dict) -> dict[str, int]:
                 continue
 
             metrics['rejected_targets'] += 1
+            if name:
+                rejected_target_names.append(name)
             if raw_code:
                 logging.warning(f'⚠️ [P6本地标的拒绝] {name} 未命中 {tdx_root} 股票主数据，已移除模型 code={raw_code}')
             else:
@@ -98,6 +118,28 @@ def _apply_tdx_stock_codes(data: dict) -> dict[str, int]:
             metrics['rejected_events'] += 1
 
     data['events'] = accepted_events
+    normalized_rejections = normalize_rejected_stock_names(rejected_target_names)
+    metrics['rejected_target_names'] = normalized_rejections
+    for field_name in ('optional_searches', 'deep_research'):
+        cleaned_values: list[str] = []
+        raw_values = data.get(field_name, [])
+        if not isinstance(raw_values, list):
+            raw_values = []
+        for raw_value in raw_values:
+            cleaned_value, removed_names = remove_rejected_stock_mentions(
+                raw_value,
+                normalized_rejections,
+            )
+            if removed_names:
+                metrics['identity_rewrites'] += 1
+                logging.warning(
+                    '⚠️ [P6身份约束] %s 移除已拒绝标的：%s',
+                    field_name,
+                    '、'.join(removed_names),
+                )
+            if cleaned_value:
+                cleaned_values.append(cleaned_value)
+        data[field_name] = cleaned_values
     return metrics
 
 
@@ -155,17 +197,30 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
     resp = opus_adapter.invoke(prompt)
     raw_content = resp.content if resp.content else ''
     thinking_content = getattr(resp, 'thinking_content', '')
+    model_provenance = get_model_provenance(resp, OPUS_MODEL)
+    requested_model = str(model_provenance.get('requested_model') or OPUS_MODEL)
+    effective_model = str(model_provenance.get('effective_model') or requested_model)
     
     if thinking_content:
         try:
             thinking_body = (
-                '# P6 GPT-5.6 Sol Max Reasoning 推理链\n\n'
+                '# P6 LLM Reasoning 推理链\n\n'
                 f'> 生成时间: {datetime.now().isoformat()}\n'
+                f'> 请求模型: {requested_model}\n'
+                f'> 实际模型: {effective_model}\n'
+                f'> 使用备模: {bool(model_provenance.get("fallback_used"))}\n'
+                f'> 备模原因: {model_provenance.get("fallback_reason", "") or "无"}\n'
                 f'> 推理链长度: {len(thinking_content)} 字符\n\n---\n\n'
                 f'{thinking_content}'
             )
-            thinking_fname = write_text_artifact('P6_GPT56_SolMax推理链', thinking_body)
-            logging.info(f'🧠 [P6] GPT-5.6 Sol Max 推理链已保存: {thinking_fname} ({len(thinking_content)} 字符)')
+            thinking_fname = write_text_artifact('P6_LLM推理链', thinking_body)
+            logging.info(
+                '🧠 [P6] LLM 推理链已保存: %s (%s 字符, requested=%s, effective=%s)',
+                thinking_fname,
+                len(thinking_content),
+                requested_model,
+                effective_model,
+            )
         except Exception as e:
             logging.warning(f'[P6] 推理链保存失败: {e}')
             thinking_fname = ''
@@ -178,7 +233,10 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
             'p6',
             status='failed_empty_output',
             files={'thinking': thinking_fname} if thinking_fname else None,
-            metrics={'input_chars': len(evidence_text)},
+            metrics={
+                'input_chars': len(evidence_text),
+                'model_provenance': model_provenance,
+            },
         )
         return ''
         
@@ -245,6 +303,7 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
                 'output_chars': len(report),
                 'stock_count': stock_count,
                 'retry_count': _retry_count,
+                'model_provenance': model_provenance,
                 **target_metrics,
             },
         )
@@ -272,7 +331,13 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
                 'p6',
                 status='retrying_parse',
                 files=manifest_files,
-                metrics={'input_chars': len(evidence_text), 'raw_output_chars': len(raw_content), 'error': str(e), 'retry_count': _retry_count},
+                metrics={
+                    'input_chars': len(evidence_text),
+                    'raw_output_chars': len(raw_content),
+                    'error': str(e),
+                    'retry_count': _retry_count,
+                    'model_provenance': model_provenance,
+                },
             )
             time.sleep(5)
             return generate_report(evidence_text, _retry_count=_retry_count + 1)
@@ -280,6 +345,12 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
             'p6',
             status='failed_parse',
             files=manifest_files,
-            metrics={'input_chars': len(evidence_text), 'raw_output_chars': len(raw_content), 'error': str(e), 'retry_count': _retry_count},
+            metrics={
+                'input_chars': len(evidence_text),
+                'raw_output_chars': len(raw_content),
+                'error': str(e),
+                'retry_count': _retry_count,
+                'model_provenance': model_provenance,
+            },
         )
         return ''

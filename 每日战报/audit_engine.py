@@ -21,6 +21,12 @@ from datetime import datetime
 from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
 from settings import pro_adapter, require_prompt
 from industry_dict import ALL_OLIGARCHS_FLAT
+from tdx_stock_universe import (
+    build_rejected_stock_guardrail,
+    filter_rejected_stock_lines,
+    filter_rejected_stock_tree,
+    normalize_rejected_stock_names,
+)
 from utils import extract_json_from_llm_response
 
 AUDIT_JSON_RETRY_LIMIT = 1
@@ -220,7 +226,11 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
         return raw_content
 
 
-def p7a_deep_research_audit(raw_deep_research: str) -> str:
+def p7a_deep_research_audit(
+    raw_deep_research: str,
+    *,
+    rejected_target_names: list[str] | None = None,
+) -> str:
     """P7a 深度研究审计 — 对 P7 原始搜索数据做去重、降噪、结构化汇总。
 
     Why: P7 原始输出通常 40K+ 字，跨 3 轮搜索存在大量重复信息和搜索噪声。
@@ -234,12 +244,22 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
     Returns:
         str: 审计汇总后的 Markdown 报告（纯文本，不含 JSON）
     """
+    rejected_names = normalize_rejected_stock_names(rejected_target_names)
+    raw_deep_research, input_identity_lines_removed = filter_rejected_stock_lines(
+        raw_deep_research,
+        rejected_names,
+    )
+    input_identity_metrics = {
+        'rejected_target_names': rejected_names,
+        'rejected_identity_items_removed': input_identity_lines_removed,
+    }
+
     if not raw_deep_research or len(raw_deep_research.strip()) < 200:
         logging.warning('[P7a 审计] P7 深研数据不足 200 字，跳过审计直接透传')
         update_run_manifest(
             'p7a',
             status='skipped_short_input',
-            metrics={'input_chars': len(raw_deep_research or '')},
+            metrics={'input_chars': len(raw_deep_research or ''), **input_identity_metrics},
         )
         return raw_deep_research or ''
 
@@ -255,7 +275,7 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
         update_run_manifest(
             'p7a',
             status='failed_missing_prompt',
-            metrics={'input_chars': len(raw_deep_research), 'error': str(e)},
+            metrics={'input_chars': len(raw_deep_research), 'error': str(e), **input_identity_metrics},
         )
         return raw_deep_research
 
@@ -264,6 +284,9 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
         vanguard_list=vanguard_list,
         raw_deep_research=raw_deep_research,
     )
+    identity_guardrail = build_rejected_stock_guardrail(rejected_names)
+    if identity_guardrail:
+        prompt = f'{identity_guardrail}\n\n{prompt}'
 
     t0 = time.time()
     try:
@@ -275,7 +298,7 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
         update_run_manifest(
             'p7a',
             status='failed_invoke',
-            metrics={'input_chars': len(raw_deep_research), 'error': str(e)},
+            metrics={'input_chars': len(raw_deep_research), 'error': str(e), **input_identity_metrics},
         )
         return raw_deep_research
 
@@ -287,6 +310,7 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
         failure_metrics = {
             'input_chars': len(raw_deep_research),
             'elapsed_seconds': round(elapsed, 1),
+            **input_identity_metrics,
         }
         last_error_category = getattr(pro_adapter, 'last_error_category', '')
         last_error_message = getattr(pro_adapter, 'last_error_message', '')
@@ -344,6 +368,27 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
         structured_degraded = True
         degrade_reason = 'missing_markdown_separator'
 
+    json_identity_items_removed = 0
+    if json_data:
+        json_data, json_identity_items_removed = filter_rejected_stock_tree(
+            json_data,
+            rejected_names,
+        )
+    markdown_text, output_identity_lines_removed = filter_rejected_stock_lines(
+        markdown_text,
+        rejected_names,
+    )
+    rejected_identity_items_removed = (
+        input_identity_lines_removed
+        + json_identity_items_removed
+        + output_identity_lines_removed
+    )
+    if rejected_identity_items_removed:
+        logging.warning(
+            '[P7a 身份约束] 移除 %s 个含本地拒绝标的的输入/输出项',
+            rejected_identity_items_removed,
+        )
+
     json_path = ''
     if json_data:
         try:
@@ -378,6 +423,8 @@ def p7a_deep_research_audit(raw_deep_research: str) -> str:
         'compression_ratio': round(compression_ratio, 2),
         'elapsed_seconds': round(elapsed, 1),
         'topics_count': len(json_data.get('topics', [])) if isinstance(json_data, dict) else 0,
+        'rejected_target_names': rejected_names,
+        'rejected_identity_items_removed': rejected_identity_items_removed,
     }
     if structured_degraded:
         manifest_metrics['structured_degraded'] = True

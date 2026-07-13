@@ -13,6 +13,11 @@ from datetime import datetime, timedelta
 
 from artifact_store import extract_timestamp_from_name
 from settings import OUTPUT_DIR
+from tdx_stock_universe import (
+    filter_rejected_stock_lines,
+    normalize_rejected_stock_names,
+    remove_rejected_stock_mentions,
+)
 
 P7_TOPIC_PREFIX = "## \u6df1\u5ea6\u7814\u7a76\uff1a"
 # Why: 深度研究是研究型搜索，不需要时间窗口限制
@@ -351,9 +356,34 @@ def build_research_plan(
     *,
     p4_data: str = "",
     p5_evidence: str = "",
+    rejected_target_names: list[str] | None = None,
 ) -> dict[str, object]:
-    raw_topics = pick_deep_topics(p6_mapping)
-    search_queries = extract_search_queries(p6_mapping)
+    rejected_names = normalize_rejected_stock_names(rejected_target_names)
+    identity_rewrites = 0
+
+    raw_topics: list[str] = []
+    for raw_topic in pick_deep_topics(p6_mapping):
+        topic, removed_names = remove_rejected_stock_mentions(raw_topic, rejected_names)
+        if removed_names:
+            identity_rewrites += 1
+            logging.warning(
+                "[P7] removed rejected stock identities from topic: %s",
+                ", ".join(removed_names),
+            )
+        if len(topic) >= 10:
+            raw_topics.append(topic)
+
+    search_queries: list[str] = []
+    for raw_query in extract_search_queries(p6_mapping):
+        query, removed_names = remove_rejected_stock_mentions(raw_query, rejected_names)
+        if removed_names:
+            identity_rewrites += 1
+            logging.warning(
+                "[P7] removed rejected stock identities from supplement query: %s",
+                ", ".join(removed_names),
+            )
+        if len(query) >= 8:
+            search_queries.append(query)
     recent_history = _recent_deep_topic_history(days=5)
 
     skipped_recent_topics: list[str] = []
@@ -411,6 +441,8 @@ def build_research_plan(
         "round_backtracks": round_backtracks,
         "skipped_recent_topics": skipped_recent_topics,
         "recent_topics": [item["topic"] for item in recent_history[:10]],
+        "rejected_target_names": rejected_names,
+        "identity_rewrites": identity_rewrites,
     }
 
 
@@ -967,6 +999,7 @@ def iterative_deep_search(
 
 def run_deep_research(plan: dict[str, object]) -> dict[str, object]:
     topics = list(plan.get("deep_topics") or [])
+    rejected_names = normalize_rejected_stock_names(plan.get("rejected_target_names"))
     if not plan.get("should_run_p7") or not topics:
         return {
             "status": "skipped_not_triggered",
@@ -986,6 +1019,7 @@ def run_deep_research(plan: dict[str, object]) -> dict[str, object]:
 
     topic_results: list[dict[str, object]] = []
     all_sections: list[str] = []
+    rejected_identity_lines_removed = 0
     max_workers = min(3, len(topics))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -1016,7 +1050,15 @@ def run_deep_research(plan: dict[str, object]) -> dict[str, object]:
                 }
             topic_results.append(result)
             if result.get("text"):
-                all_sections.append(str(result["text"]))
+                filtered_text, removed_count = filter_rejected_stock_lines(
+                    result["text"],
+                    rejected_names,
+                )
+                result["text"] = filtered_text
+                result["rejected_identity_lines_removed"] = removed_count
+                rejected_identity_lines_removed += removed_count
+                if filtered_text:
+                    all_sections.append(filtered_text)
 
     combined = "\n\n".join(all_sections).strip()
     return {
@@ -1030,4 +1072,6 @@ def run_deep_research(plan: dict[str, object]) -> dict[str, object]:
         "triggers": list(plan.get("triggers") or []),
         "topic_results": topic_results,
         "skipped_recent_topics": list(plan.get("skipped_recent_topics") or []),
+        "rejected_target_names": rejected_names,
+        "rejected_identity_lines_removed": rejected_identity_lines_removed,
     }

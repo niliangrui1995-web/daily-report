@@ -50,6 +50,7 @@ from p8_technical import (
 )
 from p9_reporter import p9_risk_analysis, send_report_email
 from search_engine import gemini_search
+from tdx_stock_universe import IDENTITY_VALIDATION_VERSION, normalize_rejected_stock_names
 from agent_assistant import diagnose_failure, review_final_report
 
 CONTROL_STAGE_START = {
@@ -189,6 +190,42 @@ def _context_p6_input_sha256(context: dict[str, Any]) -> str:
     return compute_file_sha256(context.get("ckpt", {}).get("files", {}).get("p6", ""))
 
 
+def _load_p6_identity_validation(metrics: dict[str, Any] | None = None) -> dict[str, Any]:
+    if metrics is None:
+        manifest = load_run_manifest()
+        metrics = manifest.get("stages", {}).get("p6", {}).get("metrics", {})
+    if not isinstance(metrics, dict):
+        metrics = {}
+    rejected_names = normalize_rejected_stock_names(metrics.get("rejected_target_names"))
+    try:
+        rejected_targets = int(metrics.get("rejected_targets") or 0)
+    except (TypeError, ValueError):
+        rejected_targets = 0
+    try:
+        validation_version = int(metrics.get("identity_validation_version") or 0)
+    except (TypeError, ValueError):
+        validation_version = 0
+    if validation_version >= IDENTITY_VALIDATION_VERSION:
+        complete = True
+        reason = ""
+    elif validation_version == 0 and rejected_targets > 0 and not rejected_names:
+        complete = False
+        reason = "legacy_rejections_missing_names"
+    elif validation_version == 0:
+        complete = False
+        reason = "identity_validation_unversioned"
+    else:
+        complete = False
+        reason = "identity_validation_outdated"
+    return {
+        "rejected_target_names": rejected_names,
+        "rejected_targets": rejected_targets,
+        "identity_validation_version": validation_version,
+        "complete": complete,
+        "reason": reason,
+    }
+
+
 def _parse_flags(argv: list[str]) -> tuple[bool, bool]:
     force_run = "--force" in argv or "--force-run" in argv
     force_restart = "--force" in argv or "--force-restart" in argv
@@ -214,6 +251,7 @@ def _build_context(now: datetime, run_ts: str, ckpt: dict, resume_from: str) -> 
         "p3_stats": {},
         "p4_data": "",
         "p6_mapping": "",
+        "rejected_target_names": [],
         "p7_deep": "",
         "p7a_audited": "",
         "p75_supplement": "",
@@ -501,10 +539,17 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
     resume_from = context["resume_from"]
     ckpt = context["ckpt"]
 
+    identity_validation = _load_p6_identity_validation(ckpt.get("p6_metrics", {}))
     if resume_from in {"p6", "p8_resume", "p9_resume"} and ckpt["files"].get("p6"):
         if _checkpoint_older_than_any(ckpt, "p6", ("p5", "p4", "p3", "p2")):
             logging.warning("[P6] checkpoint is older than upstream evidence; rerunning mapping")
+        elif not identity_validation["complete"]:
+            logging.warning(
+                "[P6] checkpoint identity validation incomplete (%s); rerunning P6",
+                identity_validation["reason"],
+            )
         else:
+            context["rejected_target_names"] = identity_validation["rejected_target_names"]
             context["p6_mapping"] = _read_text_checkpoint(ckpt["files"].get("p6", ""), "P6 mapping")
             context["p5_evidence"] = context["p5_evidence"] or _read_text_checkpoint(ckpt["files"].get("p5", ""), "P5 audit")
             context["p4_data"] = _read_text_checkpoint(ckpt["files"].get("p4", ""), "P4 market snapshot")
@@ -581,6 +626,13 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
             files={"md": p6_path},
             metrics={"mapping_chars": len(context["p6_mapping"])},
         )
+        identity_validation = _load_p6_identity_validation()
+        context["rejected_target_names"] = identity_validation["rejected_target_names"]
+        context["ckpt"]["p6_metrics"] = {
+            "rejected_target_names": identity_validation["rejected_target_names"],
+            "rejected_targets": identity_validation["rejected_targets"],
+            "identity_validation_version": identity_validation["identity_validation_version"],
+        }
 
 
 def _stage_research(context: dict[str, Any]) -> None:
@@ -588,11 +640,21 @@ def _stage_research(context: dict[str, Any]) -> None:
         return
 
     resume_from = context["resume_from"]
+    rejected_target_names = normalize_rejected_stock_names(
+        context.get("rejected_target_names")
+    )
+    if not rejected_target_names:
+        identity_validation = _load_p6_identity_validation(
+            context.get("ckpt", {}).get("p6_metrics", {})
+        )
+        rejected_target_names = identity_validation["rejected_target_names"]
+        context["rejected_target_names"] = rejected_target_names
     try:
         research_plan = build_research_plan(
             context["p6_mapping"],
             p4_data=context.get("p4_data", ""),
             p5_evidence=context.get("p5_evidence", ""),
+            rejected_target_names=rejected_target_names,
         )
     except Exception as exc:
         logging.error("[P7] research plan failed; skipping optional research layers: %s", exc)
@@ -658,6 +720,9 @@ def _stage_research(context: dict[str, Any]) -> None:
                     try:
                         p7_result = p7_future.result()
                         context["p7_deep"] = p7_result.get("text", "")
+                        context["p7_rejected_identity_lines_removed"] = int(
+                            p7_result.get("rejected_identity_lines_removed", 0) or 0
+                        )
                     except Exception as exc:
                         logging.error("[P7] deep research failed: %s", exc)
                         context["p7_deep"] = ""
@@ -707,7 +772,15 @@ def _stage_research(context: dict[str, Any]) -> None:
             "p7",
             status="completed",
             files=p7_files,
-            metrics={"output_chars": len(context["p7_deep"]), **p6_hash_metrics},
+            metrics={
+                "output_chars": len(context["p7_deep"]),
+                "rejected_target_names": rejected_target_names,
+                "rejected_identity_lines_removed": context.get(
+                    "p7_rejected_identity_lines_removed",
+                    0,
+                ),
+                **p6_hash_metrics,
+            },
         )
 
     if context.get("p7a_audited"):
@@ -717,7 +790,10 @@ def _stage_research(context: dict[str, Any]) -> None:
             try:
                 if p6_hash_metrics:
                     update_run_manifest("p7a", status="running", metrics=p6_hash_metrics)
-                context["p7a_audited"] = p7a_deep_research_audit(context["p7_deep"])
+                context["p7a_audited"] = p7a_deep_research_audit(
+                    context["p7_deep"],
+                    rejected_target_names=rejected_target_names,
+                )
             except Exception as exc:
                 logging.error("[P7a] audit failed unexpectedly; passing through raw P7 data: %s", exc)
                 update_run_manifest(
@@ -905,6 +981,7 @@ def _stage_report(context: dict[str, Any]) -> None:
                 p2_x_intel_data=context.get("p2_data", ""),
                 p3_intel_data=context.get("p3_data", ""),
                 p4_yfinance=context.get("p4_data", ""),
+                rejected_target_names=context.get("rejected_target_names", []),
             )
         except Exception as exc:
             logging.error("[P9] report generation failed: %s", exc)

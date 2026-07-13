@@ -204,7 +204,7 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
 
         # 60日前高
         high_60 = max(highs[-60:])
-        dist_to_60d_high = (latest_c - high_60)/high_60 * 100
+        dist_to_60d_high = (latest_c - high_60)/high_60 * 100 if high_60 > 0 else 0.0
         breakouts = "无"
         if latest_c >= max(highs[-20:]) * 0.98:
             breakouts = "🔥 逼近20日新高"
@@ -218,13 +218,18 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
         ma60 = sum(closes[-60:])/60
         min_ma = min(ma5, ma10, ma20, ma60)
         ma_spread = (max(ma5, ma10, ma20, ma60) - min_ma)/min_ma*100 if min_ma > 0 else 0
+        
+        ma5_pct = (latest_c - ma5)/ma5*100 if ma5 > 0 else 0.0
+        ma10_pct = (latest_c - ma10)/ma10*100 if ma10 > 0 else 0.0
+        ma20_pct = (latest_c - ma20)/ma20*100 if ma20 > 0 else 0.0
+        ma60_pct = (latest_c - ma60)/ma60*100 if ma60 > 0 else 0.0
 
         # 量能
         avg_vol_5d = sum(vols[-5:])/5 if vols[-5:] else 1
         avg_vol_20d = sum(vols[-20:])/20 if vols[-20:] else 1
         avg_vol_60d = sum(vols[-60:])/60 if vols[-60:] else 1
-        vr = avg_vol_5d / avg_vol_20d
-        vs = avg_vol_5d / avg_vol_60d
+        vr = avg_vol_5d / avg_vol_20d if avg_vol_20d > 0 else 1.0
+        vs = avg_vol_5d / avg_vol_60d if avg_vol_60d > 0 else 1.0
         vol_desc = "明显放量" if vr > 1.5 else ("温和缩量" if vr < 0.7 else "正常")
 
         # 波动
@@ -272,8 +277,8 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
 - 所属赛道：{track_label}
 - 收盘 {latest_c:.2f} 元（{latest_r['date'][4:6]}-{latest_r['date'][6:8]}）
 - 涨跌：近20日 {chg_1m:+.1f}% | 近60日 {chg_3m:+.1f}% | 250日分位 {int(pct_250d)}%（{pos_desc}）
-- 距60日前高 {dist_to_60d_high:+.1f}%（回撤 {abs(dist_to_60d_high):.1f}%）| 突破：{breakouts}
-- 均线：5日{(latest_c-ma5)/ma5*100:+.1f}%，10日{(latest_c-ma10)/ma10*100:+.1f}%，20日{(latest_c-ma20)/ma20*100:+.1f}%，60日{(latest_c-ma60)/ma60*100:+.1f}% | 密集度 {ma_spread:.1f}%
+- 距60日前前高 {dist_to_60d_high:+.1f}%（回撤 {abs(dist_to_60d_high):.1f}%）| 突破：{breakouts}
+- 均线：5日{ma5_pct:+.1f}%，10日{ma10_pct:+.1f}%，20日{ma20_pct:+.1f}%，60日{ma60_pct:+.1f}% | 密集度 {ma_spread:.1f}%
 - 量能：{vol_desc}（量比 {vr:.2f}，5日/60日 {vs:.2f}）| 换手：未提供
 - 波动：布林宽 {boll_w:.1f}%{b_desc} | ATR {atr:.1f}% 压缩比 {ac:.2f}（{c_desc}）
 - 动量：MACD {macd_stat}({macd_val:.3f}) | RSI {rsi_val}（{rsi_desc}）| KDJ J={kdj_j}（{kdj_desc}）| 阳线 {int(yang_ratio)}%

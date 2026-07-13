@@ -310,6 +310,9 @@ class TestProviderErrorClassification:
         assert result.content == '{"partial": true'
         assert adapter.last_error_category == "incomplete_response"
         assert adapter.last_error_message == "max_output_tokens"
+        provenance = result.response_metadata["model_provenance"]
+        assert provenance["final_error_category"] == "incomplete_response"
+        assert provenance["final_error"] == "max_output_tokens"
 
     def test_openai_responses_retries_transient_incomplete_response(self, monkeypatch):
         import requests
@@ -524,6 +527,110 @@ class TestProviderErrorClassification:
         assert len(calls) == 1
         assert adapter.last_error_category == "permission_denied"
         assert sleeps == []
+
+    def test_gpt56_sol_fallback_to_opus46_on_quota_error(self, monkeypatch):
+        from native_llm_adapter import NativeLLMAdapter
+
+        calls = []
+
+        class FailingOpenAIClient:
+            def create(self, **kwargs):
+                calls.append(kwargs.get('model'))
+                if len(calls) == 1:
+                    raise Exception("Insufficient quota or credit balance (401)")
+                class FakeChoice:
+                    message = SimpleNamespace(content="fallback success", reasoning_content="")
+                return SimpleNamespace(choices=[FakeChoice()])
+
+        class FakeCompletions:
+            chat = SimpleNamespace(completions=FailingOpenAIClient())
+
+        adapter = NativeLLMAdapter(model="gpt-5.6-sol", api_key="secret", max_retries=1)
+        object.__setattr__(adapter, "_openai_client", FakeCompletions())
+
+        result = adapter.invoke("hello")
+        assert result.content == "fallback success"
+        assert calls == ["gpt-5.6-sol", "claude-opus-4-6-thinking"]
+        assert adapter.model == "gpt-5.6-sol"
+        provenance = result.response_metadata["model_provenance"]
+        assert provenance["requested_model"] == "gpt-5.6-sol"
+        assert provenance["effective_model"] == "claude-opus-4-6-thinking"
+        assert provenance["attempted_models"] == [
+            "gpt-5.6-sol",
+            "claude-opus-4-6-thinking",
+        ]
+        assert provenance["fallback_used"] is True
+        assert provenance["fallback_reason_category"] == "risk_control"
+        assert "Insufficient quota" in provenance["fallback_reason"]
+        assert provenance["final_error_category"] == ""
+        assert provenance["final_error"] == ""
+
+    def test_gpt56_sol_fallback_records_backup_failure(self, monkeypatch):
+        from native_llm_adapter import NativeLLMAdapter
+
+        calls = []
+
+        class FailingOpenAIClient:
+            def create(self, **kwargs):
+                calls.append(kwargs.get('model'))
+                if len(calls) == 1:
+                    raise Exception("Insufficient quota or credit balance (401)")
+                raise Exception("request timeout")
+
+        class FakeCompletions:
+            chat = SimpleNamespace(completions=FailingOpenAIClient())
+
+        adapter = NativeLLMAdapter(model="gpt-5.6-sol", api_key="secret", max_retries=1)
+        object.__setattr__(adapter, "_openai_client", FakeCompletions())
+
+        result = adapter.invoke("hello")
+
+        assert result.content == ""
+        assert calls == ["gpt-5.6-sol", "claude-opus-4-6-thinking"]
+        provenance = result.response_metadata["model_provenance"]
+        assert provenance["fallback_reason_category"] == "risk_control"
+        assert provenance["final_error_category"] == "timeout"
+        assert "timeout" in provenance["final_error"]
+
+    def test_partial_model_provenance_is_normalized(self):
+        from native_llm_adapter import get_model_provenance
+
+        response_only = get_model_provenance(
+            SimpleNamespace(
+                content="ok",
+                response_metadata={"model_provenance": {"response_model": "claude-server"}},
+            ),
+            "gpt-5.6-sol",
+        )
+        requested_only = get_model_provenance(
+            SimpleNamespace(
+                content="ok",
+                response_metadata={"model_provenance": {"requested_model": "custom-request"}},
+            ),
+            "gpt-5.6-sol",
+        )
+        fallback_only = get_model_provenance(
+            SimpleNamespace(
+                content="ok",
+                response_metadata={
+                    "model_provenance": {
+                        "fallback_used": True,
+                        "fallback_model": "claude-opus-4-6-thinking",
+                    }
+                },
+            ),
+            "gpt-5.6-sol",
+        )
+
+        assert response_only["effective_model"] == "claude-server"
+        assert requested_only["attempted_models"] == ["custom-request"]
+        assert requested_only["effective_model"] == "custom-request"
+        assert fallback_only["attempted_models"] == [
+            "gpt-5.6-sol",
+            "claude-opus-4-6-thinking",
+        ]
+        assert fallback_only["effective_model"] == "claude-opus-4-6-thinking"
+
 
 
 class TestAuditFailureTelemetry:

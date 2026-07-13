@@ -122,3 +122,51 @@ def test_p7a_marks_structured_degradation_when_json_parse_fails(monkeypatch):
     assert manifest_updates[-1][1]["metrics"]["structured_degraded"] is True
     assert manifest_updates[-1][1]["metrics"]["degrade_reason"].startswith("json_parse_failed:")
     assert manifest_updates[-1][1]["metrics"]["raw_json_attempt_chars"] == len("not-json")
+
+
+def test_p7a_canonicalizes_known_alias_in_json_and_markdown(monkeypatch):
+    import audit_engine
+
+    raw_content = (
+        '{"topics":['
+        '{"title":"宏和电子/国际复材供给弹性","beneficiaries":["宏和电子","国际复材"]},'
+        '{"title":"中国巨石供给弹性","beneficiaries":["中国巨石"]}'
+        ']}'
+        "\n===MARKDOWN===\n"
+        "- 宏和电子（002011）已实现量产；国际复材认证有效。\n"
+        "- 中国巨石（600176）供给弹性明确。\n"
+    )
+    json_artifacts = []
+    manifest_updates = []
+
+    monkeypatch.setattr(
+        audit_engine.pro_adapter,
+        "invoke",
+        lambda _prompt: SimpleNamespace(content=raw_content, thinking_content=""),
+    )
+    monkeypatch.setattr(audit_engine, "require_prompt", lambda _name: "{raw_deep_research}")
+    monkeypatch.setattr(
+        audit_engine,
+        "write_json_artifact",
+        lambda _prefix, data, **_kwargs: json_artifacts.append(data) or "p7a.json",
+    )
+    monkeypatch.setattr(audit_engine, "write_text_artifact", lambda *args, **kwargs: "p7a.md")
+    monkeypatch.setattr(
+        audit_engine,
+        "update_run_manifest",
+        lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+    )
+
+    result = audit_engine.p7a_deep_research_audit(
+        "P7 research input " * 20,
+        rejected_target_names=["宏和电子"],
+    )
+
+    assert "宏和电子" not in result
+    assert "宏和科技（603256）已实现量产" in result
+    assert "中国巨石" in result
+    assert "国际复材认证有效" in result
+    assert "宏和电子" not in str(json_artifacts[-1])
+    assert "宏和科技" in str(json_artifacts[-1])
+    assert "国际复材" in str(json_artifacts[-1])
+    assert manifest_updates[-1][1]["metrics"]["rejected_identity_items_removed"] == 0

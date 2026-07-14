@@ -826,7 +826,11 @@ class NativeLLMAdapter(RunnableSerializable):
     def _call_grok_native(self, system_prompt: str, user_prompt: str) -> str:
         import requests
 
-        url = "https://api.x.ai/v1/responses"
+        base = (self.base_url or 'https://api.x.ai').rstrip('/')
+        if base.endswith('/v1'):
+            url = f"{base}/responses"
+        else:
+            url = f"{base}/v1/responses"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"

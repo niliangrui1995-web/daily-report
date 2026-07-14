@@ -45,7 +45,10 @@ target-version = "py314"
 exclude = ["每日热点输出"]
 
 [tool.ruff.lint]
-select = ["E9", "F63", "F7", "F82"]
+select = ["E9", "F", "B", "C90"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 35
 
 [tool.coverage.run]
 branch = true

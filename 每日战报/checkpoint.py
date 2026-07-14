@@ -54,7 +54,7 @@ def _pick_existing_file(path: str, *, require_nonempty: bool = False) -> str:
     return path
 
 
-def _file_mtime(files: dict[str, str], file_key: str) -> float:
+def get_file_mtime(files: dict[str, str], file_key: str) -> float:
     path = files.get(file_key, "")
     if not path:
         return 0.0
@@ -77,11 +77,11 @@ def compute_file_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def _is_older_than_any(files: dict[str, str], file_key: str, upstream_keys: tuple[str, ...]) -> bool:
-    target_mtime = _file_mtime(files, file_key)
+def is_older_than_any(files: dict[str, str], file_key: str, upstream_keys: tuple[str, ...]) -> bool:
+    target_mtime = get_file_mtime(files, file_key)
     if not target_mtime:
         return False
-    return any(_file_mtime(files, upstream_key) > target_mtime for upstream_key in upstream_keys)
+    return any(get_file_mtime(files, upstream_key) > target_mtime for upstream_key in upstream_keys)
 
 
 def _manifest_p6_input_hashes(manifest: dict) -> dict[str, str]:
@@ -103,11 +103,19 @@ def _p6_input_hash_is_stale(
     p6_input_hashes: dict[str, str],
     stage_name: str,
 ) -> bool:
+    return not p6_input_hash_matches(files, p6_input_hashes, stage_name)
+
+
+def p6_input_hash_matches(
+    files: dict[str, str],
+    p6_input_hashes: dict[str, str],
+    stage_name: str,
+) -> bool:
     if not files.get(stage_name):
-        return False
+        return True
     expected = str(p6_input_hashes.get(stage_name) or "").strip().lower()
     actual = compute_file_sha256(files.get("p6", ""))
-    return not expected or not actual or expected != actual
+    return bool(expected and actual and expected == actual)
 
 
 def _drop_stale_downstream_files(
@@ -123,7 +131,7 @@ def _drop_stale_downstream_files(
         not files.get("p7")
         or p7_stale
         or p7a_hash_stale
-        or _is_older_than_any(files, "p7a", ("p7",))
+        or is_older_than_any(files, "p7a", ("p7",))
     )
     p6_dependency_stale = p7_hash_stale or p75_hash_stale or p7a_hash_stale
 
@@ -131,12 +139,12 @@ def _drop_stale_downstream_files(
         if stale:
             files.pop(file_key, None)
 
-    if p6_dependency_stale or (files.get("p8") and _is_older_than_any(files, "p8", ("p6",))):
+    if p6_dependency_stale or (files.get("p8") and is_older_than_any(files, "p8", ("p6",))):
         files.pop("p8", None)
 
     if p6_dependency_stale or (
         files.get("war_report")
-        and _is_older_than_any(
+        and is_older_than_any(
             files,
             "war_report",
             ("p8", "p75", "p7a", "p7", "p6", "p5", "p4", "p3", "p2"),

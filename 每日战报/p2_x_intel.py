@@ -57,6 +57,11 @@ GROK_MAX_OUTPUT_TOKENS = _env_positive_int('GROK_MAX_OUTPUT_TOKENS', 4096)
 P2_TOTAL_BUDGET_SECONDS = 420
 P2_REQUEST_TIMEOUT_SECONDS = 75
 P2_MIN_REMAINING_SECONDS = 10
+_X_LEAK_BLOCK_PATTERN = re.compile(r'<x_leaks>.*?</x_leaks>', flags=re.DOTALL)
+_X_STATUS_ID_PATTERN = re.compile(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/[^/]+/status/(\d+)')
+_FAKE_TWEET_ID_PATTERN = re.compile(
+    r'(01234|12345|23456|34567|45678|56789|67890|98765|87654|76543|65432|54321|43210|0000|1111)'
+)
 
 INDUSTRY_SCAN_KEYWORDS = [
     'Synopsys Cadence ARM Siemens EDA semiconductor IP',
@@ -121,6 +126,24 @@ def _sleep_with_budget(wait: float, start_time: float, max_total_seconds: int | 
         return False
     time.sleep(wait)
     return True
+
+
+def _filter_x_leak_blocks(content: str, seen_tweet_ids: set[str]) -> str:
+    filtered_blocks: list[str] = []
+    for match in _X_LEAK_BLOCK_PATTERN.finditer(content or ''):
+        block = match.group(0).strip()
+        block_valid = True
+        for tweet_id in _X_STATUS_ID_PATTERN.findall(block):
+            if tweet_id in seen_tweet_ids:
+                block_valid = False
+                logging.info(f'🔄   -> 剔除跨批次重复爆发：重复ID({tweet_id})')
+            seen_tweet_ids.add(tweet_id)
+            if _FAKE_TWEET_ID_PATTERN.search(tweet_id):
+                block_valid = False
+                logging.warning(f'🚫   -> 剔除幻觉：连号假ID({tweet_id})')
+        if block_valid:
+            filtered_blocks.append(block)
+    return '\n'.join(filtered_blocks)
 
 
 def collect_from_x(
@@ -292,40 +315,7 @@ def collect_from_x(
                 if not content:
                     raise ValueError('XAI API返回空内容')
 
-                lines = content.split('\n')
-                filtered_content = []
-                block_buffer = []
-                in_block = False
-                block_valid = True
-
-                for line in lines:
-                    if '<x_leaks>' in line:
-                        in_block = True
-                        block_buffer = [line]
-                        block_valid = True
-                        continue
-                    if '</x_leaks>' in line:
-                        if in_block:
-                            block_buffer.append(line)
-                            if block_valid:
-                                filtered_content.extend(block_buffer)
-                        in_block = False
-                        block_buffer = []
-                        continue
-                    if in_block:
-                        block_buffer.append(line)
-                        match = re.search(r'https?://(?:www\.)?(?:twitter\.com|x\.com)/[^/]+/status/(\d+)', line)
-                        if match:
-                            tweet_id = match.group(1)
-                            if tweet_id in seen_tweet_ids:
-                                block_valid = False
-                                logging.info(f'🔄   -> 剔除跨批次重复爆发：重复ID({tweet_id})')
-                            seen_tweet_ids.add(tweet_id)
-                            if re.search(r'(01234|12345|23456|34567|45678|56789|67890|98765|87654|76543|65432|54321|43210|0000|1111)', tweet_id):
-                                block_valid = False
-                                logging.warning(f'🚫   -> 剔除幻觉：连号假ID({tweet_id})')
-
-                chunk_final = '\n'.join(filtered_content)
+                chunk_final = _filter_x_leak_blocks(content, seen_tweet_ids)
                 if chunk_final.strip():
                     all_filtered_leaks.append(chunk_final)
                     successful_chunks += 1

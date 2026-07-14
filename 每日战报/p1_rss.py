@@ -304,6 +304,41 @@ def _rss_name_to_category(name: str) -> str:
         return '产业链动态'
     return '综合RSS'
 
+
+def _tokenize_entry_text(text: str) -> set[str]:
+    english_tokens = re.findall(r'[a-zA-Z0-9]+', text.lower())
+    chinese_tokens = re.findall(r'[\u4e00-\u9fa5]', text)
+    return set(english_tokens + chinese_tokens)
+
+
+def _deduplicate_entries(entries: list[dict], threshold: float = 0.45) -> list[dict]:
+    unique_entries: list[dict] = []
+    unique_sets: list[set[str]] = []
+    for entry in entries:
+        text = f"{entry.get('title', '')} {entry.get('content', '')[:100]}"
+        tokens = _tokenize_entry_text(text)
+        if not tokens:
+            unique_entries.append(entry)
+            unique_sets.append(set())
+            continue
+
+        for index, unique_tokens in enumerate(unique_sets):
+            if not unique_tokens:
+                continue
+            intersection = len(tokens.intersection(unique_tokens))
+            union = len(tokens.union(unique_tokens))
+            if union and intersection / union > threshold:
+                new_source = entry.get('source', '')
+                existing = unique_entries[index]
+                if new_source and new_source not in existing.get('source', ''):
+                    existing['source'] = f"{existing.get('source', '')}, {new_source}"
+                break
+        else:
+            unique_entries.append(entry)
+            unique_sets.append(tokens)
+    return unique_entries
+
+
 def collect_from_rss(backtrack: str = '24h') -> tuple[list[dict], dict]:
     hours = parse_backtrack_hours(backtrack)
     all_results = []
@@ -387,41 +422,6 @@ def collect_from_rss(backtrack: str = '24h') -> tuple[list[dict], dict]:
                 
     logging.info(f'\n[P1 Phase 1 完毕] 成功: {len(stats["success"])}/{stats["total"]} | 发现: {len(all_entries)} 篇')
     
-    def _deduplicate_entries(entries: list[dict], threshold: float = 0.45) -> list[dict]:
-        import re
-        def _tokenize(text: str) -> set:
-            eng = re.findall(r'[a-zA-Z0-9]+', text.lower())
-            chn = re.findall(r'[\u4e00-\u9fa5]', text)
-            return set(eng + chn)
-            
-        unique_entries = []
-        unique_sets = []
-        for entry in entries:
-            is_duplicate = False
-            text_a = f"{entry.get('title', '')} {entry.get('content', '')[:100]}"
-            set_a = _tokenize(text_a)
-            if not set_a:
-                unique_entries.append(entry)
-                unique_sets.append(set())
-                continue
-            for idx, u_set in enumerate(unique_sets):
-                if not u_set:
-                    continue
-                intersection = len(set_a.intersection(u_set))
-                union = len(set_a.union(u_set))
-                jaccard = intersection / union if union > 0 else 0
-                if jaccard > threshold:
-                    is_duplicate = True
-                    new_src = entry.get('source', '')
-                    u_entry = unique_entries[idx]
-                    if new_src and new_src not in u_entry.get('source', ''):
-                        u_entry['source'] = f"{u_entry.get('source', '')}, {new_src}"
-                    break
-            if not is_duplicate:
-                unique_entries.append(entry)
-                unique_sets.append(set_a)
-        return unique_entries
-        
     if all_entries:
         original_count = len(all_entries)
         all_entries = _deduplicate_entries(all_entries)

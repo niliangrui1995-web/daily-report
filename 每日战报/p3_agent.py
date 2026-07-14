@@ -10,7 +10,7 @@ from datetime import datetime
 from artifact_store import write_text_artifact
 from config import P3_JINNANG_1_MAX_TARGETS, P3_JINNANG_1_RECOVERY_SOURCES
 from intel_structuring import normalize_p3_structured_items, render_p3_structured_markdown
-from search_engine import raw_gemini_search
+from search_engine import compact_search_text, raw_gemini_search, split_tavily_result_blocks
 from settings import SEARCH_API_KEY_POOL, load_prompt
 from utils import extract_json_from_llm_response, parse_backtrack_hours
 
@@ -296,28 +296,6 @@ def _persist_raw_response(bucket: str, raw_text: str) -> None:
     )
 
 
-def _compact_summary(value: str, *, max_chars: int = 180) -> str:
-    text = re.sub(r"\s+", " ", (value or "").strip())
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip() + "..."
-
-
-def _split_tavily_result_blocks(raw_text: str) -> list[str]:
-    blocks: list[str] = []
-    current: list[str] = []
-    for line in (raw_text or "").splitlines():
-        if line.startswith("- "):
-            if current:
-                blocks.append("\n".join(current).strip())
-            current = [line]
-        elif current:
-            current.append(line)
-    if current:
-        blocks.append("\n".join(current).strip())
-    return blocks
-
-
 def _parse_tavily_fallback_response(
     raw_text: str,
     *,
@@ -329,7 +307,7 @@ def _parse_tavily_fallback_response(
 
     grounding_sources = grounding_sources or []
     items: list[dict] = []
-    for index, block in enumerate(_split_tavily_result_blocks(raw_text), 1):
+    for index, block in enumerate(split_tavily_result_blocks(raw_text), 1):
         text = block[2:].strip() if block.startswith("- ") else block.strip()
         if not text:
             continue
@@ -347,8 +325,8 @@ def _parse_tavily_fallback_response(
         else:
             title, summary = f"Tavily备用搜索结果{index}", text
 
-        title = _compact_summary(title, max_chars=80)
-        summary = _compact_summary(summary)
+        title = compact_search_text(title, max_chars=80)
+        summary = compact_search_text(summary, max_chars=180)
         if not title and not summary:
             continue
 
@@ -379,7 +357,7 @@ def _parse_tavily_fallback_response(
         return [
             {
                 "title": "Tavily备用搜索摘要",
-                "summary": _compact_summary(first_line),
+                "summary": compact_search_text(first_line, max_chars=180),
                 "track": "Tavily备用搜索",
                 "source_name": "Tavily",
                 "source_url": source_url,

@@ -164,6 +164,29 @@ DEF",
 
 
 class TestP2BudgetGuardrail:
+    def test_filter_x_leak_blocks_keeps_single_line_block(self):
+        import p2_x_intel
+
+        raw = (
+            "prefix <x_leaks>### [HBM] 单行爆料 "
+            "https://x.com/example/status/1983746519203847561</x_leaks> suffix"
+        )
+
+        filtered = p2_x_intel._filter_x_leak_blocks(raw, set())
+
+        assert filtered == (
+            "<x_leaks>### [HBM] 单行爆料 "
+            "https://x.com/example/status/1983746519203847561</x_leaks>"
+        )
+
+    def test_filter_x_leak_blocks_rejects_cross_batch_duplicate(self):
+        import p2_x_intel
+
+        tweet_id = "1983746519203847561"
+        raw = f"<x_leaks>https://x.com/example/status/{tweet_id}</x_leaks>"
+
+        assert p2_x_intel._filter_x_leak_blocks(raw, {tweet_id}) == ""
+
     def test_collect_from_x_returns_partial_content_when_budget_is_exhausted(self, monkeypatch):
         import p2_x_intel
 
@@ -262,6 +285,21 @@ class TestP2BudgetGuardrail:
         assert stats["total_chunks"] == 2
         assert manifest_updates[-1]["status"] == "completed"
         assert manifest_updates[-1]["metrics"]["stop_reason"] == "budget_exhausted"
+
+
+class TestP1Deduplication:
+    def test_deduplicate_entries_merges_sources_without_dropping_first_item(self):
+        import p1_rss
+
+        entries = [
+            {"title": "HBM supply remains tight", "content": "Lead times extend", "source": "source-a"},
+            {"title": "HBM supply remains tight", "content": "Lead times extend", "source": "source-b"},
+        ]
+
+        result = p1_rss._deduplicate_entries(entries)
+
+        assert len(result) == 1
+        assert result[0]["source"] == "source-a, source-b"
 
 
 class TestCollectIntelPersistence:

@@ -65,7 +65,7 @@ def test_google_client_receives_transport_timeout(monkeypatch) -> None:
 
     adapter = native_llm_adapter.NativeLLMAdapter(
         model="gemini-2.5-flash",
-        api_key="test-key",
+        api_key="test-key",  # pragma: allowlist secret
         timeout=12.5,
         max_retries=1,
     )

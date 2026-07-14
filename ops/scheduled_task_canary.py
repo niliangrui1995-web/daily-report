@@ -99,6 +99,11 @@ def _probe_proxy(base_url: str, api_key: str, inference_model: str = "") -> str:
         raise RuntimeError("proxy URL or API key is missing")
 
     import requests
+    from native_llm_adapter import validate_model_base_url
+
+    endpoint_ok, _, endpoint_error = validate_model_base_url(base_url)
+    if not endpoint_ok:
+        raise RuntimeError(endpoint_error)
 
     endpoint = f"{base_url.rstrip('/')}/models"
     session = requests.Session()

@@ -228,38 +228,6 @@ _TAVILY_COVERAGE_MARKERS = {
     "losers": ("loser", "downside", "risk", "pressure", "decline", "利空", "受损", "风险", "压力"),
     "alternatives": ("alternative", "substitute", "backup", "competition", "替代", "备选", "竞争", "格局"),
 }
-_P7_STRUCTURED_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
-        "claims": {"type": "array", "items": {"type": "string"}},
-        "entities": {"type": "array", "items": {"type": "string"}},
-        "dates": {"type": "array", "items": {"type": "string"}},
-        "implications": {"type": "array", "items": {"type": "string"}},
-        "open_questions": {"type": "array", "items": {"type": "string"}},
-        "coverage_flags": {
-            "type": "object",
-            "properties": {
-                "cause": {"type": "boolean"},
-                "winners": {"type": "boolean"},
-                "losers": {"type": "boolean"},
-                "alternatives": {"type": "boolean"},
-            },
-            "required": ["cause", "winners", "losers", "alternatives"],
-        },
-    },
-    "required": [
-        "summary",
-        "claims",
-        "entities",
-        "dates",
-        "implications",
-        "open_questions",
-        "coverage_flags",
-    ],
-}
-
-
 def _normalize_string_list(values, *, limit: int, max_length: int) -> list[str]:
     if not isinstance(values, list):
         return []
@@ -324,14 +292,14 @@ def _render_p7_structured_text(payload: dict) -> str:
     return "\n".join(parts).strip()
 
 
-def _compact_search_text(value: str, *, max_chars: int = 240) -> str:
+def compact_search_text(value: str, *, max_chars: int = 240) -> str:
     text = re.sub(r"\s+", " ", (value or "").strip())
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "..."
 
 
-def _split_tavily_result_blocks(raw_text: str) -> list[str]:
+def split_tavily_result_blocks(raw_text: str) -> list[str]:
     blocks: list[str] = []
     current: list[str] = []
     for line in (raw_text or "").splitlines():
@@ -349,7 +317,7 @@ def _split_tavily_result_blocks(raw_text: str) -> list[str]:
 def _parse_tavily_text_items(raw_text: str, sources: list[dict[str, str]] | None = None) -> list[dict[str, str]]:
     sources = sources or []
     items: list[dict[str, str]] = []
-    for index, block in enumerate(_split_tavily_result_blocks(raw_text), 1):
+    for index, block in enumerate(split_tavily_result_blocks(raw_text), 1):
         text = block[2:].strip() if block.startswith("- ") else block.strip()
         if not text:
             continue
@@ -369,8 +337,8 @@ def _parse_tavily_text_items(raw_text: str, sources: list[dict[str, str]] | None
 
         items.append(
             {
-                "title": _compact_search_text(title, max_chars=100),
-                "content": _compact_search_text(content),
+                "title": compact_search_text(title, max_chars=100),
+                "content": compact_search_text(content),
                 "url": url,
             }
         )
@@ -382,7 +350,7 @@ def _parse_tavily_text_items(raw_text: str, sources: list[dict[str, str]] | None
 def _extract_tavily_answer(raw_text: str) -> str:
     for line in (raw_text or "").splitlines():
         if line.startswith(_TAVILY_FALLBACK_MARKER):
-            return _compact_search_text(line.replace(_TAVILY_FALLBACK_MARKER, "", 1), max_chars=400)
+            return compact_search_text(line.replace(_TAVILY_FALLBACK_MARKER, "", 1), max_chars=400)
     return ""
 
 
@@ -457,7 +425,7 @@ def _structured_payload_from_tavily_result(
     for item in items:
         if not isinstance(item, dict):
             continue
-        claim = _compact_search_text(
+        claim = compact_search_text(
             str(item.get("content") or item.get("title") or ""),
             max_chars=240,
         )
@@ -491,12 +459,6 @@ def _structured_payload_from_tavily_result(
         "coverage_flags": coverage,
     }
     return _normalize_p7_structured_payload(payload)
-
-
-def _structured_mode_schema(structured_mode: str | None) -> dict | None:
-    if structured_mode == P7_STRUCTURED_MODE:
-        return _P7_STRUCTURED_RESPONSE_SCHEMA
-    return None
 
 
 def _parse_structured_payload(raw_text: str, structured_mode: str | None) -> dict | None:
@@ -634,16 +596,14 @@ def _post_search_request(
     key: str,
     prompt: str,
     temperature: float,
-    response_json_schema: dict | None = None,
 ) -> requests.Response:
     url = f"{base_url}/v1beta/models/{GEMINI_SEARCH_MODEL}:generateContent"
     generation_config = {
         "temperature": temperature,
         "maxOutputTokens": 8192,
     }
-    # Why: Google Search grounding（google_search 工具）和 JSON 结构化输出互斥。
-    #      同时传 response_json_schema + google_search 会返回 400 Bad Request。
-    #      P7 结构化模式改为在 prompt 中要求 JSON，拿到纯文本后用代码解析。
+    # Why: Google Search grounding 与 JSON 结构化输出互斥；P7 结构化模式
+    #      在 prompt 中要求 JSON，拿到纯文本后再由代码解析。
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "tools": [{"google_search": {}}],
@@ -759,7 +719,6 @@ def gemini_search(
     structured_mode: str | None = None,
 ) -> dict:
     prompt = _build_search_prompt(category, query, backtrack, structured_mode=structured_mode)
-    response_json_schema = _structured_mode_schema(structured_mode)
     channels = [("direct", search_rotator_direct)]
 
     for channel_name, rotator in channels:
@@ -784,7 +743,6 @@ def gemini_search(
                         key=key,
                         prompt=prompt,
                         temperature=1.0,
-                        response_json_schema=response_json_schema,
                     )
                     if _handle_search_limited_response(
                         category=category,

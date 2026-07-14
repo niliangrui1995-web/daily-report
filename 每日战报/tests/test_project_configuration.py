@@ -24,6 +24,10 @@ def test_project_has_reproducible_uv_environment() -> None:
     for dependency in ("pytest", "ruff", "pip-audit", "detect-secrets"):
         assert dependency in dev_dependencies
 
+    lint_config = config["tool"]["ruff"]["lint"]
+    assert {"E9", "F", "B", "C90"}.issubset(lint_config["select"])
+    assert lint_config["mccabe"]["max-complexity"] == 35
+
 
 def test_ci_uses_pinned_actions_and_locked_install() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "quality.yml").read_text(
@@ -40,6 +44,10 @@ def test_ci_uses_pinned_actions_and_locked_install() -> None:
     assert "windows-latest" in workflow
     assert "ubuntu-latest" in workflow
     assert "permissions:\n  contents: read" in workflow
+    assert "push:\n    branches: [master]" in workflow
+    assert "supply-chain:" in workflow
+    assert "if: ${{ !cancelled() }}" in workflow
+    assert "uv run ruff check 每日战报 ops 亚洲寡头行情" in workflow
     assert not re.search(r"uses:\s*[^\s]+@(v\d+|main|master)\s*$", workflow, re.MULTILINE)
 
 
@@ -63,12 +71,20 @@ def test_legacy_pip_entrypoint_uses_locked_export() -> None:
 
 def test_readme_documents_uv_as_the_primary_environment() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    env_template = (REPO_ROOT / "每日战报" / ".env.example").read_text(encoding="utf-8")
 
     assert "uv sync --locked" in readme
     assert "uv run python .\\每日战报\\pipeline_cli.py preflight" in readme
     assert ".\\ops\\migrate_scheduled_task.ps1 -Apply -ConfirmCredentialsRotated" in readme
+    assert ".\\ops\\migrate_scheduled_task.ps1 -RepairEnvAcl -Apply" in readme
     assert ".venv-service" in readme
     assert "自动定位包含 `pipeline_cli.py` 的项目子目录" not in readme
+    assert "Agent 审校" not in readme
+    assert "GEMINI_SEARCH_BASE_URL" not in readme
+    assert "delivery_resume" in readme
+    assert "PRO_OPUS_BASE_URL" in env_template
+    assert "PRO_OPUS_API_KEY" in env_template
+    assert "INSECURE_TLS_ALLOWLIST" in env_template
 
 
 def test_local_tdx_source_defaults_to_huatai_install() -> None:
@@ -93,6 +109,7 @@ def test_scheduled_task_migration_is_guarded_and_reversible() -> None:
     script = script_path.read_text(encoding="utf-8")
 
     assert "[switch]$Apply" in script
+    assert "[switch]$RepairEnvAcl" in script
     assert "[switch]$ConfirmCredentialsRotated" in script
     assert "[switch]$AcceptUnrotatedCredentialsRisk" in script
     assert "-Verb RunAs" in script
@@ -116,6 +133,15 @@ def test_scheduled_task_migration_is_guarded_and_reversible() -> None:
     assert "maintenance_lock.py" in script
     assert "credential_rotation_check.py" in script
     assert ".venv-service" in script
+    assert "function Set-PrivateFileAcl" in script
+    assert "function Get-PrivateFileAclStatus" in script
+    assert "$acl.SetOwner($administratorsSid)" in script
+    assert "owner_approved = $ownerApproved" in script
+    assert "missing_full_control_sids = $missingFullControlSids" in script
+    assert "runner_has_deny = $runnerHasDeny" in script
+    assert "Set-PrivateFileAcl $EnvPath $runnerSid" in script
+    assert "Grant-PathAccess $EnvPath" not in script
+    assert script.rindex("if ($RepairEnvAcl)") < script.index("$readiness = Get-ReadinessReport")
     account_description = re.search(
         r'New-LocalUser\s+`.*?-Description\s+"([^"]+)"', script, re.DOTALL
     )

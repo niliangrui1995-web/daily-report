@@ -29,7 +29,13 @@ from artifact_store import (
     write_json_artifact,
     write_text_artifact,
 )
-from checkpoint import P6_HASHED_RESEARCH_STAGES, compute_file_sha256, detect_checkpoint
+from checkpoint import (
+    P6_HASHED_RESEARCH_STAGES,
+    compute_file_sha256,
+    detect_checkpoint,
+    is_older_than_any,
+    p6_input_hash_matches,
+)
 from contribution_metrics import build_layer_roi_report, render_layer_roi_markdown
 from pipeline_runtime import StageSpec, StageTimeoutError, run_stage_registry
 from run_config import get_run_config, get_schedule_decision
@@ -137,37 +143,6 @@ def _read_json_checkpoint(path: str, label: str):
     return None
 
 
-def _checkpoint_file_mtime(ckpt: dict, file_key: str) -> float:
-    path = ckpt.get("files", {}).get(file_key, "")
-    if not path:
-        return 0.0
-    try:
-        from pathlib import Path
-
-        return Path(path).stat().st_mtime
-    except OSError:
-        return 0.0
-
-
-def _checkpoint_older_than_any(ckpt: dict, file_key: str, upstream_keys: tuple[str, ...]) -> bool:
-    target_mtime = _checkpoint_file_mtime(ckpt, file_key)
-    if not target_mtime:
-        return False
-    return any(_checkpoint_file_mtime(ckpt, upstream_key) > target_mtime for upstream_key in upstream_keys)
-
-
-def _checkpoint_p6_hash_matches(ckpt: dict, file_key: str) -> bool:
-    if file_key not in P6_HASHED_RESEARCH_STAGES:
-        return True
-    path = ckpt.get("files", {}).get(file_key, "")
-    if not path:
-        return True
-    hashes = ckpt.get("p6_input_sha256", {})
-    expected = str(hashes.get(file_key) or "").strip().lower() if isinstance(hashes, dict) else ""
-    actual = compute_file_sha256(ckpt.get("files", {}).get("p6", ""))
-    return bool(expected and actual and expected == actual)
-
-
 def _read_fresh_text_checkpoint(
     ckpt: dict,
     file_key: str,
@@ -175,11 +150,14 @@ def _read_fresh_text_checkpoint(
     *,
     upstream_keys: tuple[str, ...],
 ) -> str:
-    if not _checkpoint_p6_hash_matches(ckpt, file_key):
+    files = ckpt.get("files", {})
+    hashes = ckpt.get("p6_input_sha256", {})
+    p6_hashes = hashes if isinstance(hashes, dict) else {}
+    if file_key in P6_HASHED_RESEARCH_STAGES and not p6_input_hash_matches(files, p6_hashes, file_key):
         logging.warning("%s checkpoint P6 input hash is missing or stale; ignoring it", label)
         return ""
     remaining_upstreams = tuple(key for key in upstream_keys if key != "p6")
-    if _checkpoint_older_than_any(ckpt, file_key, remaining_upstreams):
+    if is_older_than_any(files, file_key, remaining_upstreams):
         logging.warning("%s checkpoint is older than upstream input; ignoring it", label)
         return ""
     return _read_text_checkpoint(ckpt.get("files", {}).get(file_key, ""), label)
@@ -540,7 +518,7 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
 
     identity_validation = _load_p6_identity_validation(ckpt.get("p6_metrics", {}))
     if resume_from in {"p6", "p8_resume", "p9_resume"} and ckpt["files"].get("p6"):
-        if _checkpoint_older_than_any(ckpt, "p6", ("p5", "p4", "p3", "p2")):
+        if is_older_than_any(ckpt.get("files", {}), "p6", ("p5", "p4", "p3", "p2")):
             logging.warning("[P6] checkpoint is older than upstream evidence; rerunning mapping")
         elif not identity_validation["complete"]:
             logging.warning(
@@ -812,9 +790,9 @@ def _stage_research(context: dict[str, Any]) -> None:
 
 def _stage_technical(context: dict[str, Any]) -> None:
     try:
+        current_stocks = extract_stocks_from_report(context.get("p6_mapping", ""))
         if context["resume_from"] == "p9_resume" and context.get("price_data", "").strip():
-            current_stocks = extract_stocks_from_report(context.get("p6_mapping", ""))
-            stale_p8 = _checkpoint_older_than_any(context.get("ckpt", {}), "p8", ("p6",))
+            stale_p8 = is_older_than_any(context.get("ckpt", {}).get("files", {}), "p8", ("p6",))
             stale_no_stock_p8 = "未从 P6 映射中提取到 A 股标的" in context.get("price_data", "")
             if not (stale_p8 or (current_stocks and stale_no_stock_p8)):
                 logging.info("reusing P8 technical data from checkpoint")
@@ -825,10 +803,9 @@ def _stage_technical(context: dict[str, Any]) -> None:
             )
 
         with log_heartbeat("P8 technical"):
-            stocks = current_stocks if "current_stocks" in locals() else extract_stocks_from_report(context.get("p6_mapping", ""))
             tracks = extract_stock_tracks(context.get("p6_mapping", ""))
             elasticity = extract_stock_elasticity(context.get("p6_mapping", ""))
-            context["price_data"] = p8_search_stock_prices(stocks, tracks, elasticity)
+            context["price_data"] = p8_search_stock_prices(current_stocks, tracks, elasticity)
     except Exception as exc:
         logging.error("[P8] technical layer failed; continuing with fallback price section: %s", exc)
         fallback_text = (

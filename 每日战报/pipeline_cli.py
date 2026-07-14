@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import importlib
-import ipaddress
 import logging
 import os
 import sys
@@ -26,8 +25,8 @@ from artifact_store import (
     set_preflight_summary,
     summarize_stage_degradations,
     update_manifest_context,
-    update_run_manifest,
 )
+from native_llm_adapter import validate_model_base_url
 from pipeline_lock import (
     DEFAULT_STALE_AFTER_SECONDS,
     PipelineLockError,
@@ -77,14 +76,10 @@ RUNTIME_IMPORTS = (
 
 def _probe_local_model_endpoint(base_url: str, api_key: str) -> tuple[bool, str]:
     try:
-        parsed = urlparse(base_url)
-        hostname = (parsed.hostname or "").strip().lower()
-        if parsed.scheme not in {"http", "https"} or not hostname:
-            return False, "invalid model endpoint URL"
-        try:
-            is_loopback = ipaddress.ip_address(hostname).is_loopback
-        except ValueError:
-            is_loopback = hostname == "localhost"
+        endpoint_ok, is_loopback, endpoint_error = validate_model_base_url(base_url)
+        if not endpoint_ok:
+            return False, endpoint_error
+        hostname = (urlparse(base_url).hostname or "").strip().lower()
         if not api_key:
             return False, "model endpoint API key is missing"
         if not is_loopback:

@@ -6,8 +6,10 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import multiprocessing
 import os
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -21,6 +23,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def slow_stage_handler(context: dict) -> None:
     time.sleep(float(context.get("sleep_seconds", 0)))
+    context["completed"] = True
+
+
+def stage_handler_with_lingering_thread(context: dict) -> None:
+    threading.Thread(target=time.sleep, args=(30,), daemon=False).start()
     context["completed"] = True
 
 
@@ -100,6 +107,94 @@ class TestPipelineRuntimeTimeout:
         )
 
         assert result == {"status": "success", "context": {"value": "child"}}
+
+    def test_committed_result_wins_when_child_has_lingering_threads(self, monkeypatch, tmp_path):
+        import pipeline_runtime
+
+        state = {"alive": True, "terminated": False}
+
+        class FakeQueue:
+            def __init__(self):
+                self.signal = None
+
+            def get(self, timeout=None):
+                signal = self.signal
+                self.signal = None
+                if signal is None:
+                    raise RuntimeError("empty queue")
+                return signal
+
+            def get_nowait(self):
+                return self.get()
+
+            def close(self):
+                return None
+
+            def join_thread(self):
+                return None
+
+        queue = FakeQueue()
+
+        class FakeProcess:
+            pid = 12345
+            exitcode = None
+
+            def __init__(self, target, args, name):
+                self.args = args
+
+            def start(self):
+                result_path = self.args[3]
+                digest = pipeline_runtime._write_context_to_file({"value": "committed"}, result_path)
+                queue.signal = {"status": "success", "context_sha256": digest}
+
+            def is_alive(self):
+                return state["alive"]
+
+            def join(self, timeout=None):
+                return None
+
+            def terminate(self):
+                state["terminated"] = True
+                state["alive"] = False
+
+            def kill(self):
+                state["alive"] = False
+
+        class FakeMpContext:
+            def Queue(self, maxsize=0):
+                return queue
+
+            def Process(self, target, args, name):
+                return FakeProcess(target, args, name)
+
+        monkeypatch.setattr(pipeline_runtime.multiprocessing, "get_context", lambda _method: FakeMpContext())
+        monkeypatch.setattr(pipeline_runtime.tempfile, "gettempdir", lambda: str(tmp_path))
+
+        result = pipeline_runtime._run_stage_in_subprocess(
+            pipeline_runtime.StageSpec(name="rss", handler=lambda context: None, timeout_seconds=5),
+            {"value": "parent"},
+        )
+
+        assert result == {"status": "success", "context": {"value": "committed"}}
+        assert state["terminated"] is True
+
+    def test_spawned_stage_returns_committed_result_without_waiting_for_lingering_thread(self):
+        import pipeline_runtime
+
+        started = time.monotonic()
+        result = pipeline_runtime._run_stage_in_subprocess(
+            pipeline_runtime.StageSpec(
+                name="lingering-thread",
+                handler=stage_handler_with_lingering_thread,
+                timeout_seconds=10,
+            ),
+            {},
+        )
+        elapsed = time.monotonic() - started
+
+        assert result == {"status": "success", "context": {"completed": True}}
+        assert elapsed < 15
+        assert all(child.name != "stage-lingering-thread" for child in multiprocessing.active_children())
 
     def test_context_file_roundtrips_utf8_sig_chinese(self, tmp_path):
         import pipeline_runtime
@@ -365,6 +460,43 @@ class TestManifestContext:
         payload = json.loads(json_path.read_text(encoding=artifact_store.UTF8_FILE_ENCODING))
         assert payload[0]["text"] == "investor’s update"
         assert payload[0]["nested"]["body"] == "risk—reward"
+
+    def test_atomic_text_artifact_write_keeps_existing_file_on_failure(self, monkeypatch, tmp_path):
+        import artifact_store
+
+        monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+        monkeypatch.setenv(artifact_store.RUN_TIMESTAMP_ENV, "20260714090000")
+        target = tmp_path / "战报_20260714090000.md"
+        target.write_text("旧版完整战报", encoding=artifact_store.UTF8_FILE_ENCODING)
+        monkeypatch.setattr(
+            artifact_store.os,
+            "fsync",
+            lambda _fd: (_ for _ in ()).throw(OSError("simulated flush failure")),
+        )
+
+        with pytest.raises(OSError, match="simulated flush failure"):
+            artifact_store.write_text_artifact("战报", "只写了一半的新战报")
+
+        assert target.read_text(encoding=artifact_store.UTF8_FILE_ENCODING) == "旧版完整战报"
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_atomic_json_artifact_write_does_not_publish_partial_file(self, monkeypatch, tmp_path):
+        import artifact_store
+
+        monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+        monkeypatch.setenv(artifact_store.RUN_TIMESTAMP_ENV, "20260714090001")
+        target = tmp_path / "P1_RSS原始数据_20260714090001.json"
+        monkeypatch.setattr(
+            artifact_store.os,
+            "fsync",
+            lambda _fd: (_ for _ in ()).throw(OSError("simulated flush failure")),
+        )
+
+        with pytest.raises(OSError, match="simulated flush failure"):
+            artifact_store.write_json_artifact("P1_RSS原始数据", [{"title": "partial"}])
+
+        assert target.exists() is False
+        assert list(tmp_path.glob("*.tmp")) == []
 
     def test_manifest_root_contains_runtime_context_and_preflight(self, monkeypatch, tmp_path):
         import artifact_store
@@ -1249,7 +1381,7 @@ class TestPreflightChecks:
 
 
 class TestPipelineLock:
-    def test_acquire_run_lock_clears_dead_windows_lock(self, monkeypatch, tmp_path):
+    def test_acquire_run_lock_clears_dead_lock(self, monkeypatch, tmp_path):
         import pipeline_lock
 
         lock_dir = tmp_path / "_system"
@@ -1268,8 +1400,7 @@ class TestPipelineLock:
         )
 
         monkeypatch.setattr(pipeline_lock, "get_run_lock_path", lambda: str(lock_path))
-        monkeypatch.setattr(pipeline_lock.os, "name", "nt")
-        monkeypatch.setattr(pipeline_lock, "_pid_is_running_windows", lambda pid: False)
+        monkeypatch.setattr(pipeline_lock, "_pid_is_running", lambda pid: False)
 
         with pipeline_lock.acquire_run_lock(command="resume") as payload:
             assert payload["command"] == "resume"
@@ -1278,6 +1409,59 @@ class TestPipelineLock:
             assert current["command"] == "resume"
 
         assert not lock_path.exists()
+
+
+class TestModelEndpointPolicy:
+    def test_probe_accepts_loopback_http_after_authenticated_model_list(self, monkeypatch):
+        import pipeline_cli
+        import requests
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"data": [{"id": "gpt-test"}]}
+
+        class FakeSession:
+            trust_env = True
+
+            @staticmethod
+            def get(*_args, **_kwargs):
+                return FakeResponse()
+
+            @staticmethod
+            def close():
+                return None
+
+        monkeypatch.setattr(requests, "Session", FakeSession)
+
+        assert pipeline_cli._probe_local_model_endpoint(
+            "http://127.0.0.1:8317/v1",
+            "configured-key",
+        ) == (True, "authenticated status=200 models=1 host=127.0.0.1")
+
+    def test_probe_rejects_external_plain_http_without_network_call(self):
+        import pipeline_cli
+
+        ok, detail = pipeline_cli._probe_local_model_endpoint(
+            "http://api.example.invalid/v1",
+            "configured-key",
+        )
+
+        assert ok is False
+        assert "HTTPS" in detail
+
+    def test_probe_accepts_external_https_without_live_probe(self):
+        import pipeline_cli
+
+        ok, detail = pipeline_cli._probe_local_model_endpoint(
+            "https://api.example.invalid/v1",
+            "configured-key",
+        )
+
+        assert ok is True
+        assert "live probe skipped" in detail
 
 
 class TestTradingCalendarStatus:

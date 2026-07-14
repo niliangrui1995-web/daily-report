@@ -86,12 +86,12 @@ notepad .\每日战报\.env
 | 变量 | 用途 |
 | --- | --- |
 | `TDX_ROOT` | 本地通达信数据根，默认 `D:\HT`；需包含 `T0002\hq_cache` 和 `vipdoc` |
-| `ANTIGRAVITY_BASE_URL` | 本地/远端 OpenAI 兼容模型服务地址，默认 `http://127.0.0.1:8045` |
+| `ANTIGRAVITY_BASE_URL` | OpenAI 兼容模型服务地址；回环地址可用 HTTP，远端地址必须用 HTTPS；默认 `http://127.0.0.1:8045` |
 | `ANTIGRAVITY_API_KEY` | Pro/GPT-5.6 Sol/Agent 兼容模型鉴权 |
 | `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 覆盖 P6/P9 GPT-5.6 Sol Max 模型服务；未配置时沿用 Antigravity 配置 |
 | `AUDIT_FALLBACK_BASE_URL` / `AUDIT_FALLBACK_API_KEY` | P5/P7.5/P7a 审计备用 Anthropic 接口；主接口失败后使用相同 `AUDIT_MODEL` |
 | `GEMINI_SEARCH_API_KEYS` | Gemini 搜索 key 池，逗号分隔 |
-| `GEMINI_SEARCH_BASE_URL` | Gemini 搜索代理地址 |
+| `GEMINI_SEARCH_MODEL` | Gemini 搜索模型，默认 `gemini-2.5-flash` |
 | `AUDIT_MODEL` | P5/P7a/P7.5 审计模型，默认 `claude-sonnet-4-6`；兼容旧变量 `GEMINI_PRO_MODEL` |
 | `GEMINI_PRO_API_KEY` | Gemini 审计模型专用 key；仅当 `AUDIT_MODEL` 使用 Gemini 3.5 时生效 |
 | `TAVILY_API_KEY` | Tavily 备用搜索 |
@@ -238,6 +238,12 @@ uv sync --locked --no-dev --python C:\Python314\python.exe
 
 脚本会导出原任务和 ACL，先禁用原触发器并取得流水线维护锁，再创建强制密码、随机密码的专用标准账户。源码和代理程序仅授予读取/执行，输出目录可写；`D:\HT` 通过专用账号的 deny-write ACE 保持有效只读，不改变其他用户现有权限。`CLIProxyAPI` 目标目录在复制任何凭据前即锁定为私有 ACL，仅 `auths` 子目录允许专用账号修改。
 
+已完成迁移的机器可独立、幂等地收紧 `.env` 权限；该模式不受首次迁移 readiness 条件限制，只保留 SYSTEM、Administrators、当前管理员的完全控制及专用账号的只读权限：
+
+```powershell
+.\ops\migrate_scheduled_task.ps1 -RepairEnvAcl -Apply
+```
+
 迁移依次完成 8318 隔离 canary、8317 live canary、正式 `cmd.exe` Action 的 `preflight` 实跑，最后才替换正式任务主体。回滚只删除本次创建的资源，并恢复本次实际修改的任务、ACL 和桌面代理。
 
 ```powershell
@@ -259,7 +265,8 @@ uv sync --locked --no-dev --python C:\Python314\python.exe
 | `market_mapping` | P4 海外龙头行情快照、P6 A 股映射 | 900s |
 | `research` | P7 深度研究、P7a 审计、P7.5 补充搜索 | 900s |
 | `technical` | P8 技术面/股价/弹性层 | 300s |
-| `report` | P9 战报生成、Agent 审校、邮件发送 | 900s |
+| `report` | P9 战报生成与邮件发送 | 900s |
+| `delivery_resume` | 复用已保存战报，仅重试邮件发送 | 600s |
 | `roi` | Layer ROI 贡献评估 | 180s |
 
 阶段由 `pipeline_runtime.py` 在子进程中执行。超时会写入 `failed_timeout`，异常会写入 `failed_exception`，成功写入 `completed`。
@@ -277,7 +284,6 @@ uv sync --locked --no-dev --python C:\Python314\python.exe
     ├── logs\
     │   ├── pipeline.log
     │   └── error.log
-    ├── agent\
     ├── meta\
     └── 各阶段 md/json 产物
 ```
@@ -287,7 +293,6 @@ uv sync --locked --no-dev --python C:\Python314\python.exe
 - `run_manifest.json` 是排查运行状态的第一入口。
 - `logs/pipeline.log` 记录主流程日志。
 - `logs/error.log` 记录错误日志。
-- `agent/` 存放预检解释、失败诊断和终稿审校产物。
 - `meta/` 存放 `Layer_ROI` 等辅助元数据。
 
 ---

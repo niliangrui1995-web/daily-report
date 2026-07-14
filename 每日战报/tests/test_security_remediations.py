@@ -327,7 +327,7 @@ def test_web_source_fetch_blocks_redirect_to_private_host(monkeypatch):
 def test_search_exception_logging_redacts_gemini_key(monkeypatch, caplog):
     import search_engine
 
-    secret = "SECRETKEY123"
+    secret = "SECRETKEY123"  # pragma: allowlist secret
 
     class FakeResponse:
         status_code = 418
@@ -392,7 +392,7 @@ def test_search_5xx_trips_channel_and_uses_tavily(monkeypatch, caplog):
 def test_search_permission_denied_403_does_not_exhaust_gemini_key(monkeypatch, caplog):
     import search_engine
 
-    secret = "SECRETKEY123"
+    secret = "SECRETKEY123"  # pragma: allowlist secret
 
     class PermissionDeniedResponse:
         status_code = 403
@@ -600,7 +600,7 @@ def test_report_email_falls_back_to_tun_safe_route(monkeypatch):
     p9_email.send_report_via_email(
         "report",
         sender_email="sender@example.com",
-        sender_password="secret",
+        sender_password="secret",  # pragma: allowlist secret
         receiver_email="receiver@example.com",
     )
 
@@ -649,7 +649,7 @@ def test_send_message_uses_verifying_ssl_context(monkeypatch):
     p9_email._send_message(
         msg,
         sender_email="sender@example.com",
-        sender_password="secret",
+        sender_password="secret",  # pragma: allowlist secret
         receiver_email="receiver@example.com",
     )
 
@@ -657,4 +657,4 @@ def test_send_message_uses_verifying_ssl_context(monkeypatch):
     assert isinstance(context, ssl.SSLContext)
     assert context.check_hostname is True
     assert context.verify_mode == ssl.CERT_REQUIRED
-    assert captured["login"] == ("sender@example.com", "secret")
+    assert captured["login"] == ("sender@example.com", "secret")  # pragma: allowlist secret

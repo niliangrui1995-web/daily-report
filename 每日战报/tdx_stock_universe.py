@@ -74,10 +74,13 @@ def canonicalize_stock_aliases_in_text(text: object) -> tuple[str, int]:
             rf'(?:{re.escape(alias_name)}|{re.escape(canonical_name)})'
             rf'\s*[（(]\s*\d{{6}}\s*[）)]'
         )
+        canonical_replacement = f'{canonical_name}（{expected_code}）'
 
-        def replace_coded(match: re.Match[str]) -> str:
+        def replace_coded(
+            match: re.Match[str],
+            replacement: str = canonical_replacement,
+        ) -> str:
             nonlocal rewrite_count
-            replacement = f'{canonical_name}（{expected_code}）'
             if match.group(0) != replacement:
                 rewrite_count += 1
             return replacement

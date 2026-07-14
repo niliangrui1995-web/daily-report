@@ -3,6 +3,7 @@
 [CmdletBinding()]
 param(
     [switch]$Apply,
+    [switch]$RepairEnvAcl,
     [switch]$ConfirmCredentialsRotated,
     [switch]$AcceptUnrotatedCredentialsRisk,
     [string]$TaskName = "VCPHunter_DailyReport",
@@ -74,6 +75,9 @@ function Invoke-ElevatedSelf {
     }
     if ($AcceptUnrotatedCredentialsRisk) {
         $argumentItems += "-AcceptUnrotatedCredentialsRisk"
+    }
+    if ($RepairEnvAcl) {
+        $argumentItems += "-RepairEnvAcl"
     }
     $arguments = $argumentItems -join " "
     $process = Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $arguments -WindowStyle Hidden -PassThru
@@ -401,6 +405,115 @@ function Set-PrivateDirectoryAcl([string]$Path, [Security.Principal.SecurityIden
         $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($RunnerSid, $readExecute, $inheritance, $none, $allow)) | Out-Null
     }
     Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Set-PrivateFileAcl(
+    [string]$Path,
+    [Security.Principal.SecurityIdentifier]$RunnerSid
+) {
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    $administratorsSid = [Security.Principal.SecurityIdentifier]::new("S-1-5-32-544")
+    $acl.SetOwner($administratorsSid)
+    foreach ($rule in @($acl.Access)) {
+        [void]$acl.RemoveAccessRuleSpecific($rule)
+    }
+    $none = [Security.AccessControl.InheritanceFlags]::None
+    $propagation = [Security.AccessControl.PropagationFlags]::None
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $full = [Security.AccessControl.FileSystemRights]::FullControl
+    $read = [Security.AccessControl.FileSystemRights]"Read, Synchronize"
+    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    foreach ($sid in @(
+        [Security.Principal.SecurityIdentifier]::new("S-1-5-18"),
+        $administratorsSid,
+        $currentSid
+    )) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, $full, $none, $propagation, $allow)) | Out-Null
+    }
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($RunnerSid, $read, $none, $propagation, $allow)) | Out-Null
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Get-PrivateFileAclStatus(
+    [string]$Path,
+    [Security.Principal.SecurityIdentifier]$RunnerSid
+) {
+    $acl = Get-Acl -LiteralPath $Path
+    $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $requiredFullControlSids = @(
+        "S-1-5-18",
+        "S-1-5-32-544",
+        $currentSid
+    )
+    $allowedSids = @($requiredFullControlSids) + $RunnerSid.Value
+    $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    $ownerApproved = $ownerSid -eq "S-1-5-32-544"
+    $unapprovedIdentities = [Collections.Generic.List[string]]::new()
+    $fullControlSids = [Collections.Generic.HashSet[string]]::new()
+    $runnerCanRead = $false
+    $runnerCanWrite = $false
+    $runnerHasDeny = $false
+    $fullControl = [Security.AccessControl.FileSystemRights]::FullControl
+    $writeRights = [Security.AccessControl.FileSystemRights]"WriteData, AppendData, WriteExtendedAttributes, WriteAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership"
+
+    foreach ($rule in @($acl.Access)) {
+        try {
+            $identitySid = $rule.IdentityReference.Translate(
+                [Security.Principal.SecurityIdentifier]
+            ).Value
+        }
+        catch {
+            $identitySid = $rule.IdentityReference.Value
+        }
+        if ($allowedSids -notcontains $identitySid) {
+            $unapprovedIdentities.Add($rule.IdentityReference.Value) | Out-Null
+        }
+        if (
+            $rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+            (($rule.FileSystemRights -band $fullControl) -eq $fullControl)
+        ) {
+            $fullControlSids.Add($identitySid) | Out-Null
+        }
+        if (
+            $identitySid -eq $RunnerSid.Value -and
+            $rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny
+        ) {
+            $runnerHasDeny = $true
+        }
+        if (
+            $identitySid -eq $RunnerSid.Value -and
+            $rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow
+        ) {
+            if (($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadData) -ne 0) {
+                $runnerCanRead = $true
+            }
+            if (($rule.FileSystemRights -band $writeRights) -ne 0) {
+                $runnerCanWrite = $true
+            }
+        }
+    }
+
+    $missingFullControlSids = @(
+        $requiredFullControlSids | Where-Object { -not $fullControlSids.Contains($_) }
+    )
+    $ok = $ownerApproved -and
+        $acl.AreAccessRulesProtected -and
+        $unapprovedIdentities.Count -eq 0 -and
+        $missingFullControlSids.Count -eq 0 -and
+        $runnerCanRead -and
+        -not $runnerCanWrite -and
+        -not $runnerHasDeny
+    return [pscustomobject][ordered]@{
+        ok = $ok
+        owner_approved = $ownerApproved
+        owner_sid = $ownerSid
+        inheritance_disabled = $acl.AreAccessRulesProtected
+        runner_read_only = $runnerCanRead -and -not $runnerCanWrite
+        runner_has_deny = $runnerHasDeny
+        missing_full_control_sids = $missingFullControlSids
+        unapproved_identities = @($unapprovedIdentities)
+    }
 }
 
 function Set-TdxReadOnlyAccess(
@@ -1053,6 +1166,41 @@ function Restore-MigrationState(
     }
 }
 
+if ($RepairEnvAcl) {
+    $runner = Get-LocalUser -Name $AccountName -ErrorAction SilentlyContinue
+    if (-not $runner) {
+        throw "Cannot repair the environment ACL because local account $AccountName does not exist."
+    }
+    if (-not (Test-Path -LiteralPath $EnvPath -PathType Leaf)) {
+        throw "Cannot repair the environment ACL because $EnvPath does not exist."
+    }
+    $runnerSid = [Security.Principal.SecurityIdentifier]::new($runner.Sid.Value)
+    if (-not $Apply) {
+        [ordered]@{
+            mode = "repair-env-acl-dry-run"
+            env_path = $EnvPath
+            current_status = Get-PrivateFileAclStatus $EnvPath $runnerSid
+            planned_change = "replace inherited access with SYSTEM, Administrators, current administrator, and read-only runner access"
+        } | ConvertTo-Json -Depth 4
+        return
+    }
+    if (-not (Test-IsAdministrator)) {
+        Invoke-ElevatedSelf
+        return
+    }
+    Set-PrivateFileAcl $EnvPath $runnerSid
+    $aclStatus = Get-PrivateFileAclStatus $EnvPath $runnerSid
+    if (-not $aclStatus.ok) {
+        throw "The environment ACL repair did not produce the required private ACL."
+    }
+    [ordered]@{
+        mode = "repair-env-acl"
+        env_path = $EnvPath
+        status = $aclStatus
+    } | ConvertTo-Json -Depth 4
+    return
+}
+
 $readiness = Get-ReadinessReport
 if (-not $Apply) {
     [ordered]@{
@@ -1172,7 +1320,7 @@ try {
     $state.AclModified = $true
     Grant-PathAccess $BatchPath $runnerSid $readExecute
     Grant-PathAccess $AppRoot $runnerSid $readExecute $inherit
-    Grant-PathAccess $EnvPath $runnerSid $readExecute
+    Set-PrivateFileAcl $EnvPath $runnerSid
     Grant-PathAccess $ServiceVenv $runnerSid $readExecute $inherit
     Grant-PathAccess $CanaryScript $runnerSid $readExecute
     Grant-PathAccess $OutputRoot $runnerSid $modify $inherit

@@ -9,8 +9,7 @@ import tempfile
 import threading
 from contextlib import contextmanager
 from datetime import date, datetime
-from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TextIO
 
 from settings import OUTPUT_DIR, SEARCH_API_KEY_POOL, get_tls_policy_summary, get_today_output_dir
 from trading_calendar import get_calendar_mode
@@ -22,7 +21,7 @@ MANIFEST_FILENAME = "run_manifest.json"
 # Windows PowerShell 5.1 guesses ANSI for BOM-less UTF-8; these artifacts are opened locally.
 UTF8_FILE_ENCODING = "utf-8-sig"
 
-ARTIFACT_CATEGORIES = ("logs", "meta", "agent")
+ARTIFACT_CATEGORIES = ("logs", "meta")
 STAGE_DEGRADED_STATUSES = {
     "completed_structured_degraded",
 }
@@ -104,8 +103,6 @@ def get_error_log_path() -> str:
 
 
 def infer_artifact_category(prefix: str) -> str:
-    if prefix.startswith("Agent_"):
-        return "agent"
     if prefix.startswith("Layer_ROI"):
         return "meta"
     return ""
@@ -143,6 +140,24 @@ def build_artifact_path(
     return os.path.join(target_dir, f"{prefix}_{ts}.{ext}")
 
 
+def _write_file_atomic(path: str, writer: Callable[[TextIO], object]) -> None:
+    target_dir = ensure_dir(os.path.dirname(path) or ".")
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp",
+        dir=target_dir,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=UTF8_FILE_ENCODING) as handle:
+            writer(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def write_text_artifact(
     prefix: str,
     content: str,
@@ -151,8 +166,8 @@ def write_text_artifact(
     category: str | None = None,
 ) -> str:
     path = build_artifact_path(prefix, "md", timestamp=timestamp, category=category)
-    with open(path, "w", encoding=UTF8_FILE_ENCODING) as f:
-        f.write(normalize_common_text_mojibake(content))
+    normalized_content = normalize_common_text_mojibake(content)
+    _write_file_atomic(path, lambda handle: handle.write(normalized_content))
     return path
 
 
@@ -164,8 +179,11 @@ def write_json_artifact(
     category: str | None = None,
 ) -> str:
     path = build_artifact_path(prefix, "json", timestamp=timestamp, category=category)
-    with open(path, "w", encoding=UTF8_FILE_ENCODING) as f:
-        json.dump(normalize_common_mojibake_artifacts(data), f, ensure_ascii=False, indent=2)
+    normalized_data = normalize_common_mojibake_artifacts(data)
+    _write_file_atomic(
+        path,
+        lambda handle: json.dump(normalized_data, handle, ensure_ascii=False, indent=2),
+    )
     return path
 
 
@@ -337,17 +355,10 @@ def _backup_corrupt_manifest(path: str) -> str:
 
 
 def _write_manifest_file(path: str, manifest: dict[str, Any]) -> None:
-    ensure_dir(os.path.dirname(path))
-    fd, temp_path = tempfile.mkstemp(prefix="manifest_", suffix=".json", dir=os.path.dirname(path))
-    try:
-        with os.fdopen(fd, "w", encoding=UTF8_FILE_ENCODING) as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp_path, path)
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+    _write_file_atomic(
+        path,
+        lambda handle: json.dump(manifest, handle, ensure_ascii=False, indent=2),
+    )
 
 
 def _cleanup_legacy_manifest(current_path: str, day_dir: str | None = None) -> None:
@@ -557,17 +568,3 @@ def record_run_state(
             _cleanup_legacy_manifest(manifest_path, day_dir)
 
     return manifest_path
-
-
-def find_latest_day_dir() -> str:
-    root = Path(get_output_root_dir())
-    candidates = sorted(
-        (
-            path
-            for path in root.iterdir()
-            if path.is_dir() and path.name.isdigit() and len(path.name) == 8
-        ),
-        key=lambda item: item.name,
-        reverse=True,
-    )
-    return str(candidates[0]) if candidates else get_day_dir()

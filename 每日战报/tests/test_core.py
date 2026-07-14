@@ -569,7 +569,7 @@ class TestP1WebTimeWindow:
             return FakeResponse()
 
         monkeypatch.setattr(p1_web, "Selector", FakeSelector, raising=False)
-        monkeypatch.setattr(p1_web.requests, "get", fake_get)
+        monkeypatch.setattr(p1_web, "_safe_external_requests_get", fake_get)
         monkeypatch.setattr(
             p1_web,
             "get_tls_policy_for_url",
@@ -590,8 +590,8 @@ class TestP1WebTimeWindow:
         )
 
         assert calls == [
-            ("https://slow.example/primary", (5.0, 8.0)),
-            ("https://fast.example/fallback", (5.0, 8.0)),
+            ("https://slow.example/primary", 8),
+            ("https://fast.example/fallback", 8),
         ]
         assert len(entries) == 1
         assert entries[0]["url"] == "https://fast.example/news/a"

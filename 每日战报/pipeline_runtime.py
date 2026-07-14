@@ -206,6 +206,8 @@ def _run_stage_in_subprocess(stage: StageSpec, context: dict[str, Any]) -> dict[
     tmp_dir = tempfile.gettempdir()
     result_dir = tempfile.mkdtemp(prefix="vcp_stage_", dir=tmp_dir)
     result_file_path = os.path.join(result_dir, "context.json")
+    process = None
+    process_started = False
 
     try:
         process = mp_context.Process(
@@ -214,20 +216,30 @@ def _run_stage_in_subprocess(stage: StageSpec, context: dict[str, Any]) -> dict[
             name=f"stage-{stage.name}",
         )
         process.start()
+        process_started = True
 
         # Drain the tiny status signal before join so the child cannot block on
         # a full multiprocessing pipe.
         result_signal: dict[str, Any] | None = None
         deadline = time.time() + (stage.timeout_seconds or 900)
-        while process.is_alive() and time.time() < deadline:
+        while time.time() < deadline:
+            if not process.is_alive():
+                break
+            queue_timeout = min(2.0, max(0.01, deadline - time.time()))
             try:
-                result_signal = result_queue.get(timeout=2.0)
+                result_signal = result_queue.get(timeout=queue_timeout)
                 break
             except Exception:
                 continue
 
-        remaining_timeout = max(0.1, deadline - time.time())
-        process.join(timeout=min(remaining_timeout, 30))
+        if result_signal is None:
+            try:
+                result_signal = result_queue.get_nowait()
+            except Exception:
+                result_signal = None
+
+        if result_signal is not None:
+            return _resolve_stage_result_signal(result_signal, result_file_path)
 
         if process.is_alive():
             logging.error(
@@ -236,64 +248,74 @@ def _run_stage_in_subprocess(stage: StageSpec, context: dict[str, Any]) -> dict[
                 stage.timeout_seconds,
                 process.pid,
             )
-            process.terminate()
-            process.join(timeout=5)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=5)
             return {"status": "timeout"}
 
-        if result_signal is None:
-            try:
-                result_signal = result_queue.get_nowait()
-            except Exception:
-                result_signal = None
+        process.join(timeout=0)
 
+        if process.exitcode != 0:
+            return {
+                "status": "error",
+                "error": f"stage subprocess exited unexpectedly with code={process.exitcode}",
+            }
+        updated_context = _read_context_from_file(result_file_path)
+        if updated_context is None:
+            return {
+                "status": "error",
+                "error": "stage subprocess produced no valid context result",
+            }
+        return {"status": "success", "context": updated_context}
+    finally:
+        if process is not None and process_started:
+            _stop_process(process)
         try:
             result_queue.close()
             result_queue.join_thread()
         except Exception:
             pass
-
-        if result_signal is None:
-            if process.exitcode != 0:
-                return {
-                    "status": "error",
-                    "error": f"stage subprocess exited unexpectedly with code={process.exitcode}",
-                }
-            updated_context = _read_context_from_file(result_file_path)
-            if updated_context is None:
-                return {
-                    "status": "error",
-                    "error": "stage subprocess produced no valid context result",
-                }
-            return {"status": "success", "context": updated_context}
-
-        if not isinstance(result_signal, dict):
-            return {"status": "error", "error": "stage subprocess returned an invalid status signal"}
-
-        status = result_signal.get("status", "error")
-        if status == "error":
-            return result_signal
-        if status != "success":
-            return {"status": "error", "error": f"stage subprocess returned unknown status={status}"}
-
-        updated_context = _read_context_from_file(
-            result_file_path,
-            expected_sha256=str(result_signal.get("context_sha256") or "") or None,
-        )
-        if updated_context is None:
-            return {
-                "status": "error",
-                "error": "stage subprocess context result is missing, corrupt, or failed validation",
-            }
-        return {"status": "success", "context": updated_context}
-    finally:
         _cleanup_temp_file(result_file_path)
         try:
             os.rmdir(result_dir)
         except OSError:
             pass
+
+
+def _resolve_stage_result_signal(
+    result_signal: object,
+    result_file_path: str,
+) -> dict[str, Any]:
+    if not isinstance(result_signal, dict):
+        return {"status": "error", "error": "stage subprocess returned an invalid status signal"}
+
+    status = result_signal.get("status", "error")
+    if status == "error":
+        return result_signal
+    if status != "success":
+        return {"status": "error", "error": f"stage subprocess returned unknown status={status}"}
+
+    updated_context = _read_context_from_file(
+        result_file_path,
+        expected_sha256=str(result_signal.get("context_sha256") or "") or None,
+    )
+    if updated_context is None:
+        return {
+            "status": "error",
+            "error": "stage subprocess context result is missing, corrupt, or failed validation",
+        }
+    return {"status": "success", "context": updated_context}
+
+
+def _stop_process(process: Any) -> None:
+    try:
+        process.join(timeout=0)
+        if not process.is_alive():
+            return
+        process.terminate()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+    except Exception:
+        logging.exception("[control] failed to stop stage subprocess cleanly")
 
 
 def _context_sha256(context: dict[str, Any]) -> str:

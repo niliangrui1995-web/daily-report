@@ -48,7 +48,7 @@ class _FakeSession:
 
 
 def test_proxy_canary_requires_real_inference_text(monkeypatch: pytest.MonkeyPatch) -> None:
-    nonce = "VCP_CANARY_0123456789abcdef"
+    nonce = "VCP_CANARY_0123456789abcdef"  # pragma: allowlist secret
     session = _FakeSession(
         {
             "id": "response-id",
@@ -88,8 +88,23 @@ def test_proxy_canary_rejects_empty_inference(monkeypatch: pytest.MonkeyPatch) -
     assert session.closed is True
 
 
+def test_proxy_canary_rejects_external_plain_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        requests,
+        "Session",
+        lambda: (_ for _ in ()).throw(AssertionError("network call must not be attempted")),
+    )
+
+    with pytest.raises(RuntimeError, match="HTTPS"):
+        scheduled_task_canary._probe_proxy(
+            "http://api.example.invalid/v1",
+            "configured-key",
+            "gpt-5.6-sol",
+        )
+
+
 def test_proxy_canary_rejects_failed_inference_status(monkeypatch: pytest.MonkeyPatch) -> None:
-    nonce = "VCP_CANARY_0123456789abcdef"
+    nonce = "VCP_CANARY_0123456789abcdef"  # pragma: allowlist secret
     session = _FakeSession({"id": "response-id", "status": "failed", "output_text": nonce})
     monkeypatch.setattr(requests, "Session", lambda: session)
     monkeypatch.setattr(scheduled_task_canary.secrets, "token_hex", lambda _length: "0123456789abcdef")

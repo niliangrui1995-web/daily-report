@@ -7,8 +7,10 @@ import time
 import random
 import logging
 import uuid
+import ipaddress
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 # Why: FAKE_HEADERS 统一在 config.py 定义，避免分散维护
 from config import FAKE_HEADERS
@@ -68,6 +70,26 @@ _INPUT_TOO_LARGE_MARKERS = (
     'maximum number of input tokens',
     'content too large',
 )
+
+
+def validate_model_base_url(base_url: str) -> tuple[bool, bool, str]:
+    try:
+        parsed = urlparse(base_url)
+        hostname = (parsed.hostname or '').strip().lower()
+    except Exception:
+        return False, False, 'invalid model endpoint URL'
+
+    if parsed.scheme not in {'http', 'https'} or not hostname:
+        return False, False, 'invalid model endpoint URL'
+
+    try:
+        is_loopback = ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        is_loopback = hostname == 'localhost'
+
+    if parsed.scheme == 'http' and not is_loopback:
+        return False, False, 'external model endpoints must use HTTPS'
+    return True, is_loopback, ''
 
 
 def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
@@ -403,6 +425,9 @@ class NativeLLMAdapter(RunnableSerializable):
     ):
         resolved_base_url = base_url or os.environ.get('ANTIGRAVITY_BASE_URL', 'http://127.0.0.1:8045')
         resolved_api_key = api_key or os.environ.get('ANTIGRAVITY_API_KEY', os.environ.get('OPENAI_API_KEY', ''))
+        endpoint_ok, _, endpoint_error = validate_model_base_url(resolved_base_url)
+        if not endpoint_ok:
+            raise ValueError(endpoint_error)
 
         model_lower = model.lower()
         if _should_use_openai_compat_proxy(model_lower, resolved_base_url):
@@ -702,7 +727,7 @@ class NativeLLMAdapter(RunnableSerializable):
             from anthropic import Anthropic
             client = Anthropic(api_key=self.api_key, base_url=self.base_url, default_headers=FAKE_HEADERS)
             object.__setattr__(self, '_anthropic_client', client)
-        client = getattr(self, '_anthropic_client')
+        client = self._anthropic_client
 
         kwargs = {
             'model': self.model,
@@ -763,7 +788,7 @@ class NativeLLMAdapter(RunnableSerializable):
                 )
             object.__setattr__(self, '_gemini_client', client)
         
-        client = getattr(self, '_gemini_client')
+        client = self._gemini_client
 
         # Why: import 提出循环外，避免每次重试都做模块查找（虽然 Python 有缓存，但无必要）
         from google.genai import types
@@ -871,7 +896,7 @@ class NativeLLMAdapter(RunnableSerializable):
             # Keep retry budgeting in this adapter instead of the SDK's hidden retry loop.
             client = OpenAI(api_key=self.api_key, base_url=base_url, max_retries=0)
             object.__setattr__(self, '_openai_client', client)
-        client = getattr(self, '_openai_client')
+        client = self._openai_client
 
         messages = []
         if system_prompt:

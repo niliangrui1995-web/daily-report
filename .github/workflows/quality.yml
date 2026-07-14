@@ -2,6 +2,7 @@ name: Quality
 
 on:
   push:
+    branches: [master]
   pull_request:
 
 permissions:
@@ -24,10 +25,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
         with:
           version: "0.11.28"
           enable-cache: true
@@ -39,21 +40,58 @@ jobs:
           uv lock --check
           uv sync --locked --group dev
 
-      - name: Lint critical errors
-        run: uv run ruff check 每日战报
+      - name: Lint Python sources
+        run: uv run ruff check 每日战报 ops 亚洲寡头行情
 
-      - name: Compile source
-        run: uv run python -m compileall -q 每日战报
+      - name: Compile Python sources
+        run: uv run python -m compileall -q 每日战报 ops 亚洲寡头行情
+
+      - name: Parse PowerShell scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem -LiteralPath ops -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_.Message }
+              exit 1
+            }
+          }
 
       - name: Run tests with coverage
         run: uv run pytest --cov --cov-report=term-missing --cov-fail-under=65 -q
 
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install Python and locked dependencies
+        run: |
+          uv python install
+          uv lock --check
+          uv sync --locked --group dev
+
       - name: Audit locked runtime dependencies
-        if: runner.os == 'Linux'
         run: |
           uv export --locked --no-dev --output-file .audit-requirements.txt
           uv run pip-audit --requirement .audit-requirements.txt --disable-pip
 
       - name: Reject new secrets
-        if: runner.os == 'Linux'
+        if: ${{ !cancelled() }}
         run: git ls-files -z | xargs -0 uv run detect-secrets-hook --baseline .secrets.baseline

@@ -7,10 +7,22 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class TestProviderErrorClassification:
+    def test_adapter_rejects_external_plain_http(self):
+        from native_llm_adapter import NativeLLMAdapter
+
+        with pytest.raises(ValueError, match="HTTPS"):
+            NativeLLMAdapter(
+                model="gpt-5.6-sol",
+                base_url="http://api.example.invalid/v1",
+                api_key="configured-key",  # pragma: allowlist secret
+            )
+
     def test_permission_denied_is_not_misclassified_as_risk_control(self):
         from native_llm_adapter import _classify_provider_error
 
@@ -59,7 +71,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="gemini-3.1-pro-high",
             base_url="http://127.0.0.1:7861/antigravity/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
         )
 
         assert adapter.provider == "openai_compat"
@@ -70,7 +82,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="claude-opus-4-6-thinking",
             base_url="http://127.0.0.1:7861/antigravity/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
         )
 
         assert adapter.provider == "openai_compat"
@@ -81,7 +93,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="claude-sonnet-4-6",
             base_url="http://127.0.0.1:7861/antigravity/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
         )
 
         assert adapter.provider == "openai_compat"
@@ -92,7 +104,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="gemini-3.1-pro-high",
             base_url="http://127.0.0.1:8317/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
         )
 
         assert adapter.provider == "openai_compat"
@@ -103,7 +115,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="claude-opus-4-6-thinking",
             base_url="http://127.0.0.1:8317/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
         )
 
         assert adapter.provider == "openai_compat"
@@ -114,7 +126,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="claude-sonnet-4-6",
             base_url="http://127.0.0.1:8317/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
         )
 
         assert adapter.provider == "openai_compat"
@@ -125,7 +137,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="gemini-2.5-flash",
             base_url="http://127.0.0.1:8317/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
         )
 
         assert adapter.provider == "google"
@@ -136,7 +148,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="gemini-3.5-flash",
             base_url="http://127.0.0.1:8317/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
         )
 
         assert adapter.provider == "google"
@@ -173,12 +185,12 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="gemini-3.5-flash",
             base_url="http://127.0.0.1:8317/v1",
-            api_key="gemini-key",
+            api_key="gemini-key",  # pragma: allowlist secret
             max_retries=1,
         )
 
         assert adapter._call_gemini("ping") == "OK"
-        assert client_kwargs["api_key"] == "gemini-key"
+        assert client_kwargs["api_key"] == "gemini-key"  # pragma: allowlist secret
         assert client_kwargs["http_options"].timeout == 300_000
         assert generate_kwargs["model"] == "gemini-3.5-flash"
 
@@ -205,7 +217,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="gpt-5.6-sol",
             base_url="http://127.0.0.1:8317/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
             max_retries=1,
             reasoning_effort="max",
         )
@@ -253,7 +265,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="gpt-5.6-sol",
             base_url="http://127.0.0.1:8317/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
             max_retries=1,
             reasoning_effort="max",
             reasoning_summary="auto",
@@ -298,7 +310,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="gpt-5.6-sol",
             base_url="http://127.0.0.1:8317/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
             max_retries=1,
             reasoning_effort="max",
             reasoning_summary="auto",
@@ -364,7 +376,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="gpt-5.6-sol",
             base_url="http://127.0.0.1:8317/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
             max_retries=2,
             reasoning_effort="max",
             reasoning_summary="auto",
@@ -398,7 +410,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="claude-sonnet-4-6",
             base_url="http://127.0.0.1:8317/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
             max_retries=1,
         )
 
@@ -428,7 +440,7 @@ class TestProviderErrorClassification:
         adapter = NativeLLMAdapter(
             model="claude-sonnet-4-6",
             base_url="http://127.0.0.1:8317/v1",
-            api_key="pwd",
+            api_key="pwd",  # pragma: allowlist secret
             max_retries=1,
         )
 
@@ -471,7 +483,7 @@ class TestProviderErrorClassification:
 
         monkeypatch.setattr(requests, "post", fake_post)
 
-        adapter = NativeLLMAdapter(model="grok-4.3", api_key="secret", max_retries=1)
+        adapter = NativeLLMAdapter(model="grok-4.3", api_key="secret", max_retries=1)  # pragma: allowlist secret
 
         assert adapter._call_grok_native("system", "user") == "Grok answer"
         assert calls[0]["json"]["model"] == "grok-4.3"
@@ -497,7 +509,7 @@ class TestProviderErrorClassification:
         monkeypatch.setenv("GROK_NATIVE_MAX_OUTPUT_TOKENS", "1024")
         monkeypatch.setattr(requests, "post", lambda *args, **kwargs: calls.append(kwargs) or FakeResponse())
 
-        adapter = NativeLLMAdapter(model="grok-4.3", api_key="secret", max_retries=1)
+        adapter = NativeLLMAdapter(model="grok-4.3", api_key="secret", max_retries=1)  # pragma: allowlist secret
 
         assert adapter._call_grok_native("", "user") == "ok"
         assert calls[0]["json"]["tools"] == [{"type": "x_search"}]
@@ -521,7 +533,7 @@ class TestProviderErrorClassification:
         monkeypatch.setattr(requests, "post", lambda *args, **kwargs: calls.append(kwargs) or PermissionDeniedResponse())
         monkeypatch.setattr(native_llm_adapter.time, "sleep", lambda seconds: sleeps.append(seconds))
 
-        adapter = NativeLLMAdapter(model="grok-4.3", api_key="secret", max_retries=3)
+        adapter = NativeLLMAdapter(model="grok-4.3", api_key="secret", max_retries=3)  # pragma: allowlist secret
 
         assert adapter._call_grok_native("", "user") == ""
         assert len(calls) == 1
@@ -545,7 +557,7 @@ class TestProviderErrorClassification:
         class FakeCompletions:
             chat = SimpleNamespace(completions=FailingOpenAIClient())
 
-        adapter = NativeLLMAdapter(model="gpt-5.6-sol", api_key="secret", max_retries=1)
+        adapter = NativeLLMAdapter(model="gpt-5.6-sol", api_key="secret", max_retries=1)  # pragma: allowlist secret
         object.__setattr__(adapter, "_openai_client", FakeCompletions())
 
         result = adapter.invoke("hello")
@@ -580,7 +592,7 @@ class TestProviderErrorClassification:
         class FakeCompletions:
             chat = SimpleNamespace(completions=FailingOpenAIClient())
 
-        adapter = NativeLLMAdapter(model="gpt-5.6-sol", api_key="secret", max_retries=1)
+        adapter = NativeLLMAdapter(model="gpt-5.6-sol", api_key="secret", max_retries=1)  # pragma: allowlist secret
         object.__setattr__(adapter, "_openai_client", FakeCompletions())
 
         result = adapter.invoke("hello")

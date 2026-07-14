@@ -37,6 +37,9 @@ Thumbs.db
 .ruff_cache/
 .coverage
 coverage.xml
+coverage.json
+coverage_research_audit.json
+coverage_research_audit_target.json
 htmlcov/
 .audit-requirements.txt
 .agent/

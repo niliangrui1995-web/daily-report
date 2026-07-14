@@ -214,6 +214,12 @@ def test_build_research_plan_budget_paths_and_identity_rewrites(monkeypatch):
     assert plan["max_topics"] == 1
     assert plan["max_rounds"] == 2
 
+    clean_query = p7.build_research_plan(
+        "DEEP_RESEARCH: completely ordinary detailed gamma topic\n"
+        "SEARCH: ordinary clean supplement query"
+    )
+    assert clean_query["supplement_queries"] == ["ordinary clean supplement query"]
+
     single = p7.build_research_plan(
         "DEEP_RESEARCH: completely ordinary detailed alpha topic"
     )
@@ -335,6 +341,11 @@ def test_structured_helpers_valid_and_fallback_paths():
     assert p7._structured_dates(structured, "fallback") == ["2026-07-14"]
     assert p7._structured_implications(structured, ["fallback"]) == ["suppliers benefit"]
     assert p7._structured_open_questions(structured, {}, "topic") == ["losing side?"]
+    assert p7._structured_open_questions(
+        {"open_questions": []},
+        {"cause": True, "winners": True, "losers": True, "alternatives": True},
+        "topic",
+    ) == []
 
     fallback = "Cause found on 2026-07-14 and 2026/7/15; winner benefits supplier."
     assert p7._structured_claim_lines({}, fallback)
@@ -551,6 +562,47 @@ def test_iterative_search_no_entities_low_novelty_and_max_rounds(monkeypatch):
     result = p7.iterative_deep_search("topic", rounds=1, round_backtracks=[""])
     assert result["stop_reason"] == "max_rounds_reached"
     assert result["rounds_run"] == 1
+
+
+def test_iterative_search_structured_entities_and_coverage_complete(monkeypatch):
+    results = [
+        {
+            "text": "round one",
+            "structured": {
+                "summary": "round one",
+                "claims": ["NVIDIA cause is grounded with detailed evidence."],
+                "entities": ["NVIDIA"],
+                "coverage_flags": {
+                    "cause": True,
+                    "winners": True,
+                    "losers": False,
+                    "alternatives": False,
+                },
+            },
+            "grounding_sources": [],
+        },
+        {
+            "text": "round two",
+            "structured": {
+                "summary": "round two",
+                "claims": ["AMD downside and glass alternatives add distinct detailed evidence."],
+                "entities": ["AMD", "Glass"],
+                "coverage_flags": {
+                    "cause": True,
+                    "winners": True,
+                    "losers": True,
+                    "alternatives": True,
+                },
+            },
+            "grounding_sources": [],
+        },
+    ]
+    _install_p7_search(monkeypatch, results)
+    monkeypatch.setattr(p7, "_estimate_incremental_novelty", lambda *args: 1.0)
+    result = p7.iterative_deep_search("topic", rounds=3, round_backtracks=[""])
+    assert result["stop_reason"] == "coverage_complete"
+    assert result["rounds_run"] == 2
+    assert result["coverage"] == ["alternatives", "cause", "losers", "winners"]
 
 
 def test_run_deep_research_skip_success_filter_and_worker_exception(monkeypatch):
@@ -1050,6 +1102,11 @@ def test_p7a_degraded_empty_json_and_markdown_only_with_successful_artifacts(
         "extract_json_from_llm_response",
         lambda *args, **kwargs: (_ for _ in ()).throw(error),
     )
+    monkeypatch.setattr(
+        audit_engine,
+        "filter_rejected_stock_tree",
+        lambda data, names: ({"meta": {}, "raw_json_attempt": ""}, 0),
+    )
     empty_json_content = "===MARKDOWN===" + "grounded markdown body " * 10
     monkeypatch.setattr(
         audit_engine,
@@ -1080,3 +1137,22 @@ def test_p7a_degraded_empty_json_and_markdown_only_with_successful_artifacts(
     result = audit_engine.p7a_deep_research_audit(raw)
     assert result == markdown_only
     assert set(manifests[-1][1]["files"]) == {"md"}
+
+    valid_json_only = '{"topics":[],"padding":"' + ("x" * 150) + '"}===MARKDOWN==='
+    monkeypatch.setattr(
+        audit_engine,
+        "extract_json_from_llm_response",
+        lambda *args, **kwargs: {"topics": []},
+    )
+    monkeypatch.setattr(
+        audit_engine,
+        "_invoke_audit_with_fallback",
+        lambda *args, **kwargs: (
+            SimpleNamespace(content=valid_json_only),
+            _Adapter(),
+            {"audit_fallback_used": False},
+        ),
+    )
+    result = audit_engine.p7a_deep_research_audit(raw)
+    assert result == valid_json_only
+    assert manifests[-1][1]["status"] == "completed"

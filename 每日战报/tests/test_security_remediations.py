@@ -364,6 +364,7 @@ def test_search_5xx_trips_channel_and_uses_tavily(monkeypatch, caplog):
     direct_rotator = search_engine.SearchKeyRotator(["key_A", "key_B", "key_C"], "https://example.invalid")
     breaker = search_engine.ChannelCircuitBreaker(threshold=2)
     calls = []
+    sleeps = []
 
     def fake_post(**kwargs):
         calls.append(kwargs)
@@ -372,6 +373,8 @@ def test_search_5xx_trips_channel_and_uses_tavily(monkeypatch, caplog):
     monkeypatch.setattr(search_engine, "search_rotator_direct", direct_rotator)
     monkeypatch.setattr(search_engine, "channel_breaker", breaker)
     monkeypatch.setattr(search_engine, "_post_search_request", fake_post)
+    monkeypatch.setattr(search_engine.time, "sleep", sleeps.append)
+    monkeypatch.setattr(search_engine.random, "uniform", lambda start, end: start)
     monkeypatch.setattr(
         search_engine,
         "_tavily_fallback",
@@ -384,9 +387,62 @@ def test_search_5xx_trips_channel_and_uses_tavily(monkeypatch, caplog):
 
     assert result["text"] == "fallback ok"
     assert len(calls) == 2
+    assert [call["key"] for call in calls] == ["key_A", "key_A"]
+    assert sleeps == [3]
     assert breaker.is_tripped("direct") is True
     assert direct_rotator.available == 3
     assert "server_error on direct" in caplog.text
+
+
+def test_search_503_retries_same_key_then_recovers(monkeypatch):
+    import search_engine
+
+    class ServerErrorResponse:
+        status_code = 503
+        text = "503 UNAVAILABLE: model overloaded"
+
+    class SuccessResponse:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "recovered"}]},
+                        "groundingMetadata": {"groundingChunks": []},
+                    }
+                ]
+            }
+
+    responses = iter([ServerErrorResponse(), SuccessResponse()])
+    calls = []
+    sleeps = []
+
+    def fake_post(**kwargs):
+        calls.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(
+        search_engine,
+        "search_rotator_direct",
+        search_engine.SearchKeyRotator(["key_A", "key_B"], "https://example.invalid"),
+    )
+    monkeypatch.setattr(search_engine, "channel_breaker", search_engine.ChannelCircuitBreaker(threshold=2))
+    monkeypatch.setattr(search_engine, "_post_search_request", fake_post)
+    monkeypatch.setattr(search_engine.time, "sleep", sleeps.append)
+    monkeypatch.setattr(search_engine.random, "uniform", lambda start, end: start)
+    monkeypatch.setattr(search_engine, "_tavily_fallback", lambda *args, **kwargs: {})
+
+    result = search_engine.raw_gemini_search("test prompt", max_retries=3, return_dict=True)
+
+    assert result["text"] == "recovered"
+    assert [call["key"] for call in calls] == ["key_A", "key_A"]
+    assert sleeps == [3]
+    assert search_engine.channel_breaker.state("direct") == "closed"
 
 
 def test_search_permission_denied_403_does_not_exhaust_gemini_key(monkeypatch, caplog):

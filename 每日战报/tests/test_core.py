@@ -913,6 +913,30 @@ class TestCircuitBreaker:
         cb.record_failure("direct")
         assert cb.is_tripped("direct") is False  # 中间成功过，计数重置
 
+    def test_half_open_allows_only_one_probe(self, monkeypatch):
+        """冷却结束后仅首个调用可执行 HALF_OPEN 探测"""
+        import search_engine
+
+        now = [100.0]
+        monkeypatch.setattr(search_engine.time, "time", lambda: now[0])
+        cb = search_engine.ChannelCircuitBreaker(threshold=1, cooldown_sec=10, max_cooldown_sec=30)
+
+        cb.record_failure("direct")
+        assert cb.state("direct") == "open"
+        assert cb.is_tripped("direct") is True
+
+        now[0] = 111.0
+        assert cb.is_tripped("direct") is False
+        assert cb.state("direct") == "half_open"
+        assert cb.is_tripped("direct") is True
+
+        cb.record_failure("direct")
+        assert cb.state("direct") == "open"
+        now[0] = 142.0
+        assert cb.is_tripped("direct") is False
+        cb.record_success("direct")
+        assert cb.state("direct") == "closed"
+
 
 
 

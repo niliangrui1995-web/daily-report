@@ -74,47 +74,80 @@ class SearchKeyRotator:
 
 
 class ChannelCircuitBreaker:
-    """Per-channel circuit breaker with cooldown probing."""
+    """Thread-safe per-channel circuit breaker with one HALF_OPEN probe."""
 
-    def __init__(self, threshold: int = 2, cooldown_sec: int = 300):
+    def __init__(self, threshold: int = 2, cooldown_sec: int = 120, max_cooldown_sec: int = 300):
         self._failures: dict[str, int] = {}
-        self._tripped: set[str] = set()
-        self._tripped_time: dict[str, float] = {}
+        self._states: dict[str, str] = {}
+        self._opened_at: dict[str, float] = {}
+        self._cooldowns: dict[str, int] = {}
         self._threshold = threshold
-        self._cooldown = cooldown_sec
+        self._initial_cooldown = cooldown_sec
+        self._max_cooldown = max(max_cooldown_sec, cooldown_sec)
         self._lock = threading.Lock()
 
     def record_failure(self, channel_name: str):
         with self._lock:
+            state = self._states.get(channel_name, "closed")
+            if state == "open":
+                # Requests admitted before OPEN may finish later; they must not
+                # extend the cooldown or emit duplicate trip events.
+                return
+            if state == "half_open":
+                self._failures[channel_name] = self._threshold
+                self._states[channel_name] = "open"
+                self._opened_at[channel_name] = time.time()
+                self._cooldowns[channel_name] = self._max_cooldown
+                logging.warning(
+                    f"[search] half-open probe failed for {channel_name}; reopen for {self._max_cooldown}s"
+                )
+                return
+
             self._failures[channel_name] = self._failures.get(channel_name, 0) + 1
             if self._failures[channel_name] >= self._threshold:
-                self._tripped.add(channel_name)
-                self._tripped_time[channel_name] = time.time()
+                self._states[channel_name] = "open"
+                self._opened_at[channel_name] = time.time()
+                self._cooldowns[channel_name] = self._initial_cooldown
                 logging.warning(
-                    f"[search] circuit breaker tripped for {channel_name} after {self._threshold} failures"
+                    f"[search] circuit breaker opened for {channel_name} after {self._threshold} failures; "
+                    f"cooldown={self._initial_cooldown}s"
                 )
 
     def trip(self, channel_name: str):
         with self._lock:
             self._failures[channel_name] = self._threshold
-            self._tripped.add(channel_name)
-            self._tripped_time[channel_name] = time.time()
+            self._states[channel_name] = "open"
+            self._opened_at[channel_name] = time.time()
+            self._cooldowns[channel_name] = self._initial_cooldown
 
     def record_success(self, channel_name: str):
         with self._lock:
+            if self._states.get(channel_name, "closed") == "open":
+                # Ignore late successes from requests that were already in flight
+                # when another request opened the circuit.
+                return
             self._failures[channel_name] = 0
-            self._tripped.discard(channel_name)
-            self._tripped_time.pop(channel_name, None)
+            self._states[channel_name] = "closed"
+            self._opened_at.pop(channel_name, None)
+            self._cooldowns.pop(channel_name, None)
+
+    def state(self, channel_name: str) -> str:
+        with self._lock:
+            return self._states.get(channel_name, "closed")
 
     def is_tripped(self, channel_name: str) -> bool:
         with self._lock:
-            if channel_name not in self._tripped:
+            state = self._states.get(channel_name, "closed")
+            if state == "closed":
                 return False
-            elapsed = time.time() - self._tripped_time.get(channel_name, 0)
-            if elapsed > self._cooldown:
-                self._tripped.discard(channel_name)
-                self._tripped_time.pop(channel_name, None)
-                logging.info(f"[search] cooldown finished for {channel_name}; probe once")
+            if state == "half_open":
+                return True
+
+            elapsed = time.time() - self._opened_at.get(channel_name, 0)
+            cooldown = self._cooldowns.get(channel_name, self._initial_cooldown)
+            if elapsed >= cooldown:
+                self._states[channel_name] = "half_open"
+                logging.info(f"[search] cooldown finished for {channel_name}; allow one half-open probe")
                 return False
             return True
 
@@ -150,6 +183,8 @@ def _search_response_text(response: requests.Response) -> str:
 
 def _classify_search_http_response(response: requests.Response) -> str:
     status_code = getattr(response, "status_code", 0)
+    if status_code == 408:
+        return "server_error"
     if status_code == 400:
         text = _search_response_text(response).lower()
         if "location is not supported" in text or "failed_precondition" in text:
@@ -178,25 +213,51 @@ def _handle_search_limited_response(
     key_idx: int,
     key_last4: str,
     response: requests.Response,
-) -> bool:
+) -> str:
     classification = _classify_search_http_response(response)
     if not classification:
-        return False
+        return ""
 
     if classification == "quota_exhausted":
         logging.warning(f"[{category}] key ...{key_last4} limited on {channel_name}")
         rotator.mark_exhausted(key_idx)
-        return True
+        return classification
 
     if classification in {"bad_request", "unsupported_location"}:
         channel_breaker.trip(channel_name)
     else:
         channel_breaker.record_failure(channel_name)
     logging.warning(
-        f"[{category}] {classification} on {channel_name}; keep key ...{key_last4} available | "
+        f"[{category}] {classification} on {channel_name}; keep key ...{key_last4} available; "
+        f"breaker={channel_breaker.state(channel_name)} | "
         f"{_search_response_text(response)[:240]}"
     )
-    return True
+    return classification
+
+
+_SERVER_ERROR_RETRY_WINDOWS = ((3.0, 6.0), (8.0, 15.0), (18.0, 30.0))
+
+
+def _server_error_retry_delay(attempt: int) -> float:
+    low, high = _SERVER_ERROR_RETRY_WINDOWS[min(attempt, len(_SERVER_ERROR_RETRY_WINDOWS) - 1)]
+    return random.uniform(low, high)
+
+
+def _log_server_error_retry(
+    *,
+    category: str,
+    channel_name: str,
+    key_last4: str,
+    attempt: int,
+    max_retries: int,
+    delay: float,
+    prompt: str,
+):
+    logging.warning(
+        f"[{category}] transient server error; retry same key ...{key_last4} in {delay:.1f}s "
+        f"({attempt + 2}/{max_retries}); channel={channel_name}; model={GEMINI_SEARCH_MODEL}; "
+        f"tool=google_search; prompt_chars={len(prompt)}"
+    )
 
 P7_STRUCTURED_MODE = "p7"
 _TAVILY_FALLBACK_MARKER = "[Tavily Fallback]"
@@ -640,10 +701,7 @@ def raw_gemini_search(prompt: str, max_retries: int = 3, *, return_dict: bool = 
     channels = [("direct", search_rotator_direct)]
 
     for channel_name, rotator in channels:
-        if channel_breaker.is_tripped(channel_name):
-            logging.debug(f"[raw_search] skip tripped channel {channel_name}")
-            continue
-
+        stop_channel = False
         for _ in range(rotator.total):
             if channel_breaker.is_tripped(channel_name):
                 logging.debug(f"[raw_search] skip tripped channel {channel_name}")
@@ -662,14 +720,32 @@ def raw_gemini_search(prompt: str, max_retries: int = 3, *, return_dict: bool = 
                         prompt=prompt,
                         temperature=0.7,
                     )
-                    if _handle_search_limited_response(
+                    classification = _handle_search_limited_response(
                         category="raw_search",
                         channel_name=channel_name,
                         rotator=rotator,
                         key_idx=key_idx,
                         key_last4=key_last4,
                         response=response,
-                    ):
+                    )
+                    if classification:
+                        if classification == "server_error":
+                            if attempt < max_retries - 1 and channel_breaker.state(channel_name) == "closed":
+                                delay = _server_error_retry_delay(attempt)
+                                _log_server_error_retry(
+                                    category="raw_search",
+                                    channel_name=channel_name,
+                                    key_last4=key_last4,
+                                    attempt=attempt,
+                                    max_retries=max_retries,
+                                    delay=delay,
+                                    prompt=prompt,
+                                )
+                                time.sleep(delay)
+                                continue
+                            stop_channel = True
+                        elif classification != "quota_exhausted":
+                            stop_channel = True
                         break
 
                     response.raise_for_status()
@@ -686,6 +762,7 @@ def raw_gemini_search(prompt: str, max_retries: int = 3, *, return_dict: bool = 
                 except requests.exceptions.ConnectTimeout:
                     channel_breaker.record_failure(channel_name)
                     logging.warning(f"[raw_search] connect timeout on {channel_name}")
+                    stop_channel = True
                     break
                 except Exception as exc:
                     err_str = _redact_sensitive_log_text(exc)
@@ -699,6 +776,9 @@ def raw_gemini_search(prompt: str, max_retries: int = 3, *, return_dict: bool = 
                         f"[raw_search] exception on {channel_name}: {err_str}; retry in {wait:.0f}s ({attempt + 1}/{max_retries})"
                     )
                     time.sleep(wait)
+
+            if stop_channel:
+                break
 
     result = _tavily_fallback(prompt, category="raw_search", return_dict=return_dict)
     if result:
@@ -722,10 +802,7 @@ def gemini_search(
     channels = [("direct", search_rotator_direct)]
 
     for channel_name, rotator in channels:
-        if channel_breaker.is_tripped(channel_name):
-            logging.debug(f"[{category}] skip tripped channel {channel_name}")
-            continue
-
+        stop_channel = False
         for _ in range(rotator.total):
             if channel_breaker.is_tripped(channel_name):
                 logging.debug(f"[{category}] skip tripped channel {channel_name}")
@@ -744,14 +821,32 @@ def gemini_search(
                         prompt=prompt,
                         temperature=1.0,
                     )
-                    if _handle_search_limited_response(
+                    classification = _handle_search_limited_response(
                         category=category,
                         channel_name=channel_name,
                         rotator=rotator,
                         key_idx=key_idx,
                         key_last4=key_last4,
                         response=response,
-                    ):
+                    )
+                    if classification:
+                        if classification == "server_error":
+                            if attempt < max_retries - 1 and channel_breaker.state(channel_name) == "closed":
+                                delay = _server_error_retry_delay(attempt)
+                                _log_server_error_retry(
+                                    category=category,
+                                    channel_name=channel_name,
+                                    key_last4=key_last4,
+                                    attempt=attempt,
+                                    max_retries=max_retries,
+                                    delay=delay,
+                                    prompt=prompt,
+                                )
+                                time.sleep(delay)
+                                continue
+                            stop_channel = True
+                        elif classification != "quota_exhausted":
+                            stop_channel = True
                         break
 
                     response.raise_for_status()
@@ -775,6 +870,7 @@ def gemini_search(
                 except requests.exceptions.ConnectTimeout:
                     channel_breaker.record_failure(channel_name)
                     logging.warning(f"[{category}] connect timeout on {channel_name}")
+                    stop_channel = True
                     break
                 except Exception as exc:
                     err_str = _redact_sensitive_log_text(exc)
@@ -788,6 +884,9 @@ def gemini_search(
                         f"[{category}] exception on {channel_name}: {err_str}; retry in {wait:.0f}s ({attempt + 1}/{max_retries})"
                     )
                     time.sleep(wait)
+
+            if stop_channel:
+                break
 
     result = _tavily_fallback(query, category=category, return_dict=True)
     if result:

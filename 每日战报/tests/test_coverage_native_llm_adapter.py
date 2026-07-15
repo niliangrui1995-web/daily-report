@@ -65,6 +65,10 @@ def test_url_validation_covers_parse_failure_and_endpoint_classes(monkeypatch):
 @pytest.mark.parametrize(
     ("message", "category"),
     [
+        (
+            "503 auth_unavailable: no auth available (providers=codex, model=gpt-5.6-sol)",
+            "auth_unavailable",
+        ),
         ("503 RESOURCE_EXHAUSTED", "rate_limit"),
         ("request deadline exceeded", "timeout"),
         ("an unrecognised provider problem", "unknown_error"),
@@ -73,6 +77,24 @@ def test_url_validation_covers_parse_failure_and_endpoint_classes(monkeypatch):
 def test_error_classification_remaining_categories(message, category):
     result = adapter_module._classify_provider_error(RuntimeError(message))
     assert result == {"category": category, "retryable": True}
+
+
+def test_auth_unavailable_log_is_not_reported_as_rate_limit(monkeypatch, caplog):
+    adapter = make_adapter(max_retries=2)
+    monkeypatch.setattr(adapter_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(adapter_module.random, "uniform", lambda *_args: 0)
+
+    with caplog.at_level("WARNING"):
+        should_retry = adapter._handle_provider_error(
+            "OpenAI Responses",
+            RuntimeError("HTTP 503 auth_unavailable: no auth available"),
+            0,
+        )
+
+    assert should_retry is True
+    assert adapter.last_error_category == "auth_unavailable"
+    assert "认证池暂时不可用" in caplog.text
+    assert "触发限流" not in caplog.text
 
 
 def test_model_routing_helpers_cover_negative_and_official_variants():
@@ -726,6 +748,66 @@ def test_openai_responses_exception_retry_payload_and_error_reset(monkeypatch):
     assert adapter.last_response_model == "served"
 
 
+def test_openai_responses_retry_time_is_bounded_by_total_budget(monkeypatch):
+    import requests
+
+    clock = {"now": 0.0}
+    request_timeouts = []
+    sleeps = []
+
+    def post(*_args, **kwargs):
+        request_timeout = float(kwargs["timeout"])
+        request_timeouts.append(request_timeout)
+        clock["now"] += request_timeout
+        raise requests.Timeout("request timeout")
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(requests, "post", post)
+    monkeypatch.setattr(adapter_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(adapter_module.time, "sleep", sleep)
+    monkeypatch.setattr(adapter_module.random, "uniform", lambda *_args: 0)
+    adapter = make_adapter(
+        "gpt-5.6-sol",
+        timeout=600,
+        max_retries=5,
+        use_responses_api=True,
+        total_timeout_seconds=840,
+    )
+
+    assert adapter._call_openai_responses("", "question") == ("", "")
+    assert request_timeouts == [600.0, 225.0]
+    assert sleeps == [15]
+    assert sum(request_timeouts) + sum(sleeps) == 840.0
+    assert adapter.last_error_category == "timeout"
+
+
+def test_auth_unavailable_fallback_shares_invocation_deadline(monkeypatch):
+    deadlines = []
+
+    def call(self, _system_prompt, _user_prompt, deadline=None):
+        deadlines.append(deadline)
+        if len(deadlines) == 1:
+            self._set_last_error("auth_unavailable", "no auth available")
+            return "", ""
+        self._reset_last_error()
+        self.last_response_model = "backup-served"
+        return "backup answer", ""
+
+    monkeypatch.setattr(NativeLLMAdapter, "_call_openai_compat", call)
+    monkeypatch.setattr(adapter_module.time, "monotonic", lambda: 100.0)
+    adapter = make_adapter("gpt-5.6-sol", total_timeout_seconds=840)
+
+    result = adapter.invoke("question")
+
+    assert result.content == "backup answer"
+    assert len(deadlines) == 2
+    assert deadlines[0] == deadlines[1] == 940.0
+    assert result.response_metadata["model_provenance"]["fallback_reason_category"] == "auth_unavailable"
+
+
 def test_openai_responses_terminal_exception_returns_empty(monkeypatch):
     import requests
 
@@ -738,6 +820,29 @@ def test_openai_responses_terminal_exception_returns_empty(monkeypatch):
 
     assert adapter._call_openai_responses("", "question") == ("", "")
     assert adapter.last_error_category == "rate_limit"
+
+
+def test_openai_responses_classifies_auth_unavailable_from_http_error_body(monkeypatch):
+    import requests
+
+    class AuthUnavailableResponse:
+        status_code = 503
+        text = '{"error":{"message":"auth_unavailable: no auth available"}}'
+
+        def raise_for_status(self):
+            error = requests.HTTPError("503 Server Error")
+            error.response = self
+            raise error
+
+        def json(self):
+            return {"error": {"message": "auth_unavailable: no auth available"}}
+
+    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: AuthUnavailableResponse())
+    adapter = make_adapter("gpt-5.6-sol", max_retries=1, use_responses_api=True)
+
+    assert adapter._call_openai_responses("", "question") == ("", "")
+    assert adapter.last_error_category == "auth_unavailable"
+    assert "no auth available" in adapter.last_error_message
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "google", "openai_compat"])

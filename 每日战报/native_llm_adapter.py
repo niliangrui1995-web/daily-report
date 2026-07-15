@@ -104,6 +104,8 @@ def _classify_provider_error(error: Exception) -> Dict[str, Any]:
         return {'category': 'permission_denied', 'retryable': False}
     if _contains_any(err_lower, _INPUT_TOO_LARGE_MARKERS):
         return {'category': 'input_too_large', 'retryable': False}
+    if 'auth_unavailable' in err_lower or 'no auth available' in err_lower:
+        return {'category': 'auth_unavailable', 'retryable': True}
     if '401' in err_lower or '403' in err_lower or 'balance' in err_lower:
         return {'category': 'risk_control', 'retryable': True}
     if '429' in err_lower or '503' in err_lower or 'resource_exhausted' in err_lower:
@@ -120,6 +122,32 @@ def _classify_provider_error(error: Exception) -> Dict[str, Any]:
     ):
         return {'category': 'network_error', 'retryable': True}
     return {'category': 'unknown_error', 'retryable': True}
+
+
+def _with_http_error_detail(error: Exception) -> Exception:
+    response = getattr(error, 'response', None)
+    if response is None:
+        return error
+
+    detail = ''
+    try:
+        payload = response.json()
+        error_payload = payload.get('error', {}) if isinstance(payload, dict) else {}
+        if isinstance(error_payload, dict):
+            detail = ' '.join(
+                str(error_payload.get(key) or '').strip()
+                for key in ('code', 'type', 'message')
+                if error_payload.get(key)
+            )
+        elif error_payload:
+            detail = str(error_payload)
+    except Exception:
+        detail = str(getattr(response, 'text', '') or '')
+
+    detail = detail.strip()[:1000]
+    if not detail:
+        return error
+    return RuntimeError(f'{error}; response_error={detail}')
 
 
 def _should_use_openai_compat_proxy(model: str, base_url: str) -> bool:
@@ -475,6 +503,7 @@ class NativeLLMAdapter(RunnableSerializable):
         _ = config
         self._reset_last_error()
         self.last_response_model = ''
+        call_deadline = self._new_call_deadline()
 
         if self._tools_prompt:
             system_prompt = system_prompt + self._tools_prompt
@@ -497,7 +526,7 @@ class NativeLLMAdapter(RunnableSerializable):
         elif self.provider == 'google':
             text = self._call_gemini(f"{system_prompt}\n\n{user_prompt}")
         else:
-            result = self._call_openai_compat(system_prompt, user_prompt)
+            result = self._call_openai_compat(system_prompt, user_prompt, call_deadline)
             if isinstance(result, tuple):
                 text, thinking_content = result
             else:
@@ -507,7 +536,12 @@ class NativeLLMAdapter(RunnableSerializable):
         if original_model == 'gpt-5.6-sol' and (not text or self.last_error_category):
             err_msg_lower = self.last_error_message.lower()
             is_quota_or_balance = (
-                self.last_error_category in ('risk_control', 'rate_limit', 'permission_denied') or
+                self.last_error_category in (
+                    'auth_unavailable',
+                    'risk_control',
+                    'rate_limit',
+                    'permission_denied',
+                ) or
                 any(kw in err_msg_lower for kw in ('balance', 'quota', 'credit', 'insufficient', '401', '403', '429', 'limit', 'exceeded'))
             )
             if is_quota_or_balance:
@@ -534,7 +568,7 @@ class NativeLLMAdapter(RunnableSerializable):
                     elif self.provider == 'google':
                         text = self._call_gemini(f"{system_prompt}\n\n{user_prompt}")
                     else:
-                        result = self._call_openai_compat(system_prompt, user_prompt)
+                        result = self._call_openai_compat(system_prompt, user_prompt, call_deadline)
                         if isinstance(result, tuple):
                             text, thinking_content = result
                         else:
@@ -677,6 +711,24 @@ class NativeLLMAdapter(RunnableSerializable):
         self.last_error_category = category
         self.last_error_message = message[:2000]
 
+    def _new_call_deadline(self) -> Optional[float]:
+        raw_budget = (self.extra_kwargs or {}).get('total_timeout_seconds')
+        try:
+            budget = float(raw_budget)
+        except (TypeError, ValueError):
+            return None
+        if budget <= 0:
+            return None
+        return time.monotonic() + budget
+
+    def _bounded_request_timeout(self, deadline: Optional[float]) -> float:
+        if deadline is None:
+            return float(self.timeout)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 0.0
+        return min(float(self.timeout), remaining)
+
     def _handle_provider_error(
         self,
         provider_label: str,
@@ -684,6 +736,7 @@ class NativeLLMAdapter(RunnableSerializable):
         attempt: int,
         *,
         risk_hint: str = '',
+        deadline: Optional[float] = None,
     ) -> bool:
         error_info = _classify_provider_error(error)
         self._set_last_error(error_info['category'], str(error))
@@ -692,12 +745,35 @@ class NativeLLMAdapter(RunnableSerializable):
             logger.error(f"[{provider_label}] final attempt failed: {error}")
             return False
 
+        if deadline is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= wait:
+                category_label = {
+                    'auth_unavailable': '认证池暂时不可用',
+                    'rate_limit': '触发限流',
+                    'timeout': '请求超时',
+                }.get(error_info['category'], error_info['category'])
+                logger.warning(
+                    '[%s] %s；总调用预算仅剩 %.1fs，不再等待 %.1fs 重试',
+                    provider_label,
+                    category_label,
+                    remaining,
+                    wait,
+                )
+                return False
+
         if error_info['category'] == 'permission_denied':
             logger.error(f"🚫 [{provider_label}] 权限/项目配置错误，停止重试: {error}")
             return False
         if error_info['category'] == 'input_too_large':
             logger.error(f"📏 [{provider_label}] 请求过长或上下文超限，停止重试: {error}")
             return False
+        if error_info['category'] == 'auth_unavailable':
+            logger.warning(
+                f"⚠️ [{provider_label}] 认证池暂时不可用，等待 {wait:.1f}s（{attempt + 1}/{self.max_retries}）"
+            )
+            time.sleep(wait)
+            return True
         if error_info['category'] == 'risk_control':
             hint_text = f' {risk_hint}' if risk_hint else ''
             logger.warning(
@@ -886,12 +962,17 @@ class NativeLLMAdapter(RunnableSerializable):
         logger.error(f"❌ [Grok Native] 调用失败，最后错误分类: {self.last_error_category or 'unknown_error'}")
         return ""
 
-    def _call_openai_compat(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
+    def _call_openai_compat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        deadline: Optional[float] = None,
+    ) -> tuple[str, str]:
         # 如果是 Grok，挂载特种 Responses API 来支持原生 X_search
         if 'grok' in self.model.lower():
             return self._call_grok_native(system_prompt, user_prompt), ''
         if (self.extra_kwargs or {}).get('use_responses_api'):
-            return self._call_openai_responses(system_prompt, user_prompt)
+            return self._call_openai_responses(system_prompt, user_prompt, deadline)
 
         # Why: 惰性缓存 OpenAI Client，与 _call_anthropic/_call_gemini 保持一致，避免每次调用都新建连接
         if getattr(self, '_openai_client', None) is None:
@@ -938,8 +1019,16 @@ class NativeLLMAdapter(RunnableSerializable):
         logger.error(f"❌ [OpenAI兼容] 调用失败，最后错误分类: {self.last_error_category or 'unknown_error'}")
         return '', ''
 
-    def _call_openai_responses(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
+    def _call_openai_responses(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        deadline: Optional[float] = None,
+    ) -> tuple[str, str]:
         import requests
+
+        if deadline is None:
+            deadline = self._new_call_deadline()
 
         base_url = self.base_url + '/v1' if not self.base_url.endswith('/v1') else self.base_url
         url = f"{base_url}/responses"
@@ -970,7 +1059,13 @@ class NativeLLMAdapter(RunnableSerializable):
 
         for attempt in range(self.max_retries):
             try:
-                response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+                request_timeout = self._bounded_request_timeout(deadline)
+                if request_timeout <= 0:
+                    if not self.last_error_category:
+                        self._set_last_error('timeout_budget_exhausted', 'total call timeout budget exhausted')
+                    logger.error('[OpenAI Responses] 总调用预算已耗尽，停止请求')
+                    break
+                response = requests.post(url, headers=headers, json=payload, timeout=request_timeout)
                 response.raise_for_status()
                 data = response.json()
                 self.last_response_model = str(data.get('model') or self.model)
@@ -1005,7 +1100,13 @@ class NativeLLMAdapter(RunnableSerializable):
                     self._reset_last_error()
                 return text, reasoning
             except Exception as e:
-                if not self._handle_provider_error('OpenAI Responses', e, attempt):
+                provider_error = _with_http_error_detail(e)
+                if not self._handle_provider_error(
+                    'OpenAI Responses',
+                    provider_error,
+                    attempt,
+                    deadline=deadline,
+                ):
                     break
 
         logger.error(f"❌ [OpenAI Responses] 调用失败，最后错误分类: {self.last_error_category or 'unknown_error'}")

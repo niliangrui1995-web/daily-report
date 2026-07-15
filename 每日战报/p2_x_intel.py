@@ -431,12 +431,26 @@ def collect_from_x(
             if not _sleep_with_budget(wait, overall_start_time, max_total_seconds):
                 stop_reason = 'budget_exhausted'
                 break
-        if stop_reason:
-            stats['stop_reason'] = stop_reason
-        update_run_manifest('p2', status=stats['status'], metrics=stats)
-        return '', stats
-
-    structured_items = parse_p2_structured_items(content)
+        if stop_reason:
+            break
+
+    content = '\n\n'.join(all_filtered_leaks)
+    elapsed = time.time() - overall_start_time
+    stats['duration_seconds'] = round(elapsed, 1)
+    stats['attempted_chunks'] = attempted_chunks
+    stats['successful_chunks'] = successful_chunks
+    stats['total_chunks'] = len(chunks)
+    stats['max_total_seconds'] = max_total_seconds
+
+    if not content.strip() or '<x_leaks>' not in content:
+        logging.warning('⚠️ [P2] 所有批次均未获取到有效情报（全部作废）。')
+        stats['status'] = 'failed_timeout' if stop_reason == 'budget_exhausted' else 'failed_empty'
+        if stop_reason:
+            stats['stop_reason'] = stop_reason
+        update_run_manifest('p2', status=stats['status'], metrics=stats)
+        return '', stats
+
+    structured_items = parse_p2_structured_items(content)
     if stop_reason == 'budget_exhausted':
         stats['status'] = 'partial_timeout'
     elif stop_reason:

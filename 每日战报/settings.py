@@ -113,6 +113,8 @@ OPUS_MODEL = 'gpt-5.6-sol'
 OPUS_REASONING_EFFORT = 'max'
 OPUS_REASONING_SUMMARY = 'auto'
 OPUS_USE_RESPONSES_API = True
+# Why: P6 market_mapping has a 900s hard deadline; reserve 60s for stage cleanup.
+OPUS_TOTAL_TIMEOUT_SECONDS = 840
 
 TAVILY_API_KEY = os.environ.get('TAVILY_API_KEY', '')
 GROK_API_KEY = os.environ.get('GROK_API_KEY', '')
@@ -210,6 +212,7 @@ def _get_opus_adapter():
             reasoning_effort=OPUS_REASONING_EFFORT,
             reasoning_summary=OPUS_REASONING_SUMMARY,
             use_responses_api=OPUS_USE_RESPONSES_API,
+            total_timeout_seconds=OPUS_TOTAL_TIMEOUT_SECONDS,
         )
     return _opus_adapter
 

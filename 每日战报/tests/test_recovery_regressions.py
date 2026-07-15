@@ -409,6 +409,17 @@ def test_inner_thread_timeouts_do_not_claim_hard_deadlines():
     assert "timeout=180" in inspect.getsource(search_engine._post_search_request)
 
 
+def test_opus_call_budget_fits_market_mapping_stage_deadline():
+    import orchestrator
+    import settings
+
+    market_mapping_timeout = orchestrator.CONTROL_STAGE_TIMEOUTS["market_mapping"]
+
+    assert settings.OPUS_TOTAL_TIMEOUT_SECONDS == 840
+    assert settings.OPUS_TOTAL_TIMEOUT_SECONDS <= market_mapping_timeout - 60
+    assert settings.opus_adapter.extra_kwargs["total_timeout_seconds"] == 840
+
+
 def test_legacy_p6_rejection_without_names_is_incomplete_identity_validation(monkeypatch):
     import orchestrator
 

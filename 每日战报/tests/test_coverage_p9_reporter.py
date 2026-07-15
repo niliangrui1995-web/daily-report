@@ -298,7 +298,7 @@ def _patch_p9_pipeline_dependencies(monkeypatch, p9_reporter, *, content="", thi
     monkeypatch.setattr(
         p9_reporter.opus_adapter,
         "invoke",
-        lambda _prompt: SimpleNamespace(content=content, thinking_content=thinking),
+        lambda _prompt, _config=None: SimpleNamespace(content=content, thinking_content=thinking),
     )
     monkeypatch.setattr(p9_reporter, "get_model_provenance", lambda *_args: {})
     monkeypatch.setattr(p9_reporter, "normalize_common_text_mojibake", lambda value: value)
@@ -441,3 +441,81 @@ def test_send_report_email_covers_empty_write_configured_and_delivery_outcomes(m
     failed = p9_reporter.send_report_email("report")
     assert failed["status"] == "completed_email_failed"
     assert failed["email_sent"] is False
+
+
+def test_send_report_email_persists_saved_checkpoint_before_smtp(monkeypatch):
+    import p9_reporter
+
+    events = []
+    monkeypatch.setattr(p9_reporter, "normalize_common_text_mojibake", lambda value: value)
+    monkeypatch.setattr(p9_reporter, "get_run_timestamp", lambda: "20260715090000")
+    monkeypatch.setattr(
+        p9_reporter,
+        "write_text_artifact",
+        lambda *_args, **_kwargs: events.append(("write", "report.md")) or "report.md",
+    )
+    monkeypatch.setattr(p9_reporter, "EMAIL_ADDRESS", "sender@example.com")
+    monkeypatch.setattr(p9_reporter, "EMAIL_PASSWORD", "secret")
+    monkeypatch.setattr(p9_reporter, "RECEIVER_EMAIL", "receiver@example.com")
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda stage, **kwargs: events.append(("manifest", stage, kwargs)),
+    )
+    monkeypatch.setattr(
+        p9_reporter,
+        "send_report_via_email",
+        lambda *_args, **_kwargs: events.append(("smtp",))
+        or (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        p9_reporter.send_report_email("saved report")
+
+    assert events == [
+        (
+            "manifest",
+            "p9",
+            {
+                "status": "report_save_in_progress",
+                "metrics": {"email_configured": True, "email_sent": False},
+            },
+        ),
+        ("write", "report.md"),
+        (
+            "manifest",
+            "p9",
+            {
+                "status": "report_saved_pending_delivery",
+                "files": {"md": "report.md"},
+                "metrics": {"email_configured": True, "email_sent": False},
+            },
+        ),
+        ("smtp",),
+    ]
+
+
+def test_send_report_email_preserves_local_only_resume_policy(monkeypatch):
+    import p9_reporter
+
+    updates = []
+    monkeypatch.setattr(p9_reporter, "EMAIL_ADDRESS", "sender@example.com")
+    monkeypatch.setattr(p9_reporter, "EMAIL_PASSWORD", "secret")
+    monkeypatch.setattr(p9_reporter, "RECEIVER_EMAIL", "receiver@example.com")
+    monkeypatch.setattr(p9_reporter, "get_run_timestamp", lambda: "20260715090000")
+    monkeypatch.setattr(p9_reporter, "write_text_artifact", lambda *_args, **_kwargs: "report.md")
+    monkeypatch.setattr(
+        p9_reporter,
+        "send_report_via_email",
+        lambda *_args, **_kwargs: pytest.fail("local-only resume must not send email"),
+    )
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+
+    result = p9_reporter.send_report_email("saved report", email_required=False)
+
+    assert result["status"] == "completed_no_email"
+    assert updates[-1][1]["metrics"]["email_configured"] is False

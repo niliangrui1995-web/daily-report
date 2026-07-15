@@ -70,6 +70,9 @@ def test_url_validation_covers_parse_failure_and_endpoint_classes(monkeypatch):
             "auth_unavailable",
         ),
         ("503 RESOURCE_EXHAUSTED", "rate_limit"),
+        ("502 Server Error: Bad Gateway", "server_error"),
+        ("HTTP 502 {'type':'server_error'}", "server_error"),
+        ("504 Gateway Timeout", "timeout"),
         ("request deadline exceeded", "timeout"),
         ("an unrecognised provider problem", "unknown_error"),
     ],
@@ -95,6 +98,43 @@ def test_auth_unavailable_log_is_not_reported_as_rate_limit(monkeypatch, caplog)
     assert adapter.last_error_category == "auth_unavailable"
     assert "认证池暂时不可用" in caplog.text
     assert "触发限流" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("message", "category"),
+    [
+        ("auth_unavailable", "auth_unavailable"),
+        ("HTTP 401", "risk_control"),
+        ("permission_denied", "permission_denied"),
+        ("request timeout", "timeout"),
+        ("HTTP 502 Bad Gateway", "server_error"),
+        ("HTTP 502 {'type':'server_error'}", "server_error"),
+    ],
+)
+def test_configured_failover_category_stops_primary_retries_before_sleep(monkeypatch, message, category):
+    adapter = make_adapter(
+        "gpt-5.6-sol",
+        max_retries=5,
+        failover_categories=[
+            "auth_unavailable",
+            "risk_control",
+            "permission_denied",
+            "timeout",
+            "server_error",
+        ],
+    )
+    sleeps = []
+    monkeypatch.setattr(adapter_module.time, "sleep", sleeps.append)
+
+    should_retry = adapter._handle_provider_error(
+        "OpenAI Responses",
+        RuntimeError(message),
+        0,
+    )
+
+    assert should_retry is False
+    assert adapter.last_error_category == category
+    assert sleeps == []
 
 
 def test_model_routing_helpers_cover_negative_and_official_variants():
@@ -490,7 +530,7 @@ def test_anthropic_empty_blocks_and_retry_then_success(monkeypatch):
     assert "system" not in calls[0]
     assert calls[0]["max_tokens"] == 16000
     assert sleeps == [15]
-    assert adapter.last_error_category == ""
+    assert adapter.last_error_category == "empty_response"
     assert adapter.last_response_model == "claude-basic"
 
 
@@ -503,7 +543,7 @@ def test_anthropic_terminal_failure_records_category(monkeypatch):
     monkeypatch.setattr(adapter_module.time, "sleep", lambda _seconds: pytest.fail("must not sleep"))
 
     assert adapter._call_anthropic("", "question") == ("", "")
-    assert adapter.last_error_category == "rate_limit"
+    assert adapter.last_error_category == "server_error"
 
 
 def _install_fake_google(monkeypatch, response, constructor_calls, generate_calls):
@@ -549,12 +589,12 @@ def test_gemini_official_client_search_tool_and_model_version(monkeypatch):
     generate_calls = []
     response = SimpleNamespace(text="answer", model_version="gemini-server", model="ignored")
     _install_fake_google(monkeypatch, response, constructor_calls, generate_calls)
-    adapter = make_adapter("gemini-2.5-flash", timeout=0, max_retries=1)
+    adapter = make_adapter("gemini-2.5-flash", timeout=1, max_retries=1)
 
     assert adapter._call_gemini("prompt") == "answer"
     assert adapter.last_response_model == "gemini-server"
     assert constructor_calls[0]["api_key"] == API_KEY
-    assert constructor_calls[0]["http_options"].kwargs == {"timeout": 1}
+    assert constructor_calls[0]["http_options"].kwargs == {"timeout": 1000}
     request = generate_calls[0]
     assert request["model"] == "gemini-2.5-flash"
     assert request["contents"] == "prompt"
@@ -719,6 +759,38 @@ def test_openai_client_initialization_system_reasoning_and_retry(monkeypatch):
     assert adapter.last_response_model == "served-model"
 
 
+def test_openai_chat_request_and_retries_are_bounded_by_total_deadline(monkeypatch):
+    clock = {"now": 0.0}
+    request_timeouts = []
+    sleeps = []
+
+    def create(**kwargs):
+        timeout = float(kwargs["timeout"])
+        request_timeouts.append(timeout)
+        clock["now"] += timeout
+        raise RuntimeError("request timeout")
+
+    class OpenAI:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=OpenAI))
+    monkeypatch.setattr(adapter_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(adapter_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(adapter_module.random, "uniform", lambda *_args: 0)
+    adapter = make_adapter(
+        "local",
+        timeout=300,
+        max_retries=3,
+        total_timeout_seconds=240,
+    )
+
+    assert adapter._call_openai_compat("", "question", deadline=240.0) == ("", "")
+    assert request_timeouts == [240.0]
+    assert sleeps == []
+    assert adapter.last_error_category == "timeout"
+
+
 def test_openai_responses_exception_retry_payload_and_error_reset(monkeypatch):
     import requests
 
@@ -784,28 +856,39 @@ def test_openai_responses_retry_time_is_bounded_by_total_budget(monkeypatch):
     assert adapter.last_error_category == "timeout"
 
 
-def test_auth_unavailable_fallback_shares_invocation_deadline(monkeypatch):
+@pytest.mark.parametrize("failure_category", ["auth_unavailable", "timeout"])
+def test_fallback_gets_independent_model_deadline(monkeypatch, failure_category):
+    clock = {"now": 100.0}
     deadlines = []
 
     def call(self, _system_prompt, _user_prompt, deadline=None):
         deadlines.append(deadline)
         if len(deadlines) == 1:
-            self._set_last_error("auth_unavailable", "no auth available")
+            clock["now"] = deadline
+            self._set_last_error(failure_category, f"primary {failure_category}")
             return "", ""
         self._reset_last_error()
         self.last_response_model = "backup-served"
         return "backup answer", ""
 
     monkeypatch.setattr(NativeLLMAdapter, "_call_openai_compat", call)
-    monkeypatch.setattr(adapter_module.time, "monotonic", lambda: 100.0)
-    adapter = make_adapter("gpt-5.6-sol", total_timeout_seconds=840)
+    monkeypatch.setattr(adapter_module.time, "monotonic", lambda: clock["now"])
+    adapter = make_adapter(
+        "gpt-5.6-sol",
+        total_timeout_seconds=900,
+        fallback_total_timeout_seconds=900,
+    )
 
     result = adapter.invoke("question")
 
     assert result.content == "backup answer"
     assert len(deadlines) == 2
-    assert deadlines[0] == deadlines[1] == 940.0
-    assert result.response_metadata["model_provenance"]["fallback_reason_category"] == "auth_unavailable"
+    assert deadlines == [1000.0, 1900.0]
+    assert result.response_metadata["model_provenance"]["fallback_reason_category"] == failure_category
+    assert result.response_metadata["model_provenance"]["attempted_models"] == [
+        "gpt-5.6-sol",
+        "claude-opus-4-6-thinking",
+    ]
 
 
 def test_openai_responses_terminal_exception_returns_empty(monkeypatch):
@@ -819,7 +902,194 @@ def test_openai_responses_terminal_exception_returns_empty(monkeypatch):
     adapter = make_adapter("local", max_retries=1)
 
     assert adapter._call_openai_responses("", "question") == ("", "")
-    assert adapter.last_error_category == "rate_limit"
+    assert adapter.last_error_category == "server_error"
+
+
+def test_first_primary_timeout_switches_to_backup_without_primary_retry(monkeypatch):
+    import requests
+
+    models = []
+    sleeps = []
+
+    class SuccessResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"status": "completed", "model": "backup-served", "output_text": "backup answer"}
+
+    def post(_url, **kwargs):
+        model = kwargs["json"]["model"]
+        models.append(model)
+        if model == "gpt-5.6-sol":
+            raise requests.Timeout("primary timed out")
+        return SuccessResponse()
+
+    monkeypatch.setattr(requests, "post", post)
+    monkeypatch.setattr(adapter_module.time, "sleep", sleeps.append)
+    adapter = make_adapter(
+        "gpt-5.6-sol",
+        timeout=900,
+        max_retries=5,
+        use_responses_api=True,
+        total_timeout_seconds=900,
+        fallback_total_timeout_seconds=900,
+        failover_categories=["timeout"],
+    )
+
+    result = adapter.invoke("question")
+
+    assert result.content == "backup answer"
+    assert models == ["gpt-5.6-sol", "claude-opus-4-6-thinking"]
+    assert sleeps == []
+    assert result.response_metadata["model_provenance"]["fallback_reason_category"] == "timeout"
+
+
+def test_completed_empty_primary_response_switches_to_backup(monkeypatch):
+    import requests
+
+    models = []
+
+    class Response:
+        def __init__(self, model):
+            self.model = model
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            if self.model == "gpt-5.6-sol":
+                return {"status": "completed", "model": self.model, "output": []}
+            return {
+                "status": "completed",
+                "model": "backup-served",
+                "output_text": "backup answer",
+            }
+
+    def post(_url, **kwargs):
+        model = kwargs["json"]["model"]
+        models.append(model)
+        return Response(model)
+
+    monkeypatch.setattr(requests, "post", post)
+    adapter = make_adapter(
+        "gpt-5.6-sol",
+        timeout=900,
+        max_retries=5,
+        use_responses_api=True,
+        total_timeout_seconds=900,
+        fallback_total_timeout_seconds=900,
+    )
+
+    result = adapter.invoke("question")
+
+    assert result.content == "backup answer"
+    assert models == ["gpt-5.6-sol", "claude-opus-4-6-thinking"]
+    provenance = result.response_metadata["model_provenance"]
+    assert provenance["fallback_reason_category"] == "empty_response"
+    assert provenance["fallback_used"] is True
+
+
+def test_forced_semantic_fallback_skips_primary_model(monkeypatch):
+    calls = []
+    adapter = make_adapter(
+        "gpt-5.6-sol",
+        max_retries=1,
+        total_timeout_seconds=900,
+        fallback_total_timeout_seconds=900,
+    )
+
+    def fake_call(self, _system_prompt, _user_prompt, _deadline):
+        calls.append(self.model)
+        if self.model == "gpt-5.6-sol":
+            pytest.fail("semantic retry must not call the primary model again")
+        return "backup response", "backup thinking"
+
+    monkeypatch.setattr(NativeLLMAdapter, "_call_openai_compat", fake_call)
+
+    result = adapter.invoke(
+        "prompt",
+        {
+            "force_fallback": True,
+            "fallback_reason": "previous JSON failed validation",
+        },
+    )
+
+    provenance = result.response_metadata["model_provenance"]
+    assert result.content == "backup response"
+    assert calls == ["claude-opus-4-6-thinking"]
+    assert provenance["attempted_models"] == ["claude-opus-4-6-thinking"]
+    assert provenance["fallback_reason_category"] == "semantic_validation_failed"
+
+
+def test_fallback_can_use_an_independent_endpoint_and_provider(monkeypatch):
+    captured = {}
+
+    def primary_call(self, _system_prompt, _user_prompt, _deadline):
+        self._set_last_error("auth_unavailable", "primary auth pool unavailable")
+        return "", ""
+
+    def fallback_call(self, _system_prompt, _user_prompt, _deadline):
+        captured.update(
+            {
+                "model": self.model,
+                "base_url": self.base_url,
+                "api_key": self.api_key,
+                "provider": self.provider,
+            }
+        )
+        self._reset_last_error()
+        self.last_response_model = "backup-served"
+        return "independent backup response", "backup thinking"
+
+    monkeypatch.setattr(NativeLLMAdapter, "_call_openai_compat", primary_call)
+    monkeypatch.setattr(NativeLLMAdapter, "_call_anthropic", fallback_call)
+    adapter = make_adapter(
+        "gpt-5.6-sol",
+        max_retries=1,
+        total_timeout_seconds=900,
+        fallback_total_timeout_seconds=900,
+        fallback_model="claude-opus-4-6-thinking",
+        fallback_base_url="https://backup.example.test",
+        fallback_api_key="backup-key",
+        fallback_request_timeout_seconds=900,
+    )
+
+    result = adapter.invoke("question")
+
+    provenance = result.response_metadata["model_provenance"]
+    assert result.content == "independent backup response"
+    assert captured == {
+        "model": "claude-opus-4-6-thinking",
+        "base_url": "https://backup.example.test",
+        "api_key": "backup-key",
+        "provider": "anthropic",
+    }
+    assert provenance["fallback_provider"] == "anthropic"
+    assert provenance["fallback_endpoint_independent"] is True
+
+
+def test_terminal_primary_network_error_still_tries_backup(monkeypatch):
+    models = []
+
+    def call(self, _system_prompt, _user_prompt, deadline=None):
+        _ = deadline
+        models.append(self.model)
+        if self.model == "gpt-5.6-sol":
+            self._set_last_error("network_error", "connection reset")
+            return "", ""
+        self._reset_last_error()
+        self.last_response_model = "backup-served"
+        return "backup answer", ""
+
+    monkeypatch.setattr(NativeLLMAdapter, "_call_openai_compat", call)
+    adapter = make_adapter("gpt-5.6-sol", max_retries=1)
+
+    result = adapter.invoke("question")
+
+    assert result.content == "backup answer"
+    assert models == ["gpt-5.6-sol", "claude-opus-4-6-thinking"]
+    assert result.response_metadata["model_provenance"]["fallback_reason_category"] == "network_error"
 
 
 def test_openai_responses_classifies_auth_unavailable_from_http_error_body(monkeypatch):

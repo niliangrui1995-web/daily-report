@@ -81,6 +81,7 @@ def test_cli_command_wrappers_forward_exact_flags(monkeypatch):
     assert pipeline_cli.cmd_resume(SimpleNamespace()) == 7
     assert pipeline_cli.cmd_force_run(SimpleNamespace()) == 7
     assert pipeline_cli.cmd_restart(SimpleNamespace()) == 7
+    assert orchestrator._parse_flags(["--force-restart"]) == (True, True)
     assert calls == [
         ([], "resume"),
         (["--force-run"], "force-run"),
@@ -504,7 +505,182 @@ def test_collect_resume_ignores_non_list_p1_and_reuses_saved_markdown(monkeypatc
     assert context["evidence_raw"] == "saved markdown"
 
 
+def test_p2_resume_collects_only_p2_and_reuses_saved_p3_p5(monkeypatch):
+    calls = []
+
+    def fail_unrelated_source(*_args, **_kwargs):
+        pytest.fail("P2 targeted resume must not rerun P1 or P3")
+
+    monkeypatch.setattr(orchestrator, "collect_from_rss", fail_unrelated_source)
+    monkeypatch.setattr(orchestrator, "collect_from_web", fail_unrelated_source)
+    monkeypatch.setattr(orchestrator, "collect_p3_parallel_only", fail_unrelated_source)
+    monkeypatch.setattr(orchestrator, "gemini_pro_audit", fail_unrelated_source)
+    monkeypatch.setattr(orchestrator, "get_run_config", lambda _now: "24h")
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_from_x",
+        lambda backtrack: calls.append(("p2", backtrack)) or ("fresh p2", {"status": "success"}),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_read_text_checkpoint",
+        lambda path, label: calls.append((label, path))
+        or {"P5 audit result": "saved p5", "P3 agent intel": "saved p3", "P2 X intel": ""}[label],
+    )
+    context = {
+        "resume_from": "p2_resume",
+        "ckpt": {"files": {"p1": "p1.json", "p3": "p3.md", "p5": "p5.md"}},
+        "now": datetime.now(),
+        "backtrack": "",
+        "p5_evidence": "",
+        "p2_data": "",
+        "p3_data": "",
+    }
+
+    orchestrator._stage_audit_evidence(context)
+
+    assert orchestrator._resolve_start_stage("p2_resume") == "recover_p2"
+    assert context["p2_data"] == "fresh p2"
+    assert context["p3_data"] == "saved p3"
+    assert context["p5_evidence"] == "saved p5"
+    assert calls.count(("p2", "24h")) == 1
+
+
+def test_p2_resume_failure_is_recorded_without_blocking_downstream(monkeypatch):
+    updates = []
+    monkeypatch.setattr(orchestrator, "get_run_config", lambda _now: "24h")
+    monkeypatch.setattr(
+        orchestrator,
+        "_read_text_checkpoint",
+        lambda _path, label: {"P5 audit result": "saved p5", "P3 agent intel": "saved p3", "P2 X intel": ""}[label],
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_from_x",
+        lambda _backtrack: (_ for _ in ()).throw(RuntimeError("grok unavailable")),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "update_run_manifest",
+        lambda stage, **kwargs: updates.append((stage, kwargs)),
+    )
+    context = {
+        "resume_from": "p2_resume",
+        "ckpt": {"files": {"p1": "p1.json", "p3": "p3.md", "p5": "p5.md"}},
+        "now": datetime.now(),
+        "backtrack": "",
+        "p5_evidence": "",
+        "p2_data": "",
+        "p3_data": "",
+    }
+
+    orchestrator._stage_audit_evidence(context)
+
+    assert context["p2_data"] == ""
+    assert context["p3_data"] == "saved p3"
+    assert any(stage == "p2" and payload["status"] == "failed_exception" for stage, payload in updates)
+
+
+def test_p2_resume_flows_fresh_p2_into_p6_without_rerunning_other_sources(monkeypatch):
+    def fail_reused_source(*_args, **_kwargs):
+        pytest.fail("P2 targeted resume must reuse P1/P3/P4/P5 checkpoints")
+
+    monkeypatch.setattr(orchestrator, "collect_from_rss", fail_reused_source)
+    monkeypatch.setattr(orchestrator, "collect_from_web", fail_reused_source)
+    monkeypatch.setattr(orchestrator, "collect_p3_parallel_only", fail_reused_source)
+    monkeypatch.setattr(orchestrator, "gemini_pro_audit", fail_reused_source)
+    monkeypatch.setattr(orchestrator, "fetch_vanguard_prices", fail_reused_source)
+    monkeypatch.setattr(orchestrator, "get_run_config", lambda _now: "24h")
+    monkeypatch.setattr(orchestrator, "collect_from_x", lambda _backtrack: ("fresh p2", {"status": "success"}))
+    saved = {
+        "P1 markdown": "",
+        "P5 audit result": "saved p5",
+        "P3 agent intel": "saved p3",
+        "P2 X intel": "",
+        "P4 market snapshot": "saved p4",
+    }
+    monkeypatch.setattr(orchestrator, "_read_text_checkpoint", lambda _path, label: saved[label])
+    captured = []
+    monkeypatch.setattr(orchestrator, "generate_report", lambda evidence: captured.append(evidence) or "fresh p6")
+    monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *_args, **_kwargs: "fresh-p6.md")
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_p6_identity_validation",
+        lambda *_args, **_kwargs: {
+            "complete": True,
+            "reason": "",
+            "rejected_target_names": [],
+            "rejected_targets": 0,
+            "identity_validation_version": orchestrator.IDENTITY_VALIDATION_VERSION,
+        },
+    )
+    context = orchestrator._build_context(
+        datetime.now(),
+        "20260715083000",
+        {
+            "stage": "p2_resume",
+            "files": {"p1": "p1.json", "p3": "p3.md", "p4": "p4.md", "p5": "p5.md"},
+            "p6_metrics": {},
+        },
+        "p2_resume",
+    )
+
+    orchestrator._stage_audit_evidence(context)
+    orchestrator._stage_market_mapping(context)
+
+    assert captured == ["saved p5\nsaved p4\nfresh p2\nsaved p3"]
+    assert context["p6_mapping"] == "fresh p6"
+
+
+def test_p2_resume_before_p5_reuses_p1_p3_then_runs_p2_and_p5(monkeypatch):
+    calls = []
+    monkeypatch.setattr(orchestrator, "get_run_config", lambda _now: "24h")
+    monkeypatch.setattr(
+        orchestrator,
+        "_read_json_checkpoint",
+        lambda _path, _label: [{"title": "saved p1"}],
+    )
+    saved = {
+        "P1 markdown": "saved raw p1",
+        "P2 X intel": "",
+        "P3 agent intel": "saved p3",
+    }
+    monkeypatch.setattr(orchestrator, "_read_text_checkpoint", lambda _path, label: saved.get(label, ""))
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_from_x",
+        lambda _backtrack: calls.append("p2") or ("fresh p2", {"status": "success"}),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "gemini_pro_audit",
+        lambda evidence, **_kwargs: calls.append(("p5", evidence)) or "fresh p5",
+    )
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda *_args, **_kwargs: None)
+    context = orchestrator._build_context(
+        datetime.now(),
+        "20260715083000",
+        {
+            "stage": "p2_resume",
+            "files": {"p1": "p1.json", "p1_md": "p1.md", "p3": "p3.md"},
+            "p6_metrics": {},
+        },
+        "p2_resume",
+    )
+
+    orchestrator._stage_audit_evidence(context)
+
+    assert calls == ["p2", ("p5", "saved raw p1")]
+    assert context["p1_results"] == [{"title": "saved p1"}]
+    assert context["p2_data"] == "fresh p2"
+    assert context["p3_data"] == "saved p3"
+    assert context["p5_evidence"] == "fresh p5"
+
+
 def test_collect_stage_tolerates_all_parallel_source_failures(monkeypatch):
+    updates = []
+
     def fail(*_args, **_kwargs):
         raise RuntimeError("source unavailable")
 
@@ -513,6 +689,11 @@ def test_collect_stage_tolerates_all_parallel_source_failures(monkeypatch):
     monkeypatch.setattr(orchestrator, "collect_from_x", fail)
     monkeypatch.setattr(orchestrator, "collect_p3_parallel_only", fail)
     monkeypatch.setattr(orchestrator, "get_run_config", lambda _now: "24h")
+    monkeypatch.setattr(
+        orchestrator,
+        "update_run_manifest",
+        lambda stage, **kwargs: updates.append((stage, kwargs)),
+    )
     context = {"resume_from": "none", "ckpt": {"files": {}}, "now": datetime.now()}
 
     orchestrator._stage_collect_intel(context)
@@ -520,6 +701,185 @@ def test_collect_stage_tolerates_all_parallel_source_failures(monkeypatch):
     assert context["p1_results"] == []
     assert context["p2_data"] == ""
     assert context["p3_data"] == ""
+    assert any(stage == "p1" and payload["status"] == "failed_no_results" for stage, payload in updates)
+    assert any(stage == "p2" and payload["status"] == "failed_exception" for stage, payload in updates)
+    assert any(stage == "p3" and payload["status"] == "failed_exception" for stage, payload in updates)
+
+
+@pytest.mark.parametrize(
+    ("stats_status", "expected_status"),
+    [
+        ("skipped_no_key", "skipped_no_key"),
+        ("empty", "skipped_no_results"),
+        ("failed_all_queries", "failed_all_queries"),
+    ],
+)
+def test_persist_p3_empty_result_keeps_explicit_business_status(
+    monkeypatch,
+    stats_status,
+    expected_status,
+):
+    updates = []
+    monkeypatch.setattr(
+        orchestrator,
+        "update_run_manifest",
+        lambda stage, **kwargs: updates.append((stage, kwargs)),
+    )
+
+    orchestrator._persist_p3_artifacts(
+        "",
+        {"status": stats_status, "duration_seconds": 1.2, "query_failures": 2},
+    )
+
+    assert updates[-1][0] == "p3"
+    assert updates[-1][1]["status"] == expected_status
+
+
+def test_persist_p1_partial_source_failure_is_degraded(monkeypatch):
+    updates = []
+    monkeypatch.setattr(orchestrator, "write_json_artifact", lambda *_args, **_kwargs: "p1.json")
+    monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *_args, **_kwargs: "p1.md")
+    monkeypatch.setattr(
+        orchestrator,
+        "update_run_manifest",
+        lambda stage, **kwargs: updates.append((stage, kwargs)),
+    )
+
+    orchestrator._persist_p1_artifacts(
+        [{"title": "one surviving item"}],
+        "evidence",
+        [],
+        1.0,
+        {"source_failures": 1, "source_failure_details": ["rss: unavailable"]},
+    )
+
+    assert updates[-1][1]["status"] == "completed_structured_degraded"
+
+
+def test_collect_stage_counts_internal_p1_source_failures(monkeypatch):
+    updates = []
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_from_rss",
+        lambda _value: (
+            [{"title": "surviving item"}],
+            {"failed": [("rss-source", "down")], "success": [], "failed_urls": []},
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_from_web",
+        lambda _value: ([], {"failed": [("web-source", "timeout")], "success": []}),
+    )
+    monkeypatch.setattr(orchestrator, "collect_from_x", lambda _value: ("p2", {}))
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_p3_parallel_only",
+        lambda _value: ("p3", {"status": "success"}),
+    )
+    monkeypatch.setattr(orchestrator, "get_run_config", lambda _now: "24h")
+    monkeypatch.setattr(orchestrator, "format_evidence", lambda _rows: "evidence")
+    monkeypatch.setattr(orchestrator, "write_json_artifact", lambda *_args, **_kwargs: "p1.json")
+    monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *_args, **_kwargs: "artifact.md")
+    monkeypatch.setattr(
+        orchestrator,
+        "update_run_manifest",
+        lambda stage, **kwargs: updates.append((stage, kwargs)),
+    )
+    context = {"resume_from": "none", "ckpt": {"files": {}}, "now": datetime.now()}
+
+    orchestrator._stage_collect_intel(context)
+
+    p1_update = next(payload for stage, payload in updates if stage == "p1")
+    assert p1_update["status"] == "completed_structured_degraded"
+    assert p1_update["metrics"]["source_failures"] == 2
+    assert "rss-source" in p1_update["metrics"]["degrade_reason"]
+
+
+def test_intel_resume_reruns_only_failed_p3_branch(monkeypatch):
+    calls = []
+
+    def fail_reused(*_args, **_kwargs):
+        pytest.fail("successful P1/P2 branches must be reused")
+
+    monkeypatch.setattr(orchestrator, "collect_from_rss", fail_reused)
+    monkeypatch.setattr(orchestrator, "collect_from_web", fail_reused)
+    monkeypatch.setattr(orchestrator, "collect_from_x", fail_reused)
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_p3_parallel_only",
+        lambda _value: calls.append("p3") or ("fresh p3", {"status": "success"}),
+    )
+    monkeypatch.setattr(orchestrator, "get_run_config", lambda _now: "24h")
+    monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *_args, **_kwargs: "p3.md")
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda *_args, **_kwargs: None)
+    context = {
+        "resume_from": "intel_resume",
+        "ckpt": {
+            "files": {"p1": "p1.json", "p2": "p2.md", "p5": "p5.md"},
+            "intel_resume_stages": ["p3"],
+        },
+        "now": datetime.now(),
+        "backtrack": "",
+        "p1_results": [{"title": "saved p1"}],
+        "p1_stats": {},
+        "evidence_raw": "saved p1 evidence",
+        "p2_data": "saved p2",
+        "p3_data": "",
+        "p3_stats": {},
+        "p1_duration": 0.0,
+    }
+
+    orchestrator._stage_collect_intel(context)
+
+    assert calls == ["p3"]
+    assert context["p1_results"] == [{"title": "saved p1"}]
+    assert context["p2_data"] == "saved p2"
+    assert context["p3_data"] == "fresh p3"
+
+
+def test_intel_p1_resume_does_not_reload_stale_p5_after_fresh_audit_is_empty(monkeypatch):
+    captured = []
+
+    def read_checkpoint(_path, label):
+        if label == "P5 audit":
+            pytest.fail("old P5 must not be reused after P1 was recollected")
+        if label == "P4 market snapshot":
+            return "saved p4"
+        return ""
+
+    monkeypatch.setattr(orchestrator, "_read_text_checkpoint", read_checkpoint)
+    monkeypatch.setattr(orchestrator, "generate_report", lambda evidence: captured.append(evidence) or "fresh p6")
+    monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *_args, **_kwargs: "p6.md")
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_p6_identity_validation",
+        lambda *_args, **_kwargs: {
+            "complete": True,
+            "reason": "",
+            "rejected_target_names": [],
+            "rejected_targets": 0,
+            "identity_validation_version": orchestrator.IDENTITY_VALIDATION_VERSION,
+        },
+    )
+    context = {
+        "resume_from": "intel_resume",
+        "intel_resume_stages": ["p1"],
+        "ckpt": {
+            "files": {"p4": "p4.md", "p5": "old-p5.md"},
+            "p6_metrics": {},
+        },
+        "p5_evidence": "",
+        "p4_data": "",
+        "p2_data": "saved p2",
+        "p3_data": "saved p3",
+        "p6_mapping": "",
+    }
+
+    orchestrator._stage_market_mapping(context)
+
+    assert captured == ["saved p4\nsaved p2\nsaved p3"]
 
 
 def test_collect_stage_merges_jinnang_recovery_into_non_dict_raw_results(monkeypatch):
@@ -627,7 +987,7 @@ def test_audit_resume_keeps_already_loaded_intel(monkeypatch):
     assert (context["p2_data"], context["p3_data"]) == ("p2 loaded", "p3 loaded")
 
 
-def test_market_mapping_reruns_incomplete_checkpoint_and_handles_mapping_failure(monkeypatch):
+def test_market_mapping_reruns_incomplete_checkpoint_and_raises_on_mapping_failure(monkeypatch):
     updates = []
     monkeypatch.setattr(
         orchestrator,
@@ -662,11 +1022,89 @@ def test_market_mapping_reruns_incomplete_checkpoint_and_handles_mapping_failure
         "p6_mapping": "",
     }
 
-    orchestrator._stage_market_mapping(context)
+    with pytest.raises(RuntimeError, match="P6 mapping failed: mapping failed"):
+        orchestrator._stage_market_mapping(context)
 
     assert context["p4_data"] == "market"
     assert context["p6_mapping"] == ""
     assert not any(stage == "p6" and payload.get("status") == "completed" for stage, payload in updates)
+
+
+def test_empty_p6_mapping_stops_registry_before_report(monkeypatch):
+    import pipeline_runtime
+
+    downstream_calls = []
+    monkeypatch.setattr(orchestrator, "fetch_vanguard_prices", lambda: "market")
+    monkeypatch.setattr(orchestrator, "generate_report", lambda _evidence: "")
+    monkeypatch.setattr(pipeline_runtime, "update_run_manifest", lambda *_args, **_kwargs: None)
+    context = {
+        "resume_from": "p6_resume",
+        "ckpt": {"files": {}},
+        "p5_evidence": "saved p5",
+        "p2_data": "saved p2",
+        "p3_data": "saved p3",
+        "p4_data": "",
+        "p6_mapping": "",
+    }
+    stages = [
+        pipeline_runtime.StageSpec("market_mapping", orchestrator._stage_market_mapping),
+        pipeline_runtime.StageSpec("report", lambda _context: downstream_calls.append("P9")),
+    ]
+
+    with pytest.raises(RuntimeError, match="P6 mapping returned empty output"):
+        pipeline_runtime.run_stage_registry(stages, context)
+
+    assert downstream_calls == []
+
+
+def test_p6_resume_reuses_upstream_artifacts_and_runs_only_market_mapping(monkeypatch):
+    def fail_unrelated_stage(*_args, **_kwargs):
+        pytest.fail("P6 targeted resume must not rerun P1, P2, P3, or P5")
+
+    monkeypatch.setattr(orchestrator, "collect_from_rss", fail_unrelated_stage)
+    monkeypatch.setattr(orchestrator, "collect_from_web", fail_unrelated_stage)
+    monkeypatch.setattr(orchestrator, "collect_from_x", fail_unrelated_stage)
+    monkeypatch.setattr(orchestrator, "collect_p3_parallel_only", fail_unrelated_stage)
+    monkeypatch.setattr(orchestrator, "gemini_pro_audit", fail_unrelated_stage)
+    monkeypatch.setattr(orchestrator, "fetch_vanguard_prices", fail_unrelated_stage)
+    saved = {
+        "P5 audit": "saved p5",
+        "P2 X intel": "saved p2",
+        "P3 agent intel": "saved p3",
+        "P4 market snapshot": "saved p4",
+    }
+    monkeypatch.setattr(orchestrator, "_read_text_checkpoint", lambda _path, label: saved[label])
+    captured = []
+    monkeypatch.setattr(orchestrator, "generate_report", lambda evidence: captured.append(evidence) or "fresh p6")
+    monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *_args, **_kwargs: "fresh-p6.md")
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_p6_identity_validation",
+        lambda *_args, **_kwargs: {
+            "complete": True,
+            "reason": "",
+            "rejected_target_names": [],
+            "rejected_targets": 0,
+            "identity_validation_version": orchestrator.IDENTITY_VALIDATION_VERSION,
+        },
+    )
+    context = orchestrator._build_context(
+        datetime.now(),
+        "20260715083000",
+        {
+            "stage": "p6_resume",
+            "files": {"p2": "p2.md", "p3": "p3.md", "p4": "p4.md", "p5": "p5.md"},
+            "p6_metrics": {},
+        },
+        "p6_resume",
+    )
+
+    orchestrator._stage_market_mapping(context)
+
+    assert orchestrator._resolve_start_stage("p6_resume") == "market_mapping"
+    assert captured == ["saved p5\nsaved p4\nsaved p2\nsaved p3"]
+    assert context["p6_mapping"] == "fresh p6"
 
 
 def test_market_mapping_reuses_complete_checkpoint_and_dependent_research(monkeypatch):
@@ -743,7 +1181,7 @@ def test_research_plan_write_failure_and_existing_audit_short_circuit(monkeypatc
     plan = {
         "goal": "goal",
         "triggers": [],
-        "supplement_queries": [],
+        "supplement_queries": ["preserved query"],
         "should_run_p7": False,
         "should_run_p75": False,
     }
@@ -763,6 +1201,26 @@ def test_research_plan_write_failure_and_existing_audit_short_circuit(monkeypatc
 
     assert context["p7_plan_path"] == ""
     assert context["p7a_audited"] == "already audited"
+    assert context["search_queries"] == ["preserved query"]
+
+
+def test_research_plan_failure_is_recorded_on_p7_plan_not_clean_research(monkeypatch):
+    updates = []
+    monkeypatch.setattr(
+        orchestrator,
+        "build_research_plan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("plan unavailable")),
+    )
+    monkeypatch.setattr(orchestrator, "write_json_artifact", lambda *_args, **_kwargs: "plan.json")
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda stage, **kwargs: updates.append((stage, kwargs)))
+
+    orchestrator._stage_research(_research_context())
+
+    assert any(
+        stage == "p7_plan" and payload["status"] == "failed_plan_fallback"
+        for stage, payload in updates
+    )
+    assert not any(stage == "research" for stage, _payload in updates)
 
 
 def test_research_p7_only_path_skips_supplement_and_omits_missing_plan_file(monkeypatch):
@@ -889,7 +1347,34 @@ def test_research_optional_layers_handle_search_and_future_failures(monkeypatch)
     assert context["p7_deep"] == ""
     assert context["p75_supplement"] == ""
     assert context["search_queries"] == ["not-found", "raises"]
-    assert any(stage == "p75" and payload["status"] == "skipped_no_results" for stage, payload in updates)
+    assert any(stage == "p7" and payload["status"] == "failed_exception" for stage, payload in updates)
+    assert any(stage == "p75" and payload["status"] == "failed_query_errors" for stage, payload in updates)
+
+
+def test_research_empty_result_preserves_provider_failure_status(monkeypatch):
+    plan = {
+        "goal": "goal",
+        "triggers": [],
+        "supplement_queries": [],
+        "should_run_p7": True,
+        "should_run_p75": False,
+    }
+    updates = []
+    monkeypatch.setattr(orchestrator, "build_research_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(orchestrator, "write_json_artifact", lambda *_args, **_kwargs: "plan.json")
+    monkeypatch.setattr(orchestrator, "_context_p6_input_sha256", lambda _context: "hash")
+    monkeypatch.setattr(
+        orchestrator,
+        "run_deep_research",
+        lambda _plan: {"status": "failed_empty_output", "text": ""},
+    )
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda stage, **kwargs: updates.append((stage, kwargs)))
+
+    orchestrator._stage_research(_research_context())
+
+    failure = next(payload for stage, payload in updates if stage == "p7")
+    assert failure["status"] == "failed_empty_output"
+    assert failure["metrics"]["p6_input_sha256"] == "hash"
 
 
 def test_research_p7a_failure_passes_through_long_raw_research(monkeypatch):
@@ -952,7 +1437,17 @@ def test_report_wraps_generation_exception(monkeypatch):
         lambda **_kwargs: (_ for _ in ()).throw(ValueError("invalid model response")),
     )
     with pytest.raises(RuntimeError, match="report generation failed: invalid model response"):
-        orchestrator._stage_report({})
+        orchestrator._stage_report({"p6_mapping": "mapping"})
+
+
+def test_report_rejects_missing_p6_before_calling_p9(monkeypatch):
+    calls = []
+    monkeypatch.setattr(orchestrator, "p9_risk_analysis", lambda **_kwargs: calls.append("P9"))
+
+    with pytest.raises(RuntimeError, match="P6 mapping is missing"):
+        orchestrator._stage_report({"p6_mapping": ""})
+
+    assert calls == []
 
 
 def test_delivery_resume_validates_mode_report_and_delivery(monkeypatch):
@@ -967,12 +1462,60 @@ def test_delivery_resume_validates_mode_report_and_delivery(monkeypatch):
     monkeypatch.setattr(
         orchestrator,
         "send_report_email",
-        lambda *_args: {"ok": False, "status": "smtp_failed"},
+        lambda *_args, **_kwargs: {"ok": False, "status": "smtp_failed"},
     )
     with pytest.raises(RuntimeError, match="smtp_failed"):
         orchestrator._stage_delivery_resume(
             {"resume_from": "delivery_resume", "final_report": "# report", "run_ts": "ts"}
         )
+
+
+def test_delivery_resume_does_not_downgrade_required_email_to_local_only(monkeypatch):
+    monkeypatch.setattr(orchestrator, "EMAIL_ADDRESS", "sender@example.com")
+    monkeypatch.setattr(orchestrator, "EMAIL_PASSWORD", "smtp-secret")
+    monkeypatch.setattr(orchestrator, "RECEIVER_EMAIL", "")
+    monkeypatch.setattr(
+        orchestrator,
+        "send_report_email",
+        lambda *_args: pytest.fail("missing required email config must stop before delivery"),
+    )
+
+    with pytest.raises(RuntimeError, match="email configuration is incomplete"):
+        orchestrator._stage_delivery_resume(
+            {
+                "resume_from": "delivery_resume",
+                "final_report": "# report",
+                "run_ts": "ts",
+                "ckpt": {"p9_metrics": {"email_configured": True}},
+            }
+        )
+
+
+def test_delivery_resume_preserves_saved_local_only_policy(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(orchestrator, "EMAIL_ADDRESS", "sender@example.com")
+    monkeypatch.setattr(orchestrator, "EMAIL_PASSWORD", "smtp-secret")
+    monkeypatch.setattr(orchestrator, "RECEIVER_EMAIL", "receiver@example.com")
+
+    def fake_delivery(content, report_ts, *, email_required=None):
+        captured.update(
+            {"content": content, "report_ts": report_ts, "email_required": email_required}
+        )
+        return {"ok": True, "status": "completed_no_email"}
+
+    monkeypatch.setattr(orchestrator, "send_report_email", fake_delivery)
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda *_args, **_kwargs: None)
+
+    orchestrator._stage_delivery_resume(
+        {
+            "resume_from": "delivery_resume",
+            "final_report": "# report",
+            "run_ts": "20260715090000",
+            "ckpt": {"p9_metrics": {"email_configured": False}},
+        }
+    )
+
+    assert captured["email_required"] is False
 
 
 def test_roi_resume_requires_report_and_recovers_p1_with_invalid_manifest_metric(monkeypatch, tmp_path):
@@ -1004,7 +1547,18 @@ def test_roi_resume_requires_report_and_recovers_p1_with_invalid_manifest_metric
                     "p9_hits": 1,
                     "score": 1.0,
                     "recommendation": "keep",
-                }
+                },
+                "p3": {
+                    "units": 0,
+                    "unique_units": 0,
+                    "unique_ratio": 0.0,
+                    "adopted_units": 0,
+                    "adoption_ratio": 0.0,
+                    "p6_hits": 0,
+                    "p9_hits": 0,
+                    "score": 0.0,
+                    "recommendation": "drop",
+                },
             }
         }
 
@@ -1036,6 +1590,7 @@ def test_roi_resume_requires_report_and_recovers_p1_with_invalid_manifest_metric
     assert any(stage == "report" and payload["status"] == "completed_recovered" for stage, payload in updates)
     assert updates[-1][0] == "p1"
     assert updates[-1][1]["metrics"]["roi_score"] == 1.0
+    assert not any(stage == "p3" for stage, _payload in updates)
 
 
 def test_roi_ignores_non_list_p1_checkpoint(monkeypatch):
@@ -1174,6 +1729,8 @@ def test_orchestrator_force_restart_skips_checkpoint_and_records_degradation(mon
         lambda: pytest.fail("force restart bypasses checkpoint"),
     )
     degraded = [{"stage": "p4", "status": "failed_exception", "reason": "api down"}]
+    resets = []
+    monkeypatch.setattr(orchestrator, "reset_run_manifest", lambda run_ts: resets.append(run_ts) or "archive.json")
     updates, states, _contexts = _patch_main_runtime(
         monkeypatch,
         checkpoint={"stage": "unused", "files": {}, "run_timestamp": ""},
@@ -1182,6 +1739,7 @@ def test_orchestrator_force_restart_skips_checkpoint_and_records_degradation(mon
 
     orchestrator.orchestrator_main(["--force-run", "--force-restart"])
 
+    assert resets == ["20260623090000"]
     assert updates[-1][1]["status"] == "completed_with_stage_degradation"
     assert states[-1]["root_cause"] == "stage_degraded"
     assert states[-1]["runtime_context"]["degraded_stages"] == degraded

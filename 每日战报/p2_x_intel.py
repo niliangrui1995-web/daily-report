@@ -57,7 +57,9 @@ GROK_FALLBACK_MODEL = os.environ.get('GROK_FALLBACK_MODEL', 'grok-4.5').strip() 
 GROK_MODEL = os.environ.get('GROK_MODEL', 'grok-4.3').strip() or 'grok-4.3'
 GROK_REASONING_EFFORT = os.environ.get('GROK_REASONING_EFFORT', 'none').strip().lower() or 'none'
 GROK_MAX_OUTPUT_TOKENS = _env_positive_int('GROK_MAX_OUTPUT_TOKENS', 4096)
-P2_TOTAL_BUDGET_SECONDS = 420
+P2_PRIMARY_BUDGET_SECONDS = 300
+P2_FALLBACK_BUDGET_SECONDS = 120
+P2_TOTAL_BUDGET_SECONDS = P2_PRIMARY_BUDGET_SECONDS + P2_FALLBACK_BUDGET_SECONDS
 P2_REQUEST_TIMEOUT_SECONDS = 75
 P2_MIN_REMAINING_SECONDS = 10
 _X_LEAK_BLOCK_PATTERN = re.compile(r'<x_leaks>.*?</x_leaks>', flags=re.DOTALL)
@@ -149,16 +151,18 @@ def _filter_x_leak_blocks(content: str, seen_tweet_ids: set[str]) -> str:
     return '\n'.join(filtered_blocks)
 
 
-def collect_from_x(
+def collect_from_x(  # noqa: C901 - chunk, retry, and independent failover budgets share one state machine
     backtrack: str = '24h',
     max_retries: int = 3,
     *,
-    max_total_seconds: int = P2_TOTAL_BUDGET_SECONDS,
-    request_timeout_seconds: int = P2_REQUEST_TIMEOUT_SECONDS,
+    max_total_seconds: int = P2_PRIMARY_BUDGET_SECONDS,
+    request_timeout_seconds: int = P2_REQUEST_TIMEOUT_SECONDS,
+    fallback_total_seconds: int = P2_FALLBACK_BUDGET_SECONDS,
 ) -> tuple[str, dict]:
     stats = {
         'source': 'X(Twitter) via Grok',
-        'model': GROK_MODEL,
+        'model': GROK_MODEL,
+        'attempted_models': [GROK_MODEL],
         'status': 'pending',
         'duration_seconds': 0,
         'content_length': 0,
@@ -172,8 +176,17 @@ def collect_from_x(
         update_run_manifest('p2', status='skipped_no_key', metrics=stats)
         return '', stats
 
-    logging.info(f'📱 [P2] 启动 X(Twitter) 产业链情报采集 (Grok {GROK_MODEL})...')
-    logging.info(f'  回溯窗口: {backtrack}')
+    logging.info(f'📱 [P2] 启动 X(Twitter) 产业链情报采集 (Grok {GROK_MODEL})...')
+    logging.info(f'  回溯窗口: {backtrack}')
+    update_run_manifest(
+        'p2',
+        status='running',
+        metrics={
+            **stats,
+            'primary_budget_seconds': max_total_seconds,
+            'fallback_budget_seconds': fallback_total_seconds,
+        },
+    )
 
     try:
         # Why: 先显式验证用户 Prompt 存在，实际检索 prompt 在分批循环内按 chunk 重建
@@ -208,23 +221,36 @@ def collect_from_x(
     chunks = [INDUSTRY_SCAN_KEYWORDS[i:i + CHUNK_SIZE] for i in range(0, len(INDUSTRY_SCAN_KEYWORDS), CHUNK_SIZE)]
 
     all_filtered_leaks = []
-    seen_tweet_ids = set()
-    overall_start_time = time.time()
-    attempted_chunks = 0
-    successful_chunks = 0
-    stop_reason = ''
+    seen_tweet_ids = set()
+    overall_start_time = time.time()
+    fallback_start_time = None
+    attempted_chunks = 0
+    successful_chunks = 0
+    fallback_chunks = 0
+    fallback_only = False
+    stop_reason = ''
 
     for c_idx, chunk in enumerate(chunks, 1):
-        remaining = _remaining_budget_seconds(overall_start_time, max_total_seconds)
-        if remaining <= P2_MIN_REMAINING_SECONDS:
-            stop_reason = 'budget_exhausted'
-            logging.warning(
-                '[P2] 总耗时预算即将耗尽，停止后续 Grok 分批: attempted=%s/%s remaining=%.1fs',
-                attempted_chunks,
-                len(chunks),
-                max(0.0, remaining),
-            )
-            break
+        primary_remaining = _remaining_budget_seconds(overall_start_time, max_total_seconds)
+        fallback_remaining = (
+            float(fallback_total_seconds)
+            if fallback_start_time is None
+            else _remaining_budget_seconds(fallback_start_time, fallback_total_seconds)
+        )
+        primary_available = not fallback_only and primary_remaining > P2_MIN_REMAINING_SECONDS
+        fallback_available = bool(GROK_FALLBACK_API_KEY) and (
+            fallback_remaining > P2_MIN_REMAINING_SECONDS
+        )
+        if not primary_available and not fallback_available:
+            stop_reason = 'budget_exhausted'
+            logging.warning(
+                '[P2] 主备预算均已耗尽，停止后续分批: attempted=%s/%s primary=%.1fs fallback=%.1fs',
+                attempted_chunks,
+                len(chunks),
+                max(0.0, primary_remaining),
+                max(0.0, fallback_remaining),
+            )
+            break
 
         attempted_chunks = c_idx
         logging.info(f'📦 [P2] 开始处理检索分批 {c_idx}/{len(chunks)}，包含 {len(chunk)} 个赛道词...')
@@ -247,10 +273,17 @@ def collect_from_x(
         primary_success = False
         response = None
         err_msg = ""
-        stop_reason = ""
-
-        # 1. Primary official API attempt loop
-        for attempt in range(max_retries):
+        stop_reason = ""
+
+        # 1. Primary official API attempt loop
+        if not primary_available:
+            if fallback_only:
+                err_msg = 'primary_unavailable_latched'
+                logging.info('[P2] 主模型已判定不可用，当前分批直接使用备胎')
+            else:
+                err_msg = 'primary_budget_exhausted'
+                logging.warning('[P2] 主模型预算已耗尽，当前及后续分批直接尝试备胎')
+        for attempt in (range(max_retries) if primary_available else ()):
             try:
                 request_timeout = _bounded_request_timeout(
                     overall_start_time,
@@ -309,8 +342,17 @@ def collect_from_x(
                     break
         
         # 2. Fallback attempt if primary failed
-        if not primary_success and GROK_FALLBACK_API_KEY and stop_reason != 'budget_exhausted':
-            logging.warning(f"⚠   -> 官方 Grok API 最终失败或鉴权失效，正尝试切换至备用中转站...")
+        if not primary_success and GROK_FALLBACK_API_KEY:
+            logging.warning("⚠   -> 官方 Grok API 最终失败或鉴权失效，正尝试切换至备用中转站...")
+            if not fallback_only:
+                fallback_only = True
+                stats['fallback_only_latched'] = True
+            if fallback_start_time is None:
+                fallback_start_time = time.time()
+            if GROK_FALLBACK_MODEL not in stats['attempted_models']:
+                stats['attempted_models'].append(GROK_FALLBACK_MODEL)
+            stats['fallback_model'] = GROK_FALLBACK_MODEL
+            stop_reason = ''
             fallback_headers = {
                 'Authorization': f'Bearer {GROK_FALLBACK_API_KEY}',
                 'Content-Type': 'application/json'
@@ -326,25 +368,27 @@ def collect_from_x(
             
             for f_attempt in range(2):  # Try fallback up to 2 times
                 try:
-                    request_timeout = _bounded_request_timeout(
-                        overall_start_time,
-                        max_total_seconds,
-                        request_timeout_seconds,
-                    )
-                    if request_timeout <= 0:
-                        stop_reason = 'budget_exhausted'
-                        break
+                    request_timeout = _bounded_request_timeout(
+                        fallback_start_time,
+                        fallback_total_seconds,
+                        request_timeout_seconds,
+                    )
+                    if request_timeout <= 0:
+                        stop_reason = 'fallback_budget_exhausted'
+                        break
                     
                     logging.info(f"🔄   -> 正在请求中转站 Grok API ({GROK_FALLBACK_MODEL}) (第 {f_attempt+1}/2 次尝试)...")
-                    fallback_response = requests.post(
+                    fallback_response = requests.post(
                         fallback_url,
                         json=fallback_payload,
                         headers=fallback_headers,
-                        timeout=request_timeout
-                    )
-                    if fallback_response.status_code == 200:
-                        response = fallback_response
-                        primary_success = True
+                        timeout=request_timeout
+                    )
+                    response = fallback_response
+                    if fallback_response.status_code == 200:
+                        primary_success = True
+                        fallback_chunks += 1
+                        stop_reason = ''
                         logging.info("✅   -> 中转站 Grok 响应成功！")
                         break
                     else:
@@ -354,14 +398,14 @@ def collect_from_x(
                             break
                         # Sleep before retry
                         wait = 3
-                        if not _sleep_with_budget(wait, overall_start_time, max_total_seconds):
-                            stop_reason = 'budget_exhausted'
+                        if not _sleep_with_budget(wait, fallback_start_time, fallback_total_seconds):
+                            stop_reason = 'fallback_budget_exhausted'
                             break
                 except Exception as fe:
                     err_msg = f"Fallback Error: {fe}"
                     wait = 3
-                    if not _sleep_with_budget(wait, overall_start_time, max_total_seconds):
-                        stop_reason = 'budget_exhausted'
+                    if not _sleep_with_budget(wait, fallback_start_time, fallback_total_seconds):
+                        stop_reason = 'fallback_budget_exhausted'
                         break
 
         # 3. Process the final result
@@ -373,13 +417,20 @@ def collect_from_x(
                     stats['status'] = stop_reason
                     update_run_manifest('p2', status=stop_reason, metrics=stats)
                     return '', stats
-            else:
-                stats['status'] = 'failed_timeout' if stop_reason == 'budget_exhausted' else 'failed_empty'
-                if stop_reason:
-                    stats['stop_reason'] = stop_reason
-                update_run_manifest('p2', status=stats['status'], metrics=stats)
-                return '', stats
-            break
+            else:
+                if all_filtered_leaks:
+                    stop_reason = stop_reason or 'failed_empty'
+                else:
+                    stats['status'] = (
+                        'failed_timeout'
+                        if stop_reason in {'budget_exhausted', 'fallback_budget_exhausted'}
+                        else 'failed_empty'
+                    )
+                    if stop_reason:
+                        stats['stop_reason'] = stop_reason
+                    update_run_manifest('p2', status=stats['status'], metrics=stats)
+                    return '', stats
+            break
 
         try:
             response.raise_for_status()
@@ -441,17 +492,24 @@ def collect_from_x(
     stats['successful_chunks'] = successful_chunks
     stats['total_chunks'] = len(chunks)
     stats['max_total_seconds'] = max_total_seconds
+    stats['primary_budget_seconds'] = max_total_seconds
+    stats['fallback_budget_seconds'] = fallback_total_seconds
+    stats['fallback_chunks'] = fallback_chunks
 
     if not content.strip() or '<x_leaks>' not in content:
         logging.warning('⚠️ [P2] 所有批次均未获取到有效情报（全部作废）。')
-        stats['status'] = 'failed_timeout' if stop_reason == 'budget_exhausted' else 'failed_empty'
+        stats['status'] = (
+            'failed_timeout'
+            if stop_reason in {'budget_exhausted', 'fallback_budget_exhausted'}
+            else 'failed_empty'
+        )
         if stop_reason:
             stats['stop_reason'] = stop_reason
         update_run_manifest('p2', status=stats['status'], metrics=stats)
         return '', stats
 
     structured_items = parse_p2_structured_items(content)
-    if stop_reason == 'budget_exhausted':
+    if stop_reason in {'budget_exhausted', 'fallback_budget_exhausted'}:
         stats['status'] = 'partial_timeout'
     elif stop_reason:
         stats['status'] = f'partial_{stop_reason}'
@@ -480,10 +538,15 @@ def collect_from_x(
             collected_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
         )
 
-    output_path, json_path = _save_p2_artifacts(formatted, structured_items, stats)
-    update_run_manifest(
-        'p2',
-        status='completed',
+    output_path, json_path = _save_p2_artifacts(formatted, structured_items, stats)
+    manifest_status = (
+        'completed'
+        if stats['status'] == 'success'
+        else 'completed_structured_degraded'
+    )
+    update_run_manifest(
+        'p2',
+        status=manifest_status,
         files={k: v for k, v in {'md': output_path, 'json': json_path}.items() if v} or None,
         metrics=stats,
     )

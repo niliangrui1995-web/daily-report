@@ -6,6 +6,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 
 RUN_TS = "20260710083000"
 
@@ -46,6 +48,69 @@ def _detect(monkeypatch, tmp_path: Path, manifest: dict) -> dict:
     return checkpoint.detect_checkpoint()
 
 
+def _p2_checkpoint_manifest(tmp_path: Path, p2_status: str, *, p2_path: str = "") -> dict:
+    p1_path = _write(tmp_path / f"P1_RSS原始数据_{RUN_TS}.json", "[]")
+    p3_path = _write(tmp_path / f"P3_机动情报_{RUN_TS}.md", "saved p3")
+    p5_path = _write(tmp_path / f"P5_审计_{RUN_TS}.md", "saved p5")
+    p2_payload = {"status": p2_status, "metrics": {}}
+    if p2_path:
+        p2_payload["files"] = {"md": p2_path}
+    return {
+        "run_timestamp": RUN_TS,
+        "status": "failed_exception",
+        "stages": {
+            "p1": {"status": "completed", "files": {"json": p1_path}},
+            "p2": p2_payload,
+            "p3": {"status": "completed", "files": {"md": p3_path}},
+            "p5": {"status": "completed", "files": {"md": p5_path}},
+        },
+    }
+
+
+def _p2_before_p5_manifest(tmp_path: Path, p2_status: str | None) -> dict:
+    p1_path = _write(tmp_path / f"P1_RSS原始数据_{RUN_TS}.json", "[]")
+    p1_md_path = _write(tmp_path / f"P1_RSS原始数据_{RUN_TS}.md", "saved p1")
+    p3_path = _write(tmp_path / f"P3_机动情报_{RUN_TS}.md", "saved p3")
+    stages = {
+        "p1": {
+            "status": "completed",
+            "files": {"json": p1_path, "md": p1_md_path},
+        },
+        "p3": {"status": "completed", "files": {"md": p3_path}},
+    }
+    if p2_status is not None:
+        stages["p2"] = {"status": p2_status, "metrics": {}}
+    return {
+        "run_timestamp": RUN_TS,
+        "status": "failed_exception",
+        "stages": stages,
+    }
+
+
+def _p6_checkpoint_manifest(tmp_path: Path, p6_status: str, *, p6_path: str = "") -> dict:
+    p1_path = _write(tmp_path / f"P1_RSS原始数据_{RUN_TS}.json", "[]")
+    p2_path = _write(tmp_path / f"P2_X平台情报_{RUN_TS}.md", "saved p2")
+    p3_path = _write(tmp_path / f"P3_机动情报_{RUN_TS}.md", "saved p3")
+    p4_path = _write(tmp_path / f"P4_核心行情_{RUN_TS}.md", "saved p4")
+    p5_path = _write(tmp_path / f"P5_审计_{RUN_TS}.md", "saved p5")
+    p6_payload = {"status": p6_status, "metrics": {}}
+    if p6_path:
+        p6_payload["files"] = {"md": p6_path}
+    return {
+        "run_timestamp": RUN_TS,
+        "status": "failed_exception",
+        "stages": {
+            "p1": {"status": "completed", "files": {"json": p1_path}},
+            "p2": {"status": "completed", "files": {"md": p2_path}},
+            "p3": {"status": "completed", "files": {"md": p3_path}},
+            "p4": {"status": "completed", "files": {"md": p4_path}},
+            "p5": {"status": "completed", "files": {"md": p5_path}},
+            "p6": p6_payload,
+            "market_mapping": {"status": "failed_exception"},
+        },
+    }
+
+
 def test_report_file_alone_is_not_a_terminal_checkpoint(monkeypatch, tmp_path):
     _write(tmp_path / f"\u6218\u62a5_{RUN_TS}.md", "report")
 
@@ -75,6 +140,55 @@ def test_delivery_failure_resumes_delivery_instead_of_marking_complete(monkeypat
     checkpoint = _detect(monkeypatch, tmp_path, manifest)
 
     assert checkpoint["stage"] == "delivery_resume"
+
+
+def test_saved_report_pending_delivery_resumes_without_regenerating_p9(monkeypatch, tmp_path):
+    report_path = _write(tmp_path / f"war_report_{RUN_TS}.md", "report")
+    manifest = _manifest(
+        report_path,
+        root_status="running",
+        p9_status="report_saved_pending_delivery",
+        report_status="running",
+        roi_status=None,
+    )
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "delivery_resume"
+    assert checkpoint["files"]["war_report"] == report_path
+    assert checkpoint["p9_metrics"] == {}
+
+
+def test_report_save_in_progress_with_same_run_report_resumes_delivery(monkeypatch, tmp_path):
+    report_path = _write(tmp_path / f"战报_{RUN_TS}.md", "saved report")
+    manifest = {
+        "run_timestamp": RUN_TS,
+        "status": "running",
+        "stages": {
+            "p9": {"status": "report_save_in_progress", "metrics": {}},
+            "report": {"status": "running"},
+        },
+    }
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "delivery_resume"
+    assert checkpoint["files"]["war_report"] == report_path
+
+
+def test_report_save_in_progress_without_report_does_not_resume_delivery(monkeypatch, tmp_path):
+    p6_path = _write(tmp_path / f"P6_映射_{RUN_TS}.md", "saved p6")
+    p8_path = _write(tmp_path / f"P8_技术面_{RUN_TS}.md", "saved p8")
+    manifest = _p6_checkpoint_manifest(tmp_path, "completed", p6_path=p6_path)
+    manifest["status"] = "running"
+    manifest["stages"]["p8"] = {"status": "completed", "files": {"md": p8_path}}
+    manifest["stages"]["p9"] = {"status": "report_save_in_progress", "metrics": {}}
+    manifest["stages"]["report"] = {"status": "running"}
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p9_resume"
+    assert "war_report" not in checkpoint["files"]
 
 
 def test_missing_roi_resumes_only_roi(monkeypatch, tmp_path):
@@ -123,6 +237,311 @@ def test_zero_byte_report_is_not_terminal(monkeypatch, tmp_path):
 
     assert checkpoint["stage"] == "p9_resume"
     assert not checkpoint["files"].get("war_report")
+
+
+@pytest.mark.parametrize("p2_status", ["pending", "failed_empty", "failed_timeout", "auth_failed_401"])
+def test_incomplete_p2_without_artifact_uses_targeted_resume(monkeypatch, tmp_path, p2_status):
+    manifest = _p2_checkpoint_manifest(tmp_path, p2_status)
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p2_resume"
+
+
+def test_zero_byte_failed_p2_is_not_a_usable_artifact(monkeypatch, tmp_path):
+    p2_path = tmp_path / f"P2_X平台情报_{RUN_TS}.md"
+    p2_path.touch()
+    manifest = _p2_checkpoint_manifest(tmp_path, "failed_empty", p2_path=str(p2_path))
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p2_resume"
+
+
+@pytest.mark.parametrize("p2_status", ["skipped_no_key", "completed"])
+def test_non_retryable_p2_status_does_not_trigger_targeted_resume(monkeypatch, tmp_path, p2_status):
+    manifest = _p2_checkpoint_manifest(tmp_path, p2_status)
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p5"
+
+
+def test_failed_p2_with_existing_artifact_does_not_trigger_targeted_resume(monkeypatch, tmp_path):
+    p2_path = _write(tmp_path / f"P2_X平台情报_{RUN_TS}.md", "saved p2")
+    manifest = _p2_checkpoint_manifest(tmp_path, "failed_timeout", p2_path=p2_path)
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p5"
+
+
+def test_p2_targeted_resume_precedes_downstream_checkpoint(monkeypatch, tmp_path):
+    manifest = _p2_checkpoint_manifest(tmp_path, "pending")
+    p8_path = _write(tmp_path / f"P8_技术面_{RUN_TS}.md", "saved p8")
+    manifest["stages"]["p8"] = {"status": "completed", "files": {"md": p8_path}}
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p2_resume"
+
+
+def test_p2_targeted_resume_precedes_terminal_delivery_and_roi(monkeypatch, tmp_path):
+    p2_stages = _p2_checkpoint_manifest(tmp_path, "pending")["stages"]
+    report_path = _write(tmp_path / f"war_report_{RUN_TS}.md", "saved report")
+    cases = [
+        (_manifest(report_path), "p2_resume"),
+        (
+            _manifest(
+                report_path,
+                root_status="failed_exception",
+                p9_status="completed_email_failed",
+                report_status="failed_exception",
+                roi_status=None,
+            ),
+            "p2_resume",
+        ),
+        (
+            _manifest(report_path, root_status="failed_exception", roi_status=None),
+            "p2_resume",
+        ),
+    ]
+
+    for manifest, expected_stage in cases:
+        manifest["stages"].update(p2_stages)
+        checkpoint = _detect(monkeypatch, tmp_path, manifest)
+        assert checkpoint["stage"] == expected_stage
+
+
+def test_corrupt_manifest_falls_back_to_latest_single_artifact_cohort(monkeypatch, tmp_path):
+    old_ts = "20260710070000"
+    latest_ts = "20260710090000"
+    _write(tmp_path / f"P2_X平台情报_{old_ts}.md", "old p2")
+    latest_p1 = _write(tmp_path / f"P1_RSS原始数据_{latest_ts}.json", "[]")
+    latest_p3 = _write(tmp_path / f"P3_机动情报_{latest_ts}.md", "latest p3")
+    latest_p5 = _write(tmp_path / f"P5_审计_{latest_ts}.md", "latest p5")
+    corrupt_manifest = {
+        "run_timestamp": "20260710110000",
+        "updated_at": "2026-07-10T11:00:00",
+        "corrupt_manifest": True,
+        "stages": {},
+    }
+
+    checkpoint = _detect(monkeypatch, tmp_path, corrupt_manifest)
+
+    assert checkpoint["run_timestamp"] == latest_ts
+    assert checkpoint["stage"] == "p2_resume"
+    assert checkpoint["files"]["p1"] == latest_p1
+    assert checkpoint["files"]["p3"] == latest_p3
+    assert checkpoint["files"]["p5"] == latest_p5
+    assert "p2" not in checkpoint["files"]
+
+
+def test_manifest_without_valid_root_timestamp_cannot_mix_stage_cohorts(monkeypatch, tmp_path):
+    old_ts = "20260710070000"
+    latest_ts = "20260710090000"
+    old_p2 = _write(tmp_path / f"P2_X平台情报_{old_ts}.md", "old p2")
+    latest_p1 = _write(tmp_path / f"P1_RSS原始数据_{latest_ts}.json", "[]")
+    latest_p3 = _write(tmp_path / f"P3_机动情报_{latest_ts}.md", "latest p3")
+    latest_p5 = _write(tmp_path / f"P5_审计_{latest_ts}.md", "latest p5")
+    manifest = {
+        "run_timestamp": "",
+        "status": "failed_exception",
+        "stages": {
+            "p1": {"status": "completed", "files": {"json": latest_p1}},
+            "p2": {"status": "completed", "files": {"md": old_p2}},
+            "p3": {"status": "completed", "files": {"md": latest_p3}},
+            "p5": {"status": "completed", "files": {"md": latest_p5}},
+        },
+    }
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["run_timestamp"] == latest_ts
+    assert checkpoint["stage"] == "p2_resume"
+    assert checkpoint["files"]["p1"] == latest_p1
+    assert checkpoint["files"]["p3"] == latest_p3
+    assert checkpoint["files"]["p5"] == latest_p5
+    assert "p2" not in checkpoint["files"]
+
+
+@pytest.mark.parametrize("p6_status", ["pending", "running", "failed_empty_output", "failed_parse"])
+def test_incomplete_p6_without_artifact_uses_targeted_resume(monkeypatch, tmp_path, p6_status):
+    manifest = _p6_checkpoint_manifest(tmp_path, p6_status)
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p6_resume"
+
+
+def test_zero_byte_failed_p6_is_not_a_usable_artifact(monkeypatch, tmp_path):
+    p6_path = tmp_path / f"P6_映射_{RUN_TS}.md"
+    p6_path.touch()
+    manifest = _p6_checkpoint_manifest(tmp_path, "failed_empty_output", p6_path=str(p6_path))
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p6_resume"
+
+
+def test_failed_p6_with_existing_artifact_still_uses_targeted_resume(monkeypatch, tmp_path):
+    p6_path = _write(tmp_path / f"P6_映射_{RUN_TS}.md", "saved p6")
+    manifest = _p6_checkpoint_manifest(tmp_path, "failed_parse", p6_path=p6_path)
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p6_resume"
+
+
+def test_completed_p6_with_current_nonempty_markdown_keeps_normal_resume(monkeypatch, tmp_path):
+    p6_path = _write(tmp_path / f"P6_映射_{RUN_TS}.md", "saved p6")
+    manifest = _p6_checkpoint_manifest(tmp_path, "completed", p6_path=p6_path)
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p6"
+
+
+def test_completed_p6_with_json_only_still_uses_targeted_resume(monkeypatch, tmp_path):
+    p6_json = _write(tmp_path / f"P6_映射_{RUN_TS}.json", "{}")
+    manifest = _p6_checkpoint_manifest(tmp_path, "completed")
+    manifest["stages"]["p6"]["files"] = {"json": p6_json}
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p6_resume"
+
+
+def test_old_same_day_p6_fallback_does_not_revive_current_failure(monkeypatch, tmp_path):
+    _write(tmp_path / "P6_映射_20260710070000.md", "old p6")
+    manifest = _p6_checkpoint_manifest(tmp_path, "failed_empty_output")
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p6_resume"
+
+
+def test_p6_targeted_resume_precedes_stale_p8_checkpoint(monkeypatch, tmp_path):
+    manifest = _p6_checkpoint_manifest(tmp_path, "failed_empty_output")
+    p8_path = _write(tmp_path / f"P8_技术面_{RUN_TS}.md", "stale p8")
+    manifest["stages"]["p8"] = {"status": "completed", "files": {"md": p8_path}}
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p6_resume"
+
+
+def test_failed_p6_without_p5_reuses_available_p2_p3_and_resumes_p6(monkeypatch, tmp_path):
+    manifest = _p6_checkpoint_manifest(tmp_path, "failed_empty_output")
+    Path(manifest["stages"]["p1"]["files"]["json"]).unlink()
+    manifest["stages"]["p1"] = {"status": "skipped_no_results", "metrics": {}}
+    Path(manifest["stages"]["p5"]["files"]["md"]).unlink()
+    manifest["stages"].pop("p5")
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p6_resume"
+    assert checkpoint["files"]["p2"]
+    assert checkpoint["files"]["p3"]
+    assert "p5" not in checkpoint["files"]
+
+
+def test_p2_targeted_resume_still_precedes_p6_targeted_resume(monkeypatch, tmp_path):
+    manifest = _p6_checkpoint_manifest(tmp_path, "failed_empty_output")
+    Path(manifest["stages"]["p2"]["files"]["md"]).unlink()
+    manifest["stages"]["p2"] = {"status": "pending", "metrics": {}}
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p2_resume"
+
+
+@pytest.mark.parametrize(("failed_stage", "file_key"), [("p1", "json"), ("p3", "md")])
+def test_failed_p1_or_p3_uses_selective_intel_resume(
+    monkeypatch,
+    tmp_path,
+    failed_stage,
+    file_key,
+):
+    manifest = _p6_checkpoint_manifest(tmp_path, "completed")
+    failed_file = manifest["stages"][failed_stage].get("files", {}).get(file_key, "")
+    if failed_file:
+        Path(failed_file).unlink()
+    manifest["stages"][failed_stage] = {"status": "failed_exception", "metrics": {}}
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "intel_resume"
+    assert checkpoint["intel_resume_stages"] == [failed_stage]
+
+
+def test_multiple_missing_intel_branches_resume_together(monkeypatch, tmp_path):
+    manifest = _p2_before_p5_manifest(tmp_path, "failed_timeout")
+    p3_file = manifest["stages"]["p3"]["files"]["md"]
+    Path(p3_file).unlink()
+    manifest["stages"]["p3"] = {"status": "failed_all_queries", "metrics": {}}
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "intel_resume"
+    assert checkpoint["intel_resume_stages"] == ["p2", "p3"]
+
+
+@pytest.mark.parametrize("p2_status", [None, "pending", "running", "retrying", "failed_timeout"])
+def test_p2_interrupted_before_p5_still_uses_targeted_resume(monkeypatch, tmp_path, p2_status):
+    checkpoint = _detect(monkeypatch, tmp_path, _p2_before_p5_manifest(tmp_path, p2_status))
+
+    assert checkpoint["stage"] == "p2_resume"
+    assert "p5" not in checkpoint["files"]
+
+
+def test_old_same_day_p2_fallback_does_not_hide_current_p2_failure(monkeypatch, tmp_path):
+    _write(tmp_path / "P2_X平台情报_20260710070000.md", "old p2")
+    manifest = _p2_checkpoint_manifest(tmp_path, "pending")
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p2_resume"
+    assert "p2" not in checkpoint["files"]
+
+
+def test_manifest_rejects_stage_files_from_an_older_run(monkeypatch, tmp_path):
+    old_ts = "20260710070000"
+    old_report = _write(tmp_path / f"战报_{old_ts}.md", "old report")
+    manifest = _p2_checkpoint_manifest(tmp_path, "completed")
+    manifest["stages"]["p9"] = {
+        "status": "completed_email_sent",
+        "run_timestamp": old_ts,
+        "files": {"md": old_report},
+    }
+    manifest["stages"]["report"] = {
+        "status": "completed",
+        "run_timestamp": old_ts,
+    }
+    manifest["stages"]["roi"] = {
+        "status": "completed",
+        "run_timestamp": old_ts,
+    }
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p5"
+    assert "war_report" not in checkpoint["files"]
+
+
+def test_manifestless_fallback_chooses_one_latest_run_cohort(monkeypatch, tmp_path):
+    old_ts = "20260710070000"
+    new_ts = "20260710090000"
+    _write(tmp_path / f"P5_审计_{old_ts}.md", "old p5")
+    _write(tmp_path / f"P6_映射_{old_ts}.md", "old p6")
+    new_p1 = _write(tmp_path / f"P1_RSS原始数据_{new_ts}.json", "[]")
+
+    checkpoint = _detect(monkeypatch, tmp_path, {})
+
+    assert checkpoint["run_timestamp"] == new_ts
+    assert checkpoint["stage"] == "intel_resume"
+    assert checkpoint["intel_resume_stages"] == ["p2", "p3"]
+    assert checkpoint["files"] == {"p1": new_p1}
 
 
 def test_stale_research_files_are_dropped_relative_to_p6(monkeypatch, tmp_path):
@@ -331,7 +750,7 @@ def test_delivery_resume_reuses_saved_report_without_regeneration(monkeypatch, t
     monkeypatch.setattr(
         orchestrator,
         "send_report_email",
-        lambda content, report_ts: deliveries.append((content, report_ts))
+        lambda content, report_ts, **_kwargs: deliveries.append((content, report_ts))
         or {"ok": True, "status": "completed_email_sent"},
     )
     monkeypatch.setattr(
@@ -403,21 +822,55 @@ def test_inner_thread_timeouts_do_not_claim_hard_deadlines():
     assert "ThreadPoolExecutor" not in market_source
     assert "ThreadPoolExecutor" not in report_source
     assert ".result(timeout=" not in research_source
-    assert registry["market_mapping"].timeout_seconds == 900
+    assert registry["market_mapping"].timeout_seconds == 3900
     assert registry["research"].timeout_seconds == 900
-    assert registry["report"].timeout_seconds == 900
+    assert registry["report"].timeout_seconds == 3900
+    assert registry["research"].continue_on_error is True
+    assert registry["technical"].continue_on_error is True
+    assert registry["market_mapping"].continue_on_error is False
+    assert registry["report"].continue_on_error is False
     assert "timeout=180" in inspect.getsource(search_engine._post_search_request)
 
 
-def test_opus_call_budget_fits_market_mapping_stage_deadline():
+def test_opus_models_have_independent_900_second_budgets_with_stage_cleanup_margin():
     import orchestrator
     import settings
 
     market_mapping_timeout = orchestrator.CONTROL_STAGE_TIMEOUTS["market_mapping"]
+    report_timeout = orchestrator.CONTROL_STAGE_TIMEOUTS["report"]
 
-    assert settings.OPUS_TOTAL_TIMEOUT_SECONDS == 840
-    assert settings.OPUS_TOTAL_TIMEOUT_SECONDS <= market_mapping_timeout - 60
-    assert settings.opus_adapter.extra_kwargs["total_timeout_seconds"] == 840
+    assert settings.OPUS_MODEL_TIMEOUT_SECONDS == 900
+    assert settings.OPUS_TOTAL_TIMEOUT_SECONDS == 900
+    assert settings.OPUS_FALLBACK_TOTAL_TIMEOUT_SECONDS == 900
+    assert settings.opus_adapter.timeout == 900
+    assert settings.opus_adapter.extra_kwargs["total_timeout_seconds"] == 900
+    assert settings.opus_adapter.extra_kwargs["fallback_total_timeout_seconds"] == 900
+    combined_model_budget = (
+        settings.OPUS_TOTAL_TIMEOUT_SECONDS
+        + settings.OPUS_FALLBACK_TOTAL_TIMEOUT_SECONDS
+    )
+    maximum_json_attempt_budget = combined_model_budget * 2
+    assert maximum_json_attempt_budget <= market_mapping_timeout - 300
+    assert maximum_json_attempt_budget <= report_timeout - 300
+
+
+def test_audit_primary_and_fallback_have_bounded_budgets_inside_p5_stage():
+    import orchestrator
+    import settings
+
+    assert settings.AUDIT_PRIMARY_REQUEST_TIMEOUT_SECONDS == 240
+    assert settings.AUDIT_PRIMARY_TOTAL_TIMEOUT_SECONDS == 240
+    assert settings.AUDIT_FALLBACK_REQUEST_TIMEOUT_SECONDS == 180
+    assert settings.AUDIT_FALLBACK_TOTAL_TIMEOUT_SECONDS == 180
+    assert settings.pro_adapter.timeout == 240
+    assert settings.pro_adapter.extra_kwargs["total_timeout_seconds"] == 240
+    assert "timeout" in settings.pro_adapter.extra_kwargs["failover_categories"]
+
+    maximum_json_retry_budget = 2 * (
+        settings.AUDIT_PRIMARY_TOTAL_TIMEOUT_SECONDS
+        + settings.AUDIT_FALLBACK_TOTAL_TIMEOUT_SECONDS
+    ) + 5
+    assert maximum_json_retry_budget <= orchestrator.CONTROL_STAGE_TIMEOUTS["audit_evidence"] - 30
 
 
 def test_legacy_p6_rejection_without_names_is_incomplete_identity_validation(monkeypatch):

@@ -194,7 +194,16 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
     else:
         prompt = f"{prompt}\n\n{P6_OUTPUT_LIMITS}"
     
-    resp = opus_adapter.invoke(prompt)
+    if _retry_count:
+        resp = opus_adapter.invoke(
+            prompt,
+            {
+                'force_fallback': True,
+                'fallback_reason': 'P6 previous output failed JSON or completeness validation',
+            },
+        )
+    else:
+        resp = opus_adapter.invoke(prompt)
     raw_content = resp.content if resp.content else ''
     thinking_content = getattr(resp, 'thinking_content', '')
     model_provenance = get_model_provenance(resp, OPUS_MODEL)

@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+import pipeline_runtime
 
 
 def test_pipeline_lock_windows_pid_probe_and_import_failure(monkeypatch):
@@ -357,6 +358,68 @@ def test_pipeline_runtime_registry_skips_until_start_and_retries_failures(monkey
     )
     assert context["recovered"] is True
     assert sleeps == [1, 1]
+
+
+def test_pipeline_runtime_rejects_unknown_resume_stage(monkeypatch):
+    import pipeline_runtime
+
+    calls = []
+    monkeypatch.setattr(pipeline_runtime, "_run_single_stage", lambda stage, _context: calls.append(stage.name))
+
+    with pytest.raises(ValueError, match="unknown start_at stage"):
+        pipeline_runtime.run_stage_registry(
+            [pipeline_runtime.StageSpec("known", lambda _ctx: None)],
+            {},
+            start_at="typo",
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (pipeline_runtime.StageTimeoutError("optional", 1), "failed_timeout"),
+        (RuntimeError("optional failed"), "failed_exception"),
+    ],
+)
+def test_pipeline_runtime_optional_stage_failure_allows_downstream(
+    monkeypatch,
+    error,
+    expected_status,
+):
+    import pipeline_runtime
+
+    updates = []
+    downstream = []
+    monkeypatch.setattr(
+        pipeline_runtime,
+        "update_run_manifest",
+        lambda stage, **kwargs: updates.append((stage, kwargs)),
+    )
+
+    def execute(stage, _context):
+        if stage.name == "optional":
+            raise error
+        downstream.append(stage.name)
+
+    monkeypatch.setattr(pipeline_runtime, "_execute_stage_handler", execute)
+    stages = [
+        pipeline_runtime.StageSpec(
+            "optional",
+            lambda _ctx: None,
+            timeout_seconds=1,
+            continue_on_error=True,
+        ),
+        pipeline_runtime.StageSpec("report", lambda _ctx: None),
+    ]
+
+    pipeline_runtime.run_stage_registry(stages, {})
+
+    assert downstream == ["report"]
+    optional_statuses = [payload["status"] for stage, payload in updates if stage == "optional"]
+    assert optional_statuses[-1] == expected_status
+    assert "completed" not in optional_statuses
 
 
 def test_pipeline_runtime_single_stage_reraises_terminal_timeout_and_error(monkeypatch):

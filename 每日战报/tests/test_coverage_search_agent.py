@@ -485,6 +485,25 @@ def test_raw_search_connect_timeout_uses_fallback(monkeypatch):
     assert len(calls) == 1
 
 
+def test_raw_search_read_timeout_records_failure_and_skips_key_rotation(monkeypatch):
+    fallback_calls = []
+    fallback_result = {"text": "fallback", "grounding_sources": []}
+    calls, rotator = _install_search_route(
+        monkeypatch,
+        [requests.exceptions.ReadTimeout("slow response")],
+        keys=["key_A", "key_B", "key_C"],
+        fallback=lambda *args, **kwargs: fallback_calls.append((args, kwargs)) or fallback_result,
+    )
+
+    result = search_engine.raw_gemini_search("prompt", max_retries=3, return_dict=True)
+
+    assert result == fallback_result
+    assert [call["key"] for call in calls] == ["key_A"]
+    assert rotator.available == 3
+    assert search_engine.channel_breaker._failures["direct"] == 1
+    assert len(fallback_calls) == 1
+
+
 def test_raw_search_exception_quota_and_retry_paths(monkeypatch):
     calls, rotator = _install_search_route(
         monkeypatch,
@@ -626,6 +645,25 @@ def test_gemini_search_connect_timeout_and_generic_exceptions(monkeypatch):
     assert [call["key"] for call in calls] == ["key_A", "key_A"]
 
 
+def test_gemini_search_read_timeout_records_failure_and_skips_key_rotation(monkeypatch):
+    fallback_calls = []
+    fallback_result = {"text": "fallback", "grounding_sources": []}
+    calls, rotator = _install_search_route(
+        monkeypatch,
+        [requests.exceptions.ReadTimeout("slow response")],
+        keys=["key_A", "key_B", "key_C"],
+        fallback=lambda *args, **kwargs: fallback_calls.append((args, kwargs)) or fallback_result,
+    )
+
+    result = _gemini_impl()("news", "q", max_retries=3)
+
+    assert result == fallback_result
+    assert [call["key"] for call in calls] == ["key_A"]
+    assert rotator.available == 3
+    assert search_engine.channel_breaker._failures["direct"] == 1
+    assert len(fallback_calls) == 1
+
+
 def test_gemini_search_tripped_no_key_and_no_fallback(monkeypatch):
     breaker = search_engine.ChannelCircuitBreaker(threshold=1)
     breaker.trip("direct")
@@ -674,10 +712,8 @@ def test_p3_call_search_normalizes_dict_and_text(monkeypatch):
         "raw_gemini_search",
         lambda prompt, max_retries, return_dict: {"text": None, "grounding_sources": None},
     )
-    assert p3_agent._call_gemini_search("q", max_retries=1) == {
-        "text": "",
-        "grounding_sources": [],
-    }
+    with pytest.raises(RuntimeError, match="empty response"):
+        p3_agent._call_gemini_search("q", max_retries=1)
     monkeypatch.setattr(
         p3_agent,
         "raw_gemini_search",
@@ -906,6 +942,19 @@ def test_p3_render_output_empty_and_success(monkeypatch):
     assert p3_agent.render_p3_output({}, collected_at="now") == ("rendered:now:1", items)
 
 
+def test_p3_search_distinguishes_route_failure_from_valid_empty_json(monkeypatch):
+    monkeypatch.setattr(p3_agent, "raw_gemini_search", lambda *_args, **_kwargs: {})
+    with pytest.raises(RuntimeError, match="empty response"):
+        p3_agent._call_gemini_search("prompt")
+
+    monkeypatch.setattr(
+        p3_agent,
+        "raw_gemini_search",
+        lambda *_args, **_kwargs: {"text": "[]", "grounding_sources": []},
+    )
+    assert p3_agent._call_gemini_search("prompt")["text"] == "[]"
+
+
 def test_p3_collect_parallel_no_key_empty_partial_failure_and_success(monkeypatch):
     monkeypatch.setattr(p3_agent, "SEARCH_API_KEY_POOL", [])
     text, stats = p3_agent.collect_p3_parallel_only()
@@ -929,7 +978,8 @@ def test_p3_collect_parallel_no_key_empty_partial_failure_and_success(monkeypatc
     monkeypatch.setattr(p3_agent, "render_p3_output", lambda raw: ("report", [{"title": "B"}]))
     text, stats = p3_agent.collect_p3_parallel_only("24h")
     assert text == "report"
-    assert stats["status"] == "success"
+    assert stats["status"] == "partial_query_errors"
+    assert stats["query_failures"] == 1
     assert stats["jinnang_2_count"] == 0
     assert stats["jinnang_3_count"] == 1
     assert stats["content_length"] == 6
@@ -939,8 +989,16 @@ def test_p3_collect_parallel_no_key_empty_partial_failure_and_success(monkeypatc
     monkeypatch.setattr(p3_agent, "run_jinnang_3", fail)
     text, stats = p3_agent.collect_p3_parallel_only("24h")
     assert text == "report"
+    assert stats["status"] == "partial_query_errors"
     assert stats["jinnang_2_count"] == 1
     assert stats["jinnang_3_count"] == 0
+
+    monkeypatch.setattr(p3_agent, "run_jinnang_2", fail)
+    monkeypatch.setattr(p3_agent, "run_jinnang_3", fail)
+    text, stats = p3_agent.collect_p3_parallel_only("24h")
+    assert text == ""
+    assert stats["status"] == "failed_all_queries"
+    assert stats["query_failures"] == 2
 
 
 def test_p3_module_entrypoint_smoke(monkeypatch, capsys):

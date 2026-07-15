@@ -244,6 +244,7 @@ class TestP2BudgetGuardrail:
             return "system {{track_count}} {{industry_tracks}} {{super_giants}} {{strategic_giants}}"
 
         monkeypatch.setattr(p2_x_intel, "GROK_API_KEY", "test-key")
+        monkeypatch.setattr(p2_x_intel, "GROK_FALLBACK_API_KEY", "")
         monkeypatch.setattr(p2_x_intel, "GROK_MODEL", "grok-4.3")
         monkeypatch.setattr(p2_x_intel, "GROK_REASONING_EFFORT", "none")
         monkeypatch.setattr(p2_x_intel, "GROK_MAX_OUTPUT_TOKENS", 2048)
@@ -283,7 +284,7 @@ class TestP2BudgetGuardrail:
         assert stats["attempted_chunks"] == 1
         assert stats["successful_chunks"] == 1
         assert stats["total_chunks"] == 2
-        assert manifest_updates[-1]["status"] == "completed"
+        assert manifest_updates[-1]["status"] == "completed_structured_degraded"
         assert manifest_updates[-1]["metrics"]["stop_reason"] == "budget_exhausted"
 
 

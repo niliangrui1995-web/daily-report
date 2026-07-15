@@ -91,6 +91,14 @@ PRO_OPUS_BASE_URL = os.environ.get('PRO_OPUS_BASE_URL', ANTIGRAVITY_BASE_URL)
 PRO_OPUS_API_KEY = os.environ.get('PRO_OPUS_API_KEY', ANTIGRAVITY_API_KEY)
 AUDIT_FALLBACK_BASE_URL = os.environ.get('AUDIT_FALLBACK_BASE_URL', '').strip()
 AUDIT_FALLBACK_API_KEY = os.environ.get('AUDIT_FALLBACK_API_KEY', '').strip()
+OPUS_FALLBACK_BASE_URL = os.environ.get(
+    'OPUS_FALLBACK_BASE_URL',
+    AUDIT_FALLBACK_BASE_URL,
+).strip()
+OPUS_FALLBACK_API_KEY = os.environ.get(
+    'OPUS_FALLBACK_API_KEY',
+    AUDIT_FALLBACK_API_KEY,
+).strip()
 
 GEMINI_SEARCH_DIRECT_URL = 'https://generativelanguage.googleapis.com'
 GEMINI_PRO_API_KEY = os.environ.get('GEMINI_PRO_API_KEY', '').strip()
@@ -109,12 +117,35 @@ if not SEARCH_API_KEY_POOL:
 GEMINI_SEARCH_MODEL = os.environ.get('GEMINI_SEARCH_MODEL', 'gemini-2.5-flash').strip() or 'gemini-2.5-flash'
 AUDIT_MODEL = os.environ.get('AUDIT_MODEL', os.environ.get('GEMINI_PRO_MODEL', 'claude-sonnet-4-6')).strip() or 'claude-sonnet-4-6'
 GEMINI_PRO_MODEL = AUDIT_MODEL
+AUDIT_PRIMARY_REQUEST_TIMEOUT_SECONDS = 240
+AUDIT_PRIMARY_TOTAL_TIMEOUT_SECONDS = 240
+AUDIT_FALLBACK_REQUEST_TIMEOUT_SECONDS = 180
+AUDIT_FALLBACK_TOTAL_TIMEOUT_SECONDS = 180
+AUDIT_IMMEDIATE_FAILOVER_CATEGORIES = (
+    'auth_unavailable',
+    'risk_control',
+    'permission_denied',
+    'timeout',
+    'server_error',
+)
 OPUS_MODEL = 'gpt-5.6-sol'
+OPUS_FALLBACK_MODEL = 'claude-opus-4-6-thinking'
 OPUS_REASONING_EFFORT = 'max'
 OPUS_REASONING_SUMMARY = 'auto'
 OPUS_USE_RESPONSES_API = True
-# Why: P6 market_mapping has a 900s hard deadline; reserve 60s for stage cleanup.
-OPUS_TOTAL_TIMEOUT_SECONDS = 840
+# Each model receives its own budget. The stage deadline covers one JSON repair
+# retry plus non-model work, so a primary timeout cannot starve the fallback.
+OPUS_MODEL_TIMEOUT_SECONDS = 900
+OPUS_TOTAL_TIMEOUT_SECONDS = 900
+OPUS_FALLBACK_TOTAL_TIMEOUT_SECONDS = 900
+OPUS_STAGE_TIMEOUT_SECONDS = 3900
+OPUS_IMMEDIATE_FAILOVER_CATEGORIES = (
+    'auth_unavailable',
+    'risk_control',
+    'permission_denied',
+    'timeout',
+    'server_error',
+)
 
 TAVILY_API_KEY = os.environ.get('TAVILY_API_KEY', '')
 GROK_API_KEY = os.environ.get('GROK_API_KEY', '')
@@ -170,7 +201,15 @@ def _get_pro_adapter():
                 pro_api_key = SEARCH_API_KEY_POOL[0]
             else:
                 logging.warning('⚠️ AUDIT_MODEL 使用 Gemini 3.5，但 GEMINI_PRO_API_KEY / GEMINI_SEARCH_API_KEYS 未配置；审计调用将鉴权失败。')
-        _pro_adapter = NativeLLMAdapter(model=AUDIT_MODEL, base_url=PRO_OPUS_BASE_URL, api_key=pro_api_key, max_retries=3)
+        _pro_adapter = NativeLLMAdapter(
+            model=AUDIT_MODEL,
+            base_url=PRO_OPUS_BASE_URL,
+            api_key=pro_api_key,
+            timeout=float(AUDIT_PRIMARY_REQUEST_TIMEOUT_SECONDS),
+            max_retries=3,
+            total_timeout_seconds=AUDIT_PRIMARY_TOTAL_TIMEOUT_SECONDS,
+            failover_categories=AUDIT_IMMEDIATE_FAILOVER_CATEGORIES,
+        )
     return _pro_adapter
 
 
@@ -193,8 +232,9 @@ def get_audit_fallback_adapter():
             model=AUDIT_MODEL,
             base_url=_normalize_anthropic_base_url(AUDIT_FALLBACK_BASE_URL),
             api_key=AUDIT_FALLBACK_API_KEY,
-            timeout=300.0,
+            timeout=float(AUDIT_FALLBACK_REQUEST_TIMEOUT_SECONDS),
             max_retries=2,
+            total_timeout_seconds=AUDIT_FALLBACK_TOTAL_TIMEOUT_SECONDS,
         )
     return _audit_fallback_adapter
 
@@ -207,12 +247,22 @@ def _get_opus_adapter():
             model=OPUS_MODEL,
             base_url=PRO_OPUS_BASE_URL,
             api_key=PRO_OPUS_API_KEY,
-            timeout=600.0,
+            timeout=float(OPUS_MODEL_TIMEOUT_SECONDS),
             max_retries=5,
             reasoning_effort=OPUS_REASONING_EFFORT,
             reasoning_summary=OPUS_REASONING_SUMMARY,
             use_responses_api=OPUS_USE_RESPONSES_API,
             total_timeout_seconds=OPUS_TOTAL_TIMEOUT_SECONDS,
+            fallback_total_timeout_seconds=OPUS_FALLBACK_TOTAL_TIMEOUT_SECONDS,
+            fallback_model=OPUS_FALLBACK_MODEL,
+            fallback_base_url=(
+                _normalize_anthropic_base_url(OPUS_FALLBACK_BASE_URL)
+                if OPUS_FALLBACK_BASE_URL
+                else ''
+            ),
+            fallback_api_key=OPUS_FALLBACK_API_KEY,
+            fallback_request_timeout_seconds=OPUS_MODEL_TIMEOUT_SECONDS,
+            failover_categories=OPUS_IMMEDIATE_FAILOVER_CATEGORIES,
         )
     return _opus_adapter
 

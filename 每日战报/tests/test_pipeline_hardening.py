@@ -796,7 +796,7 @@ class TestReportStage:
         assert context["research_plan"]["should_run_p7"] is False
         assert context["research_plan"]["should_run_p75"] is False
         assert context["p7_deep"] == ""
-        assert any(update[0] == ("research",) and update[1]["status"] == "failed_plan_fallback" for update in manifest_updates)
+        assert any(update[0] == ("p7_plan",) and update[1]["status"] == "failed_plan_fallback" for update in manifest_updates)
 
     def test_technical_failure_sets_price_fallback(self, monkeypatch):
         import orchestrator
@@ -867,7 +867,7 @@ class TestReportStage:
         monkeypatch.setattr(orchestrator, "p9_risk_analysis", lambda **kwargs: ("", ""))
         monkeypatch.setattr(orchestrator, "send_report_email", lambda content, now_str="": {"ok": True, "status": "completed_no_email"})
         with pytest.raises(RuntimeError, match="empty report"):
-            orchestrator._stage_report({})
+            orchestrator._stage_report({"p6_mapping": "mapping"})
 
     def test_stage_report_raises_when_delivery_fails(self, monkeypatch):
         import orchestrator
@@ -879,7 +879,7 @@ class TestReportStage:
             lambda content, now_str="": {"ok": False, "status": "completed_email_failed"},
         )
         with pytest.raises(RuntimeError, match="completed_email_failed"):
-            orchestrator._stage_report({})
+            orchestrator._stage_report({"p6_mapping": "mapping"})
 
 
 class TestPreflightChecks:
@@ -939,9 +939,14 @@ class TestPreflightChecks:
         @contextmanager
         def fake_lock(**_kwargs):
             calls.append("lock")
-            yield {}
+            yield {"owner_token": "test-owner"}
 
-        monkeypatch.setattr(pipeline_cli, "_collect_preflight", lambda strict: failing_result)
+        monkeypatch.setattr(pipeline_cli, "_resolve_preflight_resume_stage", lambda _flags: "none")
+        monkeypatch.setattr(
+            pipeline_cli,
+            "_collect_preflight",
+            lambda strict, **_kwargs: failing_result,
+        )
         monkeypatch.setattr(pipeline_cli, "_print_preflight", lambda result: result["summary"]["exit_code"])
         monkeypatch.setattr(pipeline_cli, "set_preflight_summary", lambda summary: calls.append(("summary", summary)))
         monkeypatch.setattr(pipeline_cli, "update_manifest_context", lambda **kwargs: calls.append(("context", kwargs)))
@@ -957,7 +962,7 @@ class TestPreflightChecks:
         result = pipeline_cli._run_orchestrator([], command_name="run")
 
         assert result == pipeline_cli.EXIT_CHECK_FAILED
-        assert "lock" not in calls
+        assert "lock" in calls
         assert not any(call[0] == "orchestrator" for call in calls if isinstance(call, tuple))
         assert not any(call[0] == "run_state" for call in calls if isinstance(call, tuple))
         assert not any(call[0] == "context" for call in calls if isinstance(call, tuple))
@@ -979,12 +984,13 @@ class TestPreflightChecks:
         @contextmanager
         def fake_lock(**kwargs):
             calls.append(("lock", kwargs))
-            yield {"command": kwargs.get("command")}
+            yield {"command": kwargs.get("command"), "owner_token": "test-owner"}
 
+        monkeypatch.setattr(pipeline_cli, "_resolve_preflight_resume_stage", lambda _flags: "none")
         monkeypatch.setattr(
             pipeline_cli,
             "_collect_preflight",
-            lambda strict: calls.append(("preflight", strict)) or successful_result,
+            lambda strict, **_kwargs: calls.append(("preflight", strict)) or successful_result,
         )
         monkeypatch.setattr(pipeline_cli, "set_preflight_summary", lambda summary: calls.append(("summary", summary)))
         monkeypatch.setattr(pipeline_cli, "update_manifest_context", lambda **kwargs: calls.append(("context", kwargs)))
@@ -1309,6 +1315,8 @@ class TestPreflightChecks:
         monkeypatch.setattr(pipeline_cli, "GROK_API_KEY", "optional")
         monkeypatch.setattr(pipeline_cli, "PRO_OPUS_BASE_URL", "http://127.0.0.1:8317/v1")
         monkeypatch.setattr(pipeline_cli, "PRO_OPUS_API_KEY", "secret")
+        monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_BASE_URL", "https://backup.example.test")
+        monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_API_KEY", "backup-secret")
         monkeypatch.setattr(pipeline_cli, "EMAIL_ADDRESS", "sender@example.com")
         monkeypatch.setattr(pipeline_cli, "EMAIL_PASSWORD", "smtp-secret")
         monkeypatch.setattr(pipeline_cli, "_probe_local_model_endpoint", lambda _url, _key: (True, "authenticated status=200"))
@@ -1349,6 +1357,8 @@ class TestPreflightChecks:
         monkeypatch.setattr(pipeline_cli, "ANTIGRAVITY_API_KEY", "secret")
         monkeypatch.setattr(pipeline_cli, "PRO_OPUS_BASE_URL", "http://127.0.0.1:8317/v1")
         monkeypatch.setattr(pipeline_cli, "PRO_OPUS_API_KEY", "secret")
+        monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_BASE_URL", "https://backup.example.test")
+        monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_API_KEY", "backup-secret")
         monkeypatch.setattr(pipeline_cli, "EMAIL_ADDRESS", "sender@example.com")
         monkeypatch.setattr(pipeline_cli, "EMAIL_PASSWORD", "smtp-secret")
         monkeypatch.setattr(pipeline_cli, "_probe_local_model_endpoint", lambda _url, _key: (True, "authenticated status=200"))

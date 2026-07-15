@@ -737,7 +737,16 @@ def p9_risk_analysis(
     else:
         prompt = f"{prompt}\n\n{P9_OUTPUT_LIMITS}"
 
-    resp = opus_adapter.invoke(prompt)
+    if _retry_count:
+        resp = opus_adapter.invoke(
+            prompt,
+            {
+                "force_fallback": True,
+                "fallback_reason": "P9 previous output failed JSON or completeness validation",
+            },
+        )
+    else:
+        resp = opus_adapter.invoke(prompt)
     raw_content = getattr(resp, "content", "") or ""
     thinking_content = getattr(resp, "thinking_content", "") or ""
     model_provenance = get_model_provenance(resp, OPUS_MODEL)
@@ -896,7 +905,12 @@ def p9_risk_analysis(
         return "", run_ts
 
 
-def send_report_email(content, now_str: str = "") -> dict[str, Any]:
+def send_report_email(
+    content,
+    now_str: str = "",
+    *,
+    email_required: bool | None = None,
+) -> dict[str, Any]:
     """
     Save the final report and optionally deliver it by email.
     """
@@ -909,6 +923,13 @@ def send_report_email(content, now_str: str = "") -> dict[str, Any]:
     content = normalize_common_text_mojibake(content)
     now = datetime.now()
     file_ts = now_str or get_run_timestamp()
+    credentials_available = bool(EMAIL_ADDRESS and EMAIL_PASSWORD and RECEIVER_EMAIL)
+    email_configured = credentials_available if email_required is not False else False
+    update_run_manifest(
+        "p9",
+        status="report_save_in_progress",
+        metrics={"email_configured": email_configured, "email_sent": False},
+    )
     try:
         fname = write_text_artifact("战报", content, timestamp=file_ts)
         logging.info("[P9] saved report to %s", fname)
@@ -918,7 +939,25 @@ def send_report_email(content, now_str: str = "") -> dict[str, Any]:
         update_run_manifest("p9", status=status, metrics={"error": str(exc)})
         return {"ok": False, "status": status, "report_path": "", "email_sent": False}
 
-    if not all([EMAIL_ADDRESS, EMAIL_PASSWORD, RECEIVER_EMAIL]):
+    update_run_manifest(
+        "p9",
+        status="report_saved_pending_delivery",
+        files={"md": fname},
+        metrics={"email_configured": email_configured, "email_sent": False},
+    )
+
+    if email_required is True and not credentials_available:
+        logging.error("[P9] required email delivery cannot continue: credentials are incomplete")
+        status = "failed_delivery_config"
+        update_run_manifest(
+            "p9",
+            status=status,
+            files={"md": fname},
+            metrics={"email_configured": True, "email_sent": False},
+        )
+        return {"ok": False, "status": status, "report_path": fname, "email_sent": False}
+
+    if not email_configured:
         logging.warning("[P9] email is not configured; keeping local report only")
         status = "completed_no_email"
         update_run_manifest(
@@ -929,6 +968,8 @@ def send_report_email(content, now_str: str = "") -> dict[str, Any]:
         )
         return {"ok": True, "status": status, "report_path": fname, "email_sent": False}
 
+    # SMTP has no transaction shared with the local manifest. A process crash after
+    # remote acceptance can still cause at-least-once delivery on the next resume.
     try:
         send_report_via_email(
             content,

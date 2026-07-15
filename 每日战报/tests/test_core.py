@@ -1193,13 +1193,14 @@ class TestCheckpoint:
         assert ckpt['stage'] == 'none'
 
     def test_p1_detected(self, tmp_path, monkeypatch):
-        """有 P1 文件应返回 stage='p1'"""
+        """仅有 P1 文件时应定向补跑缺失的 P2/P3。"""
         monkeypatch.setattr('checkpoint.get_today_output_dir', lambda: str(tmp_path))
         monkeypatch.setattr('artifact_store.get_today_output_dir', lambda: str(tmp_path))
         (tmp_path / 'P1_RSS原始数据_202604091000.json').write_text('{}', encoding='utf-8')
         from checkpoint import detect_checkpoint
         ckpt = detect_checkpoint()
-        assert ckpt['stage'] == 'p1'
+        assert ckpt['stage'] == 'intel_resume'
+        assert ckpt['intel_resume_stages'] == ['p2', 'p3']
 
     def test_war_report_without_terminal_manifest_is_not_done(self, tmp_path, monkeypatch):
         """仅有战报文件不能证明投递和 ROI 已完成。"""

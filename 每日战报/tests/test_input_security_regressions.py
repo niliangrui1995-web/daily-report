@@ -95,7 +95,7 @@ def test_p6_marks_external_evidence_as_untrusted(monkeypatch):
     names = ["佰维存储", "江波龙", "德明利", "兆易创新", "聚辰股份"]
     code_map = {name: f"68{index:04d}" for index, name in enumerate(names, 1)}
 
-    def fake_invoke(prompt):
+    def fake_invoke(prompt, _config=None):
         prompts.append(prompt)
         return SimpleNamespace(
             content=json.dumps(

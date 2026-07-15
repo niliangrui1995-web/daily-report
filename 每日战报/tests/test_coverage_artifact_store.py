@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from contextlib import contextmanager
 from datetime import date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -66,6 +68,7 @@ def test_artifact_store_json_ready_classification_and_degradation_summary():
     assert artifact_store.classify_stage_status("completed_custom") == "success"
     assert artifact_store.classify_stage_status("timeout") == "failed"
     assert artifact_store.classify_stage_status("retrying") == "active"
+    assert artifact_store.classify_stage_status("completed_email_failed") == "degraded"
     assert artifact_store.classify_stage_status("mystery") == "unknown"
 
     assert artifact_store.summarize_stage_degradations({"stages": []}) == []
@@ -90,6 +93,121 @@ def test_artifact_store_json_ready_classification_and_degradation_summary():
             "reason": "adapter down",
         },
     ]
+
+    active_summary = artifact_store.summarize_stage_degradations(
+        {
+            "stages": {
+                "orchestrator": {"status": "running"},
+                "p2": {"status": "retrying"},
+            }
+        }
+    )
+    assert active_summary == [
+        {"stage": "p2", "status": "retrying", "reason": "unfinished stage state"}
+    ]
+
+
+def test_reset_run_manifest_archives_previous_run_and_starts_empty(tmp_path, monkeypatch):
+    import artifact_store
+
+    monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+    old_ts = "20260715070000"
+    new_ts = "20260715090000"
+    artifact_store.set_run_timestamp(old_ts)
+    artifact_store.update_run_manifest(
+        "p9",
+        status="completed_email_sent",
+        files={"md": str(tmp_path / f"战报_{old_ts}.md")},
+        timestamp=old_ts,
+    )
+    artifact_store.record_run_state(
+        status="completed",
+        root_cause="completed",
+        timestamp=old_ts,
+    )
+
+    archive_path = artifact_store.reset_run_manifest(new_ts)
+    current = artifact_store.load_run_manifest()
+    archived = json.loads(Path(archive_path).read_text(encoding=artifact_store.UTF8_FILE_ENCODING))
+
+    assert current["run_timestamp"] == new_ts
+    assert current["stages"] == {}
+    assert current["status"] == "pending"
+    assert current["runtime_context"]["previous_run_timestamp"] == old_ts
+    assert current["runtime_context"]["previous_manifest_archive"] == archive_path
+    assert archived["run_timestamp"] == old_ts
+    assert archived["stages"]["p9"]["status"] == "completed_email_sent"
+
+
+def test_reset_run_manifest_advances_same_second_and_rejects_stale_caller_timestamp(
+    tmp_path,
+    monkeypatch,
+):
+    import artifact_store
+
+    monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+    previous_ts = "20260715090000"
+    expected_ts = "20260715090001"
+    monkeypatch.setenv(artifact_store.RUN_TIMESTAMP_ENV, previous_ts)
+    artifact_store.update_run_manifest(
+        "p9",
+        status="completed_email_sent",
+        timestamp=previous_ts,
+    )
+
+    artifact_store.reset_run_manifest(previous_ts)
+
+    current = artifact_store.load_run_manifest()
+    assert current["run_timestamp"] == expected_ts
+    assert os.environ[artifact_store.RUN_TIMESTAMP_ENV] == expected_ts
+
+    # The orchestrator already holds the pre-reset candidate in a local variable.
+    # A later explicit write with that stale value must not regress the new run.
+    artifact_store.update_run_manifest(
+        "orchestrator",
+        status="started",
+        timestamp=previous_ts,
+    )
+    artifact_store.update_manifest_context(
+        runtime_context={"resume_from": "none"},
+        timestamp=previous_ts,
+    )
+    artifact_store.record_run_state(
+        status="running",
+        root_cause="orchestrator_started",
+        timestamp=previous_ts,
+    )
+    current = artifact_store.load_run_manifest()
+    assert current["run_timestamp"] == expected_ts
+    assert current["stages"]["orchestrator"]["run_timestamp"] == expected_ts
+
+
+def test_clean_success_clears_transient_failure_metrics(tmp_path, monkeypatch):
+    import artifact_store
+
+    monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+    artifact_store.update_run_manifest(
+        "p3",
+        status="failed_exception",
+        metrics={
+            "error": "route down",
+            "failure_category": "network_error",
+            "degrade_reason": "all routes failed",
+            "stop_reason": "budget_exhausted",
+            "structured_degraded": True,
+        },
+        timestamp="20260715090000",
+    )
+
+    artifact_store.update_run_manifest(
+        "p3",
+        status="completed",
+        metrics={"content_chars": 120},
+        timestamp="20260715090000",
+    )
+
+    metrics = artifact_store.load_run_manifest()["stages"]["p3"]["metrics"]
+    assert metrics == {"content_chars": 120}
 
 
 def test_artifact_store_posix_manifest_lock_helpers(monkeypatch):

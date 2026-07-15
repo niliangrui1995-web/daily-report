@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Callable, TextIO
 
 from settings import OUTPUT_DIR, SEARCH_API_KEY_POOL, get_tls_policy_summary, get_today_output_dir
@@ -24,6 +24,7 @@ UTF8_FILE_ENCODING = "utf-8-sig"
 ARTIFACT_CATEGORIES = ("logs", "meta")
 STAGE_DEGRADED_STATUSES = {
     "completed_structured_degraded",
+    "completed_email_failed",
 }
 DEGRADED_SKIP_STATUSES = {
     "skipped_missing_dependency",
@@ -113,6 +114,32 @@ def extract_timestamp_from_name(text: str) -> str:
         return ""
     match = re.search(r"(\d{12,14})", text)
     return match.group(1) if match else ""
+
+
+def _parse_run_timestamp(value: str) -> datetime | None:
+    normalized = str(value or "").strip()
+    if len(normalized) != 14 or not normalized.isdigit():
+        return None
+    try:
+        return datetime.strptime(normalized, "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+
+
+def _next_restart_run_timestamp(candidate: str, previous: str) -> str:
+    candidate_dt = _parse_run_timestamp(candidate)
+    previous_dt = _parse_run_timestamp(previous)
+    if candidate_dt is None or previous_dt is None or candidate_dt > previous_dt:
+        return candidate
+    return (previous_dt + timedelta(seconds=1)).strftime("%Y%m%d%H%M%S")
+
+
+def _preserve_newer_manifest_timestamp(candidate: str, current: str) -> str:
+    candidate_dt = _parse_run_timestamp(candidate)
+    current_dt = _parse_run_timestamp(current)
+    if candidate_dt is not None and current_dt is not None and candidate_dt < current_dt:
+        return current
+    return candidate
 
 
 def set_run_timestamp(timestamp: str | None = None) -> str:
@@ -262,7 +289,9 @@ def summarize_stage_degradations(manifest: dict[str, Any]) -> list[dict[str, str
         metrics = payload.get("metrics", {})
         if not isinstance(metrics, dict):
             metrics = {}
-        if classify_stage_status(status, metrics) not in {"degraded", "failed"}:
+        classification = classify_stage_status(status, metrics)
+        is_unfinished_business_stage = classification == "active" and stage_name != "orchestrator"
+        if classification not in {"degraded", "failed"} and not is_unfinished_business_stage:
             continue
         reason = str(
             metrics.get("degrade_reason")
@@ -270,7 +299,7 @@ def summarize_stage_degradations(manifest: dict[str, Any]) -> list[dict[str, str
             or metrics.get("fallback_reason")
             or metrics.get("error")
             or payload.get("error")
-            or ""
+            or ("unfinished stage state" if is_unfinished_business_stage else "")
         ).strip()
         degraded.append({"stage": str(stage_name), "status": status or "unknown", "reason": reason})
     return degraded
@@ -395,6 +424,51 @@ def load_run_manifest(day_dir: str | None = None) -> dict[str, Any]:
                 return manifest
 
 
+def reset_run_manifest(run_ts: str) -> str:
+    """Archive the current manifest and start a clean, same-day run state."""
+    normalized_run_ts = str(run_ts or "").strip() or datetime.now().strftime("%Y%m%d%H%M%S")
+    manifest_path = get_manifest_path()
+    archive_path = ""
+
+    with _MANIFEST_LOCK:
+        with _manifest_file_lock():
+            source_path = _resolve_manifest_read_path()
+            source_exists = os.path.exists(source_path)
+            previous = _load_manifest_for_write(normalized_run_ts)
+            previous_run_ts = (
+                str(previous.get("run_timestamp") or "").strip() if source_exists else ""
+            )
+            normalized_run_ts = _next_restart_run_timestamp(
+                normalized_run_ts,
+                previous_run_ts,
+            )
+
+            if source_exists:
+                archive_name = (
+                    f"run_manifest_{previous_run_ts or 'unknown'}_before_restart_{normalized_run_ts}.json"
+                )
+                archive_path = os.path.join(get_day_subdir("meta"), archive_name)
+                _write_manifest_file(archive_path, previous)
+
+            manifest = _build_default_manifest(normalized_run_ts)
+            manifest["updated_at"] = datetime.now().isoformat()
+            manifest["status"] = "pending"
+            manifest["root_cause"] = "force_restart"
+            manifest["status_reason"] = "new run initialized after explicit restart"
+            if previous_run_ts or archive_path:
+                context = manifest.setdefault("runtime_context", {})
+                if previous_run_ts:
+                    context["previous_run_timestamp"] = previous_run_ts
+                if archive_path:
+                    context["previous_manifest_archive"] = archive_path
+
+            _write_manifest_file(manifest_path, manifest)
+            _cleanup_legacy_manifest(manifest_path)
+
+    os.environ[RUN_TIMESTAMP_ENV] = normalized_run_ts
+    return archive_path
+
+
 def update_run_manifest(
     stage: str,
     *,
@@ -411,6 +485,10 @@ def update_run_manifest(
         with _manifest_file_lock():
             manifest = _load_manifest_for_write(initial_run_ts)
             run_ts = timestamp or manifest.get("run_timestamp") or env_run_ts or initial_run_ts
+            run_ts = _preserve_newer_manifest_timestamp(
+                str(run_ts),
+                str(manifest.get("run_timestamp") or ""),
+            )
             manifest["run_timestamp"] = run_ts
             manifest["updated_at"] = datetime.now().isoformat()
             manifest["manifest_version"] = 3
@@ -424,10 +502,23 @@ def update_run_manifest(
             if files:
                 stage_payload.setdefault("files", {}).update(files)
             existing_metrics = stage_payload.setdefault("metrics", {})
-            if status in SUCCESS_STATUSES and (not metrics or "error" not in metrics):
-                existing_metrics.pop("error", None)
-                existing_metrics.pop("failure_category", None)
-                existing_metrics.pop("failure_message", None)
+            clean_success = (
+                status in SUCCESS_STATUSES
+                and status not in DEGRADED_STATUSES
+                and not bool((metrics or {}).get("structured_degraded"))
+                and not str((metrics or {}).get("error") or "").strip()
+            )
+            if clean_success:
+                for transient_key in (
+                    "error",
+                    "failure_category",
+                    "failure_message",
+                    "degrade_reason",
+                    "fallback_reason",
+                    "stop_reason",
+                    "structured_degraded",
+                ):
+                    existing_metrics.pop(transient_key, None)
             if metrics:
                 existing_metrics.update(metrics)
 
@@ -481,6 +572,10 @@ def update_manifest_context(
         with _manifest_file_lock():
             manifest = _load_manifest_for_write(initial_run_ts)
             run_ts = timestamp or manifest.get("run_timestamp") or env_run_ts or initial_run_ts
+            run_ts = _preserve_newer_manifest_timestamp(
+                str(run_ts),
+                str(manifest.get("run_timestamp") or ""),
+            )
             manifest["run_timestamp"] = run_ts
             manifest["updated_at"] = datetime.now().isoformat()
             manifest["manifest_version"] = 3
@@ -521,6 +616,10 @@ def record_run_state(
         with _manifest_file_lock(day_dir):
             manifest = _load_manifest_for_write(initial_run_ts, day_dir)
             run_ts = timestamp or env_run_ts or manifest.get("run_timestamp") or initial_run_ts
+            run_ts = _preserve_newer_manifest_timestamp(
+                str(run_ts),
+                str(manifest.get("run_timestamp") or ""),
+            )
             previous_status = str(manifest.get("status") or "").strip()
             previous_root_cause = str(manifest.get("root_cause") or "").strip()
             previous_reason = str(manifest.get("status_reason") or "").strip()

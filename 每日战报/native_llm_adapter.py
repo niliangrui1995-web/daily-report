@@ -108,19 +108,25 @@ def _classify_provider_error(error: Exception) -> Dict[str, Any]:
         return {'category': 'auth_unavailable', 'retryable': True}
     if '401' in err_lower or '403' in err_lower or 'balance' in err_lower:
         return {'category': 'risk_control', 'retryable': True}
-    if '429' in err_lower or '503' in err_lower or 'resource_exhausted' in err_lower:
+    if '429' in err_lower or 'resource_exhausted' in err_lower:
         return {'category': 'rate_limit', 'retryable': True}
-    if 'timeout' in err_lower or 'deadline' in err_lower:
+    if 'timeout' in err_lower or 'timed out' in err_lower or 'deadline' in err_lower or '504' in err_lower:
         return {'category': 'timeout', 'retryable': True}
     if (
         'connection' in err_lower
         or 'ssl' in err_lower
         or 'proxy' in err_lower
         or 'eof' in err_lower
+    ):
+        return {'category': 'network_error', 'retryable': True}
+    if (
+        re.search(r'\b(?:500|502|503)\b', err_lower)
+        or 'bad gateway' in err_lower
+        or 'service unavailable' in err_lower
         or 'internal_server_error' in err_lower
         or 'server_error' in err_lower
     ):
-        return {'category': 'network_error', 'retryable': True}
+        return {'category': 'server_error', 'retryable': True}
     return {'category': 'unknown_error', 'retryable': True}
 
 
@@ -500,7 +506,12 @@ class NativeLLMAdapter(RunnableSerializable):
 
     def invoke(self, messages: Any, config: Any = None) -> Any:
         system_prompt, user_prompt = self._parse_messages(messages)
-        _ = config
+        force_fallback = bool(config.get('force_fallback')) if isinstance(config, dict) else False
+        forced_fallback_reason = (
+            str(config.get('fallback_reason') or 'previous response failed semantic validation')
+            if isinstance(config, dict)
+            else 'previous response failed semantic validation'
+        )
         self._reset_last_error()
         self.last_response_model = ''
         call_deadline = self._new_call_deadline()
@@ -510,21 +521,26 @@ class NativeLLMAdapter(RunnableSerializable):
 
         thinking_content = ''
         original_model = self.model
-        attempted_models = [original_model]
+        attempted_models = [] if force_fallback and original_model == 'gpt-5.6-sol' else [original_model]
         selected_model = original_model
         fallback_used = False
         fallback_model = ''
         fallback_reason_category = ''
         fallback_reason = ''
+        fallback_provider = ''
+        fallback_endpoint_independent = False
 
-        if self.provider == 'anthropic':
-            result = self._call_anthropic(system_prompt, user_prompt)
+        if force_fallback and original_model == 'gpt-5.6-sol':
+            text = ''
+            self._set_last_error('semantic_validation_failed', forced_fallback_reason)
+        elif self.provider == 'anthropic':
+            result = self._call_anthropic(system_prompt, user_prompt, call_deadline)
             if isinstance(result, tuple):
                 text, thinking_content = result
             else:
                 text = result
         elif self.provider == 'google':
-            text = self._call_gemini(f"{system_prompt}\n\n{user_prompt}")
+            text = self._call_gemini(f"{system_prompt}\n\n{user_prompt}", call_deadline)
         else:
             result = self._call_openai_compat(system_prompt, user_prompt, call_deadline)
             if isinstance(result, tuple):
@@ -532,21 +548,32 @@ class NativeLLMAdapter(RunnableSerializable):
             else:
                 text = result
 
-        # Fallback logic for gpt-5.6-sol to claude-opus-4-6-thinking (quota / balance exhaustion)
+        # Fallback logic for gpt-5.6-sol to claude-opus-4-6-thinking.
         if original_model == 'gpt-5.6-sol' and (not text or self.last_error_category):
             err_msg_lower = self.last_error_message.lower()
-            is_quota_or_balance = (
+            is_fallback_eligible = (
                 self.last_error_category in (
                     'auth_unavailable',
                     'risk_control',
                     'rate_limit',
                     'permission_denied',
+                    'timeout',
+                    'timeout_budget_exhausted',
+                    'server_error',
+                    'network_error',
+                    'incomplete_response',
+                    'empty_response',
+                    'semantic_validation_failed',
+                    'unknown_error',
                 ) or
                 any(kw in err_msg_lower for kw in ('balance', 'quota', 'credit', 'insufficient', '401', '403', '429', 'limit', 'exceeded'))
             )
-            if is_quota_or_balance:
+            if is_fallback_eligible:
                 fallback_used = True
-                fallback_model = 'claude-opus-4-6-thinking'
+                fallback_model = str(
+                    (self.extra_kwargs or {}).get('fallback_model')
+                    or 'claude-opus-4-6-thinking'
+                )
                 fallback_reason_category = self.last_error_category
                 fallback_reason = self.last_error_message
                 attempted_models.append(fallback_model)
@@ -556,25 +583,86 @@ class NativeLLMAdapter(RunnableSerializable):
                 )
                 self._reset_last_error()
                 self.last_response_model = ''
-                object.__setattr__(self, 'model', fallback_model)
                 selected_model = fallback_model
-                try:
-                    if self.provider == 'anthropic':
-                        result = self._call_anthropic(system_prompt, user_prompt)
-                        if isinstance(result, tuple):
-                            text, thinking_content = result
-                        else:
-                            text = result
-                    elif self.provider == 'google':
-                        text = self._call_gemini(f"{system_prompt}\n\n{user_prompt}")
+                fallback_base_url = str(
+                    (self.extra_kwargs or {}).get('fallback_base_url') or ''
+                ).strip()
+                fallback_api_key = str(
+                    (self.extra_kwargs or {}).get('fallback_api_key') or ''
+                ).strip()
+                if fallback_base_url and fallback_api_key:
+                    try:
+                        fallback_timeout = float(
+                            (self.extra_kwargs or {}).get(
+                                'fallback_request_timeout_seconds',
+                                self.timeout,
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        fallback_timeout = float(self.timeout)
+                    fallback_kwargs: Dict[str, Any] = {}
+                    fallback_total_timeout = (self.extra_kwargs or {}).get(
+                        'fallback_total_timeout_seconds'
+                    )
+                    if fallback_total_timeout is not None:
+                        fallback_kwargs['total_timeout_seconds'] = fallback_total_timeout
+                    external_fallback = NativeLLMAdapter(
+                        model=fallback_model,
+                        base_url=fallback_base_url,
+                        api_key=fallback_api_key,
+                        max_retries=self.max_retries,
+                        timeout=fallback_timeout,
+                        **fallback_kwargs,
+                    )
+                    fallback_messages = []
+                    if system_prompt:
+                        fallback_messages.append(('system', system_prompt))
+                    fallback_messages.append(('human', user_prompt))
+                    fallback_response = external_fallback.invoke(fallback_messages)
+                    text = str(getattr(fallback_response, 'content', '') or '')
+                    thinking_content = str(
+                        getattr(fallback_response, 'thinking_content', '') or ''
+                    )
+                    fallback_provider = external_fallback.provider
+                    fallback_endpoint_independent = (
+                        fallback_base_url.rstrip('/') != self.base_url.rstrip('/')
+                        or fallback_api_key != self.api_key
+                    )
+                    self.last_response_model = external_fallback.last_response_model
+                    if text.strip():
+                        self._reset_last_error()
                     else:
-                        result = self._call_openai_compat(system_prompt, user_prompt, call_deadline)
-                        if isinstance(result, tuple):
-                            text, thinking_content = result
+                        self._set_last_error(
+                            external_fallback.last_error_category or 'empty_response',
+                            external_fallback.last_error_message
+                            or 'fallback provider returned no output text',
+                        )
+                else:
+                    object.__setattr__(self, 'model', fallback_model)
+                    fallback_deadline = call_deadline
+                    if (self.extra_kwargs or {}).get('fallback_total_timeout_seconds') is not None:
+                        fallback_deadline = self._new_call_deadline('fallback_total_timeout_seconds')
+                    try:
+                        if self.provider == 'anthropic':
+                            result = self._call_anthropic(system_prompt, user_prompt, fallback_deadline)
+                            if isinstance(result, tuple):
+                                text, thinking_content = result
+                            else:
+                                text = result
+                        elif self.provider == 'google':
+                            text = self._call_gemini(
+                                f"{system_prompt}\n\n{user_prompt}",
+                                fallback_deadline,
+                            )
                         else:
-                            text = result
-                finally:
-                    object.__setattr__(self, 'model', original_model)
+                            result = self._call_openai_compat(system_prompt, user_prompt, fallback_deadline)
+                            if isinstance(result, tuple):
+                                text, thinking_content = result
+                            else:
+                                text = result
+                    finally:
+                        object.__setattr__(self, 'model', original_model)
+                    fallback_provider = self.provider
         effective_model = self.last_response_model or (selected_model if text else '')
         model_provenance = {
             'requested_model': original_model,
@@ -586,6 +674,8 @@ class NativeLLMAdapter(RunnableSerializable):
             'response_model': effective_model,
             'effective_model': effective_model,
             'adapter_provider': self.provider,
+            'fallback_provider': fallback_provider,
+            'fallback_endpoint_independent': fallback_endpoint_independent,
             'final_error_category': self.last_error_category,
             'final_error': self.last_error_message[:2000],
         }
@@ -711,8 +801,8 @@ class NativeLLMAdapter(RunnableSerializable):
         self.last_error_category = category
         self.last_error_message = message[:2000]
 
-    def _new_call_deadline(self) -> Optional[float]:
-        raw_budget = (self.extra_kwargs or {}).get('total_timeout_seconds')
+    def _new_call_deadline(self, budget_key: str = 'total_timeout_seconds') -> Optional[float]:
+        raw_budget = (self.extra_kwargs or {}).get(budget_key)
         try:
             budget = float(raw_budget)
         except (TypeError, ValueError):
@@ -743,6 +833,25 @@ class NativeLLMAdapter(RunnableSerializable):
         wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
         if attempt >= self.max_retries - 1:
             logger.error(f"[{provider_label}] final attempt failed: {error}")
+            return False
+
+        raw_failover_categories = (self.extra_kwargs or {}).get('failover_categories', ())
+        if isinstance(raw_failover_categories, str):
+            failover_categories = {
+                item.strip() for item in raw_failover_categories.split(',') if item.strip()
+            }
+        else:
+            failover_categories = {
+                str(item).strip()
+                for item in (raw_failover_categories or ())
+                if str(item).strip()
+            }
+        if error_info['category'] in failover_categories:
+            logger.warning(
+                '[%s] category=%s configured for immediate failover; stop primary retries',
+                provider_label,
+                error_info['category'],
+            )
             return False
 
         if deadline is not None:
@@ -798,7 +907,12 @@ class NativeLLMAdapter(RunnableSerializable):
         time.sleep(wait)
         return True
 
-    def _call_anthropic(self, system_prompt: str, user_prompt: str) -> tuple[str, str]:
+    def _call_anthropic(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        deadline: Optional[float] = None,
+    ) -> tuple[str, str]:
         if getattr(self, '_anthropic_client', None) is None:
             from anthropic import Anthropic
             client = Anthropic(api_key=self.api_key, base_url=self.base_url, default_headers=FAKE_HEADERS)
@@ -822,8 +936,16 @@ class NativeLLMAdapter(RunnableSerializable):
 
         for attempt in range(self.max_retries):
             try:
+                request_timeout = self._bounded_request_timeout(deadline)
+                if request_timeout <= 0:
+                    if not self.last_error_category:
+                        self._set_last_error(
+                            'timeout_budget_exhausted',
+                            'total call timeout budget exhausted',
+                        )
+                    break
+                kwargs['timeout'] = request_timeout
                 response = client.messages.create(**kwargs)
-                self._reset_last_error()
                 self.last_response_model = str(getattr(response, 'model', '') or self.model)
                 text_blocks = [b.text for b in response.content if b.type == 'text']
                 thinking_blocks = [b.thinking for b in response.content if b.type == 'thinking']
@@ -831,18 +953,29 @@ class NativeLLMAdapter(RunnableSerializable):
                 text = text_blocks[0] if text_blocks else ''
                 thinking = '\n\n'.join(thinking_blocks) if thinking_blocks else ''
 
+                if text.strip():
+                    self._reset_last_error()
+                else:
+                    self._set_last_error('empty_response', 'provider returned HTTP 200 without output text')
+
                 if thinking:
                     logger.info(f"🧠 [Anthropic] 捕获 thinking 推理链: {len(thinking)} 字符")
 
                 return text, thinking
             except Exception as e:
-                if not self._handle_provider_error('Anthropic', e, attempt, risk_hint='让反代切换账号'):
+                if not self._handle_provider_error(
+                    'Anthropic',
+                    e,
+                    attempt,
+                    risk_hint='让反代切换账号',
+                    deadline=deadline,
+                ):
                     break
 
         logger.error(f"❌ [Anthropic] 调用失败，最后错误分类: {self.last_error_category or 'unknown_error'}")
         return '', ''
 
-    def _call_gemini(self, prompt: str) -> str:
+    def _call_gemini(self, prompt: str, deadline: Optional[float] = None) -> str:
         # 统一使用最新 google.genai 架构（同时处理官方直连与旧 3.x 反代）
         if getattr(self, '_gemini_client', None) is None:
             from google import genai
@@ -871,6 +1004,13 @@ class NativeLLMAdapter(RunnableSerializable):
 
         for attempt in range(self.max_retries):
             try:
+                if self._bounded_request_timeout(deadline) <= 0:
+                    if not self.last_error_category:
+                        self._set_last_error(
+                            'timeout_budget_exhausted',
+                            'total call timeout budget exhausted',
+                        )
+                    break
                 kwargs = {
                     "model": self.model,
                     "contents": prompt,
@@ -885,15 +1025,24 @@ class NativeLLMAdapter(RunnableSerializable):
                     kwargs["config"].tools = [types.Tool(google_search=types.GoogleSearch())]
                 
                 response = client.models.generate_content(**kwargs)
-                self._reset_last_error()
                 self.last_response_model = str(
                     getattr(response, 'model_version', '')
                     or getattr(response, 'model', '')
                     or self.model
                 )
-                return response.text if response.text else ''
+                text = response.text if response.text else ''
+                if text.strip():
+                    self._reset_last_error()
+                else:
+                    self._set_last_error('empty_response', 'provider returned HTTP 200 without output text')
+                return text
             except Exception as e:
-                if not self._handle_provider_error('Gemini SDK', e, attempt):
+                if not self._handle_provider_error(
+                    'Gemini SDK',
+                    e,
+                    attempt,
+                    deadline=deadline,
+                ):
                     break
 
         logger.error(f"❌ [Gemini SDK] 调用失败，最后错误分类: {self.last_error_category or 'unknown_error'}")
@@ -932,7 +1081,6 @@ class NativeLLMAdapter(RunnableSerializable):
                 resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
                 resp.raise_for_status()
                 data = resp.json()
-                self._reset_last_error()
                 self.last_response_model = str(data.get('model') or self.model)
 
                 text = ""
@@ -954,7 +1102,12 @@ class NativeLLMAdapter(RunnableSerializable):
                                     text += content_block + "\n"
                                 elif isinstance(content_block, dict) and "text" in content_block:
                                     text += str(content_block.get("text") or "") + "\n"
-                return text.strip()
+                text = text.strip()
+                if text:
+                    self._reset_last_error()
+                else:
+                    self._set_last_error('empty_response', 'provider returned HTTP 200 without output text')
+                return text
             except Exception as e:
                 if not self._handle_provider_error('Grok Native', e, attempt):
                     break
@@ -990,10 +1143,19 @@ class NativeLLMAdapter(RunnableSerializable):
 
         for attempt in range(self.max_retries):
             try:
+                request_timeout = self._bounded_request_timeout(deadline)
+                if request_timeout <= 0:
+                    if not self.last_error_category:
+                        self._set_last_error(
+                            'timeout_budget_exhausted',
+                            'total call timeout budget exhausted',
+                        )
+                    logger.error('[OpenAI兼容] 总调用预算已耗尽，停止请求')
+                    break
                 kwargs = {
                     'model': self.model,
                     'messages': messages,
-                    'timeout': self.timeout,
+                    'timeout': request_timeout,
                 }
                 max_tokens = _openai_compat_max_tokens(self.model)
                 if max_tokens is not None:
@@ -1002,18 +1164,27 @@ class NativeLLMAdapter(RunnableSerializable):
                 if reasoning_effort:
                     kwargs['reasoning_effort'] = reasoning_effort
                 response = client.chat.completions.create(**kwargs)
-                self._reset_last_error()
                 self.last_response_model = str(getattr(response, 'model', '') or self.model)
                 message = response.choices[0].message
                 text = message.content or ''
                 reasoning = getattr(message, 'reasoning_content', '') or ''
+
+                if text.strip():
+                    self._reset_last_error()
+                else:
+                    self._set_last_error('empty_response', 'provider returned HTTP 200 without output text')
 
                 if reasoning:
                     logger.info(f"🧠 [OpenAI兼容] 捕获 reasoning_content 推理链: {len(reasoning)} 字符")
 
                 return text, reasoning
             except Exception as e:
-                if not self._handle_provider_error('OpenAI兼容', e, attempt):
+                if not self._handle_provider_error(
+                    'OpenAI兼容',
+                    e,
+                    attempt,
+                    deadline=deadline,
+                ):
                     break
 
         logger.error(f"❌ [OpenAI兼容] 调用失败，最后错误分类: {self.last_error_category or 'unknown_error'}")
@@ -1085,6 +1256,19 @@ class NativeLLMAdapter(RunnableSerializable):
                     )
                     if attempt < self.max_retries - 1:
                         wait = min(15 * (2 ** attempt), 120) + random.uniform(0, 2.0)
+                        if deadline is not None:
+                            remaining = max(0.0, deadline - time.monotonic())
+                            if remaining <= wait:
+                                self._set_last_error(
+                                    'timeout_budget_exhausted',
+                                    'total call timeout budget exhausted after incomplete response',
+                                )
+                                logger.warning(
+                                    '[OpenAI Responses] 剩余预算 %.1fs 不足退避 %.1fs，切换备胎',
+                                    remaining,
+                                    wait,
+                                )
+                                break
                         logger.warning(
                             "[OpenAI Responses] 等待 %.1fs 后重试未完成响应（%s/%s）",
                             wait,
@@ -1096,6 +1280,9 @@ class NativeLLMAdapter(RunnableSerializable):
 
                     return text, reasoning
 
+                if not text.strip():
+                    self._set_last_error('empty_response', 'provider returned HTTP 200 without output text')
+                    return text, reasoning
                 if self.last_error_category:
                     self._reset_last_error()
                 return text, reasoning

@@ -632,6 +632,7 @@ outside
 def _configure_p2(monkeypatch, *, keywords=None, reasoning="high"):
     manifests = []
     monkeypatch.setattr(p2_x_intel, "GROK_API_KEY", "test-key")
+    monkeypatch.setattr(p2_x_intel, "GROK_FALLBACK_API_KEY", "")
     monkeypatch.setattr(p2_x_intel, "GROK_MODEL", "grok-test")
     monkeypatch.setattr(p2_x_intel, "GROK_REASONING_EFFORT", reasoning)
     monkeypatch.setattr(p2_x_intel, "GROK_MAX_OUTPUT_TOKENS", 1234)
@@ -745,8 +746,96 @@ def test_collect_from_x_successful_chunks_structured_output(monkeypatch):
     assert posts[0][1]["json"]["reasoning"] == {"effort": "high"}
     assert "tracks=1" in posts[0][1]["json"]["input"][0]["content"]
     assert saved[0][0] == content
+    assert manifests[0][1]["status"] == "running"
     assert manifests[-1][1]["status"] == "completed"
     assert manifests[-1][1]["files"] == {"md": "p2.md", "json": "p2.json"}
+
+
+def test_collect_from_x_primary_budget_exhaustion_still_uses_independent_fallback(monkeypatch):
+    _configure_p2(monkeypatch, keywords=["kw1", "kw2", "kw3", "kw4", "kw5", "kw6"])
+    monkeypatch.setattr(p2_x_intel, "GROK_FALLBACK_API_KEY", "fallback-key")
+    monkeypatch.setattr(p2_x_intel, "GROK_FALLBACK_MODEL", "grok-4.5")
+    clock = {"now": 0.0}
+    calls = []
+
+    def post(url, **kwargs):
+        model = kwargs["json"]["model"]
+        calls.append((url, model, kwargs["timeout"]))
+        if model == "grok-test":
+            clock["now"] = 300.0
+            return FakeResponse(payload=_x_success_payload("9182736450", text_prefix="primary"))
+        return FakeResponse(payload=_x_success_payload("9081726354", text_prefix="fallback"))
+
+    monkeypatch.setattr(p2_x_intel.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(p2_x_intel.requests, "post", post)
+    monkeypatch.setattr(p2_x_intel, "parse_p2_structured_items", lambda _content: [])
+    monkeypatch.setattr(p2_x_intel, "_save_p2_artifacts", lambda *_args: ("p2.md", "p2.json"))
+
+    content, stats = p2_x_intel.collect_from_x(
+        max_retries=1,
+        max_total_seconds=300,
+        fallback_total_seconds=120,
+    )
+
+    assert content
+    assert [model for _url, model, _timeout in calls] == ["grok-test", "grok-4.5"]
+    assert stats["successful_chunks"] == stats["total_chunks"] == 2
+    assert stats["fallback_chunks"] == 1
+
+
+def test_collect_from_x_latches_fallback_only_after_primary_failure(monkeypatch):
+    _configure_p2(monkeypatch, keywords=["kw1", "kw2", "kw3", "kw4", "kw5", "kw6"])
+    monkeypatch.setattr(p2_x_intel, "GROK_FALLBACK_API_KEY", "fallback-key")
+    monkeypatch.setattr(p2_x_intel, "GROK_FALLBACK_MODEL", "grok-4.5")
+    models = []
+    fallback_ids = iter(["9182736450", "9081726354"])
+
+    def post(_url, **kwargs):
+        model = kwargs["json"]["model"]
+        models.append(model)
+        if model == "grok-test":
+            return FakeResponse(status_code=503)
+        return FakeResponse(payload=_x_success_payload(next(fallback_ids), text_prefix="fallback"))
+
+    monkeypatch.setattr(p2_x_intel.requests, "post", post)
+    monkeypatch.setattr(p2_x_intel, "parse_p2_structured_items", lambda _content: [])
+    monkeypatch.setattr(p2_x_intel, "_save_p2_artifacts", lambda *_args: ("p2.md", "p2.json"))
+
+    content, stats = p2_x_intel.collect_from_x(
+        max_retries=1,
+        max_total_seconds=300,
+        fallback_total_seconds=120,
+    )
+
+    assert content
+    assert models == ["grok-test", "grok-4.5", "grok-4.5"]
+    assert stats["successful_chunks"] == stats["total_chunks"] == 2
+    assert stats["fallback_chunks"] == 2
+
+
+def test_collect_from_x_keeps_earlier_chunks_when_a_later_chunk_fails(monkeypatch):
+    _configure_p2(monkeypatch, keywords=["kw1", "kw2", "kw3", "kw4", "kw5", "kw6"])
+    monkeypatch.setattr(p2_x_intel, "GROK_FALLBACK_API_KEY", "")
+    responses = [
+        FakeResponse(payload=_x_success_payload("9182736450", text_prefix="kept")),
+        RuntimeError("later chunk failed"),
+    ]
+
+    def post(*_args, **_kwargs):
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(p2_x_intel.requests, "post", post)
+    monkeypatch.setattr(p2_x_intel, "parse_p2_structured_items", lambda _content: [])
+    monkeypatch.setattr(p2_x_intel, "_save_p2_artifacts", lambda *_args: ("p2.md", "p2.json"))
+
+    content, stats = p2_x_intel.collect_from_x(max_retries=1, max_total_seconds=1000)
+
+    assert "kept" in content
+    assert stats["successful_chunks"] == 1
+    assert stats["status"].startswith("partial_")
 
 
 def test_collect_from_x_success_without_structured_items(monkeypatch):

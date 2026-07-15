@@ -2,7 +2,7 @@
 
 > 按 A 股交易日运行的多阶段情报流水线：采集北美 AI 产业链信息，审计证据，映射 A 股受益方向，生成战报并邮件分发。
 
-Last verified: 2026-07-10
+Last verified: 2026-07-15
 
 ---
 
@@ -89,6 +89,7 @@ notepad .\每日战报\.env
 | `ANTIGRAVITY_BASE_URL` | OpenAI 兼容模型服务地址；回环地址可用 HTTP，远端地址必须用 HTTPS；默认 `http://127.0.0.1:8045` |
 | `ANTIGRAVITY_API_KEY` | Pro/GPT-5.6 Sol/Agent 兼容模型鉴权 |
 | `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 覆盖 P6/P9 GPT-5.6 Sol Max 模型服务；未配置时沿用 Antigravity 配置 |
+| `OPUS_FALLBACK_BASE_URL` / `OPUS_FALLBACK_API_KEY` | P6/P9 的独立 Claude 备胎接口；未单独配置时复用审计备用接口，仍为空时退回同一模型网关切模 |
 | `AUDIT_FALLBACK_BASE_URL` / `AUDIT_FALLBACK_API_KEY` | P5/P7.5/P7a 审计备用 Anthropic 接口；主接口失败后使用相同 `AUDIT_MODEL` |
 | `GEMINI_SEARCH_API_KEYS` | Gemini 搜索 key 池，逗号分隔 |
 | `GEMINI_SEARCH_MODEL` | Gemini 搜索模型，默认 `gemini-2.5-flash` |
@@ -153,11 +154,13 @@ uv run python .\每日战报\pipeline_cli.py restart
 
 | 命令 | 用途 |
 | --- | --- |
-| `run` | 正常从头运行 |
-| `resume` | 基于 checkpoint 尝试恢复 |
-| `force-run` | 传入 `--force-run`，跳过 orchestrator 内部的交易日跳过逻辑 |
-| `restart` | 传入 `--force-restart`，清理恢复状态后重跑 |
+| `run` | 正常入口；当天已有 checkpoint 时自动断点续跑 |
+| `resume` | 显式手工恢复；恢复逻辑与 `run` 相同 |
+| `force-run` | 跳过交易日门禁，但仍使用当天 checkpoint 断点续跑 |
+| `restart` | 跳过交易日门禁，归档旧 manifest，建立全新的 manifest 后从 P1 重新运行 |
 | `status` | 查看当日输出、manifest、run lock 和阶段状态 |
+
+`restart` 不删除旧产物。旧 manifest 会归档到当天 `meta/`，新 manifest 使用严格晚于旧批次的 `run_timestamp`；后续恢复只读取同一时间戳批次，避免同秒重启覆盖产物或把当天多次运行的产物混在一起。
 
 ### 清理
 
@@ -254,22 +257,77 @@ uv sync --locked --no-dev --python C:\Python314\python.exe
 
 ---
 
-## 流水线阶段
+## 运行流程与门禁
 
-控制层当前阶段：
+正常依赖关系：
+
+```text
+P1 ──→ P5 ──┐
+P2 ─────────┤
+P3 ─────────┼──→ P6 ──→ P7 / P7a / P7.5 ──→ P8 ──→ P9
+P4 ─────────┘    硬门禁          软门禁          软门禁     硬门禁
+                                                              │
+                                               保存 MD ──→ 邮件 ──→ ROI
+```
+
+- P1、P2、P3 并行采集；P1 先经过 P5 审计，再与 P2、P3、P4 一起进入 P6 映射。
+- P1/P3 会区分正常无结果、缺 Key、部分源失败和全部失败；部分成功不会再被伪装成干净完成。
+- P5 主备均失败但 P1 原始证据非空时，使用明确标记的未审计 P1 降级输入，避免静默中断证据链。
+- P6 是硬门禁：没有非空 P6 产物时，P9 不会启动，状态保留为可恢复的 `p6_resume`。
+- P7/P7a/P7.5 和 P8 是软门禁：异常会记录明确的失败或降级状态，流水线仍可继续到 P9。
+- P9 是硬门禁：空报告不落盘；写 Markdown 前先登记 `report_save_in_progress`，原子保存后登记 `report_saved_pending_delivery`，再进入邮件分发和 ROI。
+- 邮件已配置但发送失败时，ROI 暂不运行；下次只恢复邮件，成功后继续 ROI。未配置邮件时，本地报告以 `completed_no_email` 完成并继续 ROI。
+
+控制阶段如下：
 
 | 控制阶段 | 主要内容 | 默认超时 |
 | --- | --- | --- |
-| `collect_intel` | P1 RSS/Web、P2 X/Grok、P3 机动搜索与 checkpoint 恢复 | 900s |
-| `audit_evidence` | P5 证据审计与 checkpoint 复用 | 480s |
-| `market_mapping` | P4 海外龙头行情快照、P6 A 股映射 | 900s |
-| `research` | P7 深度研究、P7a 审计、P7.5 补充搜索 | 900s |
-| `technical` | P8 技术面/股价/弹性层 | 300s |
-| `report` | P9 战报生成与邮件发送 | 900s |
+| `collect_intel` | P1 RSS/Web、P2 X/Grok、P3 机动搜索；`intel_resume` 时只运行失败分支 | 900s |
+| `recover_p2` | 只补跑缺失或失败的 P2，不重复运行 P1/P3 | 480s |
+| `audit_evidence` | P5 证据审计与 checkpoint 复用 | 900s |
+| `market_mapping` | P4 海外龙头行情快照、P6 A 股映射 | 3900s |
+| `research` | P7 深度研究、P7a 审计、P7.5 补充搜索；失败可继续 | 900s |
+| `technical` | P8 技术面/股价/弹性层；失败可继续 | 300s |
+| `report` | P9 战报生成、保存与首次邮件发送 | 3900s |
 | `delivery_resume` | 复用已保存战报，仅重试邮件发送 | 600s |
-| `roi` | Layer ROI 贡献评估 | 180s |
+| `roi` | Layer ROI 贡献评估或独立恢复 | 180s |
 
-阶段由 `pipeline_runtime.py` 在子进程中执行。超时会写入 `failed_timeout`，异常会写入 `failed_exception`，成功写入 `completed`。
+阶段由 `pipeline_runtime.py` 在可终止子进程中执行。控制阶段超时写入 `failed_timeout`，异常写入 `failed_exception`；软门禁失败后继续，硬门禁失败后停止。
+
+### 主模型、备胎与时间预算
+
+| 环节 | 主模型预算 | 备胎预算 | 切换规则 |
+| --- | --- | --- | --- |
+| P2 | `GROK_MODEL` 300s，单请求最多 75s | `grok-4.5` 120s | 401/403 立即切备；首次切备后锁定为 fallback-only，后续分批不再回主模型侵占备胎预算 |
+| P5 | 主审计接口 `AUDIT_MODEL` 240s | 备用审计接口 `AUDIT_MODEL` 180s | 认证、风控、权限、超时或服务端错误停止主接口重试并切备 |
+| P6 | `gpt-5.6-sol` 900s | `claude-opus-4-6-thinking` 900s | 认证、风控、权限、超时、服务端错误或 HTTP 200 空正文立即切备；JSON/完整性失败后的第二轮直接使用备胎 |
+| P9 | `gpt-5.6-sol` 900s | `claude-opus-4-6-thinking` 900s | 与 P6 相同，主备各自拥有完整 900s；无效报告修复轮不再重复消耗主模型 |
+
+P2 和 P5 只有在对应备用接口及密钥已配置时才能切备。P2 已成功的分批会保留；后续分批失败时记录降级，不丢弃前面的结果。P5 的 900s 控制阶段可容纳两轮 JSON 生成/修复所需的主备调用。P6/P9 优先使用独立 `OPUS_FALLBACK_*` 接口；若未单独配置，则复用 `AUDIT_FALLBACK_*`，最后才降级为同网关切换模型。首轮最坏主备共 1800s，语义修复轮只使用 900s 备胎，3900s 控制阶段仍为落盘、P4 和进程收尾保留余量。429 限流按剩余预算做有限退避，不会无限重试挤占备胎时间。
+
+### 当天断点续跑
+
+`run`、`resume` 和 `force-run` 都先取得全局运行锁，再检测当天 checkpoint。manifest 存在时只接受与根 `run_timestamp` 一致的阶段和产物；manifest 不可用时，只选择当天最新的一个时间戳批次，不跨批次拼接。
+
+恢复优先级从高到低：
+
+1. `p2_resume`：只有 P2 缺失或失败且无非空产物时，即使旧流程已误到达报告/邮件/ROI，也先只补跑 P2；复用已有 P1/P3/P5，然后重新进入 P6。
+2. `p9_done`：P2 完整，且报告、分发、ROI 和根状态均完整，直接结束。
+3. `delivery_resume`：已有报告但邮件未完成，只恢复原定投递策略，随后继续 ROI。
+4. `roi_resume`：报告分发已完成但 ROI 缺失，只补 ROI。
+5. `intel_resume`：P1/P3 单独失败，或 P1/P2/P3 多支同时失败时，只补跑失败且无产物的分支；P1 被重采后会重做 P5，成功分支不重复运行。
+6. `p6_resume`：P6 已尝试但失败或无非空产物，且 P2/P3/P4/P5 任一上游产物可用时，只从 P6 继续，不再硬依赖 P5 文件。
+7. `p9_resume`：P8 已存在，从 P9 继续。
+8. `p8_resume`：P7/P7a 已存在，从 P8 继续。
+9. 已有 P6、P5 或 P1：分别从相应 checkpoint 继续；否则从 P1 开始。
+
+P6 更新后，旧的 P7/P7a/P7.5、P8 和 P9 会按 P6 输入哈希或产物时间判定是否失效，失效产物不会被错误复用。
+
+### P9 保存、邮件和 ROI 恢复
+
+P9 写 Markdown 前先记录 `report_save_in_progress`，原子保存后立即写入 `report_saved_pending_delivery`。两次状态之间中断时，只要同批次非空报告已经存在，下次就进入 `delivery_resume`，不会重新调用 P9 模型。恢复会保留原任务的“必须发邮件/仅本地保存”策略，不会因当前环境变量变化而误发或静默降级。邮件成功后若进程在 ROI 前中断，则进入 `roi_resume`，只做本地 ROI 计算。SMTP 与本地 manifest 无法组成同一事务，因此远端已接收但本地尚未记账的极端崩溃窗仍按 at-least-once 语义处理，可能重复投递但不会静默漏发。
+
+恢复型 preflight 也按需要缩小范围：`delivery_resume` 只检查本地目录、运行锁和本次确实需要的邮件配置；原本就是本地报告的任务不会因缺少邮件配置卡住。`roi_resume` / `p9_done` 只检查本地目录与运行锁，不会被无关的模型或搜索接口阻塞。
 
 ---
 
@@ -304,6 +362,7 @@ uv sync --locked --no-dev --python C:\Python314\python.exe
 - 输出根目录、当日目录和日志目录
 - `prompts/` 目录和关键 prompt 文件
 - `ANTIGRAVITY_API_KEY`
+- P6/P9 主模型端点连通性与独立 `OPUS_FALLBACK_*` 备胎配置
 - `GROK_API_KEY`
 - Gemini 搜索 key 池数量
 - 关键依赖可导入状态

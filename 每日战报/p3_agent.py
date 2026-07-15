@@ -201,11 +201,15 @@ JINNANG_1_RECOVERY_SOURCE_KEYS = {
 def _call_gemini_search(prompt: str, max_retries: int = 3) -> dict:
     result = raw_gemini_search(prompt, max_retries=max_retries, return_dict=True)
     if isinstance(result, dict):
-        return {
+        normalized = {
             "text": result.get("text", "") or "",
             "grounding_sources": result.get("grounding_sources", []) or [],
         }
-    return {"text": result or "", "grounding_sources": []}
+    else:
+        normalized = {"text": result or "", "grounding_sources": []}
+    if not str(normalized["text"]).strip():
+        raise RuntimeError("Gemini search returned an empty response after all routes failed")
+    return normalized
 
 
 def _normalize_text_key(value: str) -> str:
@@ -541,6 +545,8 @@ def collect_p3_parallel_only(backtrack: str = "24h") -> tuple[str, dict]:
         "duration_seconds": 0,
         "content_length": 0,
         "structured_items": 0,
+        "query_failures": 0,
+        "failure_errors": [],
     }
 
     if not SEARCH_API_KEY_POOL:
@@ -562,12 +568,16 @@ def collect_p3_parallel_only(backtrack: str = "24h") -> tuple[str, dict]:
         except Exception as exc:
             logging.warning("[P3] jinnang_2 failed: %s", exc)
             jinnang_2_results = []
+            stats["query_failures"] += 1
+            stats["failure_errors"].append(f"jinnang_2: {exc}")
 
         try:
             jinnang_3_results = future_3.result()
         except Exception as exc:
             logging.warning("[P3] jinnang_3 failed: %s", exc)
             jinnang_3_results = []
+            stats["query_failures"] += 1
+            stats["failure_errors"].append(f"jinnang_3: {exc}")
 
     stats["jinnang_2_count"] = len(jinnang_2_results)
     stats["jinnang_3_count"] = len(jinnang_3_results)
@@ -581,12 +591,17 @@ def collect_p3_parallel_only(backtrack: str = "24h") -> tuple[str, dict]:
     }
     total = stats["jinnang_2_count"] + stats["jinnang_3_count"]
     if total == 0:
-        stats["status"] = "empty"
+        if stats["query_failures"] >= 2:
+            stats["status"] = "failed_all_queries"
+        elif stats["query_failures"]:
+            stats["status"] = "failed_query_errors"
+        else:
+            stats["status"] = "empty"
         stats["raw_results"] = raw_results
         return "", stats
 
     formatted, structured_items = render_p3_output(raw_results)
-    stats["status"] = "success"
+    stats["status"] = "partial_query_errors" if stats["query_failures"] else "success"
     stats["content_length"] = len(formatted)
     stats["structured_items"] = len(structured_items)
     stats["raw_results"] = raw_results

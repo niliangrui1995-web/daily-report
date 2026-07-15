@@ -759,9 +759,9 @@ def raw_gemini_search(prompt: str, max_retries: int = 3, *, return_dict: bool = 
                     if return_dict:
                         return {"text": text, "grounding_sources": sources}
                     return text
-                except requests.exceptions.ConnectTimeout:
+                except requests.exceptions.Timeout:
                     channel_breaker.record_failure(channel_name)
-                    logging.warning(f"[raw_search] connect timeout on {channel_name}")
+                    logging.warning(f"[raw_search] request timeout on {channel_name}; switching to fallback")
                     stop_channel = True
                     break
                 except Exception as exc:
@@ -867,9 +867,9 @@ def gemini_search(
                         result["structured"] = structured_payload
                         result["raw_text"] = text
                     return enrich_search_urls(result)
-                except requests.exceptions.ConnectTimeout:
+                except requests.exceptions.Timeout:
                     channel_breaker.record_failure(channel_name)
-                    logging.warning(f"[{category}] connect timeout on {channel_name}")
+                    logging.warning(f"[{category}] request timeout on {channel_name}; switching to fallback")
                     stop_channel = True
                     break
                 except Exception as exc:

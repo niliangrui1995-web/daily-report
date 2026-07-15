@@ -32,8 +32,11 @@ def _successful_preflight(pipeline_cli, monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(pipeline_cli, "ANTIGRAVITY_API_KEY", "secret")
     monkeypatch.setattr(pipeline_cli, "PRO_OPUS_BASE_URL", "http://127.0.0.1:8317/v1")
     monkeypatch.setattr(pipeline_cli, "PRO_OPUS_API_KEY", "secret")
+    monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_BASE_URL", "https://backup.example.test")
+    monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_API_KEY", "backup-secret")
     monkeypatch.setattr(pipeline_cli, "EMAIL_ADDRESS", "sender@example.com")
     monkeypatch.setattr(pipeline_cli, "EMAIL_PASSWORD", "smtp-secret")
+    monkeypatch.setattr(pipeline_cli, "RECEIVER_EMAIL", "receiver@example.com")
     monkeypatch.setattr(
         pipeline_cli,
         "_probe_local_model_endpoint",
@@ -661,3 +664,235 @@ def test_preflight_fails_when_local_model_endpoint_is_unreachable(monkeypatch, t
         "detail": "connection refused",
         "severity": "error",
     }
+
+
+def test_preflight_requires_independent_opus_fallback(monkeypatch, tmp_path):
+    import pipeline_cli
+
+    _successful_preflight(pipeline_cli, monkeypatch, tmp_path)
+    monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_BASE_URL", pipeline_cli.PRO_OPUS_BASE_URL)
+    monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_API_KEY", "backup-secret")
+    monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: None)
+
+    result = pipeline_cli._collect_preflight(strict=True)
+    fallback_check = next(item for item in result["checks"] if item["name"] == "opus_fallback")
+
+    assert result["summary"]["exit_code"] == pipeline_cli.EXIT_CHECK_FAILED
+    assert fallback_check["ok"] is False
+
+
+@pytest.mark.parametrize(
+    ("resume_stage", "expected_checks"),
+    [
+        (
+            "delivery_resume",
+            {"output_root", "today_output", "logs_dir", "email_credentials", "run_lock"},
+        ),
+        ("roi_resume", {"output_root", "today_output", "logs_dir", "run_lock"}),
+        ("p9_done", {"output_root", "today_output", "logs_dir", "run_lock"}),
+    ],
+)
+def test_recovery_preflight_only_checks_capabilities_needed_by_resume_stage(
+    monkeypatch,
+    tmp_path,
+    resume_stage,
+    expected_checks,
+):
+    import pipeline_cli
+
+    today_dir = tmp_path / "today"
+    logs_dir = tmp_path / "logs"
+    output_root = tmp_path / "output"
+    today_dir.mkdir()
+    logs_dir.mkdir()
+    output_root.mkdir()
+
+    monkeypatch.setattr(pipeline_cli, "OUTPUT_DIR", str(output_root))
+    monkeypatch.setattr(pipeline_cli, "settings_today_output_dir", lambda: str(today_dir))
+    monkeypatch.setattr(pipeline_cli, "get_today_logs_dir", lambda: str(logs_dir))
+    monkeypatch.setattr(pipeline_cli, "EMAIL_ADDRESS", "sender@example.com")
+    monkeypatch.setattr(pipeline_cli, "EMAIL_PASSWORD", "smtp-secret")
+    monkeypatch.setattr(pipeline_cli, "RECEIVER_EMAIL", "receiver@example.com")
+    monkeypatch.setattr(
+        pipeline_cli,
+        "_probe_local_model_endpoint",
+        lambda *_args: pytest.fail("recovery-only preflight must not probe the model endpoint"),
+    )
+    monkeypatch.setattr(
+        pipeline_cli.importlib,
+        "import_module",
+        lambda *_args: pytest.fail("recovery-only preflight must not import unrelated providers"),
+    )
+    monkeypatch.setattr(
+        pipeline_cli,
+        "get_calendar_status",
+        lambda: pytest.fail("recovery-only preflight must not probe the trading calendar"),
+    )
+    monkeypatch.setattr(
+        pipeline_cli,
+        "require_prompt",
+        lambda *_args: pytest.fail("recovery-only preflight must not load generation prompts"),
+    )
+    owned_lock = {
+        "pid": os.getpid(),
+        "command": "resume",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+        "owner_token": "owned-token",
+    }
+    monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: dict(owned_lock))
+    monkeypatch.setattr(pipeline_cli, "get_run_lock_state", lambda _info: "valid")
+
+    result = pipeline_cli._collect_preflight(
+        strict=True,
+        resume_stage=resume_stage,
+        expected_lock_owner_token="owned-token",
+    )
+
+    assert result["summary"]["exit_code"] == pipeline_cli.EXIT_OK
+    assert {item["name"] for item in result["checks"]} == expected_checks
+    run_lock = next(item for item in result["checks"] if item["name"] == "run_lock")
+    assert run_lock["ok"] is True
+    assert "owned" in run_lock["detail"]
+
+
+def test_delivery_preflight_allows_local_only_pending_finalize_without_email(
+    monkeypatch,
+    tmp_path,
+):
+    import pipeline_cli
+
+    _successful_preflight(pipeline_cli, monkeypatch, tmp_path)
+    monkeypatch.setattr(pipeline_cli, "EMAIL_ADDRESS", "")
+    monkeypatch.setattr(pipeline_cli, "EMAIL_PASSWORD", "")
+    monkeypatch.setattr(pipeline_cli, "RECEIVER_EMAIL", "")
+    monkeypatch.setattr(
+        pipeline_cli,
+        "load_run_manifest",
+        lambda: {
+            "stages": {
+                "p9": {
+                    "status": "report_saved_pending_delivery",
+                    "metrics": {"email_configured": False},
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: None)
+
+    result = pipeline_cli._collect_preflight(strict=True, resume_stage="delivery_resume")
+
+    email_check = next(item for item in result["checks"] if item["name"] == "email_credentials")
+    assert result["summary"]["exit_code"] == pipeline_cli.EXIT_OK
+    assert email_check["ok"] is True
+    assert "not required" in email_check["detail"]
+
+
+def test_delivery_preflight_requires_receiver_for_original_email_delivery(
+    monkeypatch,
+    tmp_path,
+):
+    import pipeline_cli
+
+    _successful_preflight(pipeline_cli, monkeypatch, tmp_path)
+    monkeypatch.setattr(pipeline_cli, "RECEIVER_EMAIL", "")
+    monkeypatch.setattr(
+        pipeline_cli,
+        "load_run_manifest",
+        lambda: {"stages": {"p9": {"metrics": {"email_configured": True}}}},
+    )
+    monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: None)
+
+    result = pipeline_cli._collect_preflight(strict=True, resume_stage="delivery_resume")
+
+    assert result["summary"]["exit_code"] == pipeline_cli.EXIT_CHECK_FAILED
+
+
+def test_normal_preflight_keeps_full_strict_dependency_checks(monkeypatch, tmp_path):
+    import pipeline_cli
+
+    _successful_preflight(pipeline_cli, monkeypatch, tmp_path)
+    monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: None)
+
+    result = pipeline_cli._collect_preflight(strict=True, resume_stage="p6_resume")
+    check_names = {item["name"] for item in result["checks"]}
+
+    assert result["summary"]["exit_code"] == pipeline_cli.EXIT_OK
+    assert {
+        "search_keys",
+        "model_endpoint",
+        "grok_key",
+        "prompt:p9_report.txt",
+        "calendar_probe",
+        "import:openai",
+    }.issubset(check_names)
+
+
+def test_run_locks_before_resolving_resume_profile_and_running_preflight(monkeypatch):
+    from contextlib import contextmanager
+
+    import pipeline_cli
+
+    calls = []
+    successful_result = {
+        "checks": [],
+        "summary": {
+            "total": 0,
+            "failed": 0,
+            "warnings": 0,
+            "exit_code": pipeline_cli.EXIT_OK,
+        },
+    }
+
+    @contextmanager
+    def fake_lock(**kwargs):
+        calls.append(("lock", kwargs))
+        yield {"owner_token": "owned-token"}
+
+    def fake_preflight(strict, **kwargs):
+        calls.append(("preflight", strict, kwargs))
+        return successful_result
+
+    monkeypatch.setattr(pipeline_cli, "acquire_run_lock", fake_lock)
+    monkeypatch.setattr(
+        pipeline_cli,
+        "_resolve_preflight_resume_stage",
+        lambda flags: calls.append(("resume_plan", list(flags))) or "delivery_resume",
+    )
+    monkeypatch.setattr(pipeline_cli, "_collect_preflight", fake_preflight)
+    monkeypatch.setattr(pipeline_cli, "set_preflight_summary", lambda summary: calls.append(("summary", summary)))
+    monkeypatch.setattr(pipeline_cli, "configure_run_logging", lambda: calls.append(("logging",)))
+    monkeypatch.setattr(pipeline_cli, "update_manifest_context", lambda **kwargs: calls.append(("context", kwargs)))
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator",
+        SimpleNamespace(orchestrator_main=lambda flags: calls.append(("orchestrator", list(flags)))),
+    )
+
+    result = pipeline_cli._run_orchestrator([], command_name="resume")
+
+    call_names = [item[0] for item in calls]
+    assert result == pipeline_cli.EXIT_OK
+    assert call_names.index("lock") < call_names.index("resume_plan") < call_names.index("preflight")
+    preflight_call = next(item for item in calls if item[0] == "preflight")
+    assert preflight_call == (
+        "preflight",
+        True,
+        {
+            "resume_stage": "delivery_resume",
+            "expected_lock_owner_token": "owned-token",
+        },
+    )
+    assert ("orchestrator", []) in calls
+
+
+def test_force_restart_uses_full_preflight_without_reading_checkpoint(monkeypatch):
+    import pipeline_cli
+
+    monkeypatch.setitem(
+        sys.modules,
+        "checkpoint",
+        SimpleNamespace(detect_checkpoint=lambda: pytest.fail("force restart must ignore checkpoint")),
+    )
+
+    assert pipeline_cli._resolve_preflight_resume_stage(["--force-restart"]) == "none"

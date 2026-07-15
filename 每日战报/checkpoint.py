@@ -36,8 +36,16 @@ ROOT_SUCCESS_STATUSES = frozenset(
         "completed_with_stage_degradation",
     }
 )
-DELIVERY_RECOVERABLE_STATUSES = frozenset({"completed_email_failed", "failed_delivery"})
+DELIVERY_RECOVERABLE_STATUSES = frozenset(
+    {
+        "completed_email_failed",
+        "failed_delivery",
+        "report_save_in_progress",
+        "report_saved_pending_delivery",
+    }
+)
 P6_HASHED_RESEARCH_STAGES = ("p7", "p7a", "p75")
+INTEL_STAGES = ("p1", "p2", "p3")
 
 
 def _pick_existing_file(path: str, *, require_nonempty: bool = False) -> str:
@@ -85,12 +93,9 @@ def is_older_than_any(files: dict[str, str], file_key: str, upstream_keys: tuple
 
 
 def _manifest_p6_input_hashes(manifest: dict) -> dict[str, str]:
-    stages = manifest.get("stages", {})
-    if not isinstance(stages, dict):
-        return {}
     hashes = {}
     for stage_name in P6_HASHED_RESEARCH_STAGES:
-        payload = stages.get(stage_name, {})
+        payload = _current_stage_payload(manifest, stage_name)
         metrics = payload.get("metrics", {}) if isinstance(payload, dict) else {}
         value = str(metrics.get("p6_input_sha256") or "").strip().lower()
         if value:
@@ -153,8 +158,23 @@ def _drop_stale_downstream_files(
         files.pop("war_report", None)
 
 
+def _current_stage_payload(manifest: dict, stage_name: str) -> dict:
+    stages = manifest.get("stages", {})
+    if not isinstance(stages, dict):
+        return {}
+    payload = stages.get(stage_name, {})
+    if not isinstance(payload, dict):
+        return {}
+
+    manifest_run_ts = str(manifest.get("run_timestamp") or "").strip()
+    stage_run_ts = str(payload.get("run_timestamp") or "").strip()
+    if manifest_run_ts and stage_run_ts and manifest_run_ts != stage_run_ts:
+        return {}
+    return payload
+
+
 def _stage_status(manifest: dict, stage_name: str) -> str:
-    return str(manifest.get("stages", {}).get(stage_name, {}).get("status", ""))
+    return str(_current_stage_payload(manifest, stage_name).get("status", ""))
 
 
 def _has_terminal_success(manifest: dict, files: dict[str, str]) -> bool:
@@ -170,7 +190,7 @@ def _has_terminal_success(manifest: dict, files: dict[str, str]) -> bool:
 def _needs_delivery_resume(manifest: dict, files: dict[str, str]) -> bool:
     if not files.get("war_report"):
         return False
-    p9 = manifest.get("stages", {}).get("p9", {})
+    p9 = _current_stage_payload(manifest, "p9")
     status = str(p9.get("status", ""))
     metrics = p9.get("metrics", {})
     return status in DELIVERY_RECOVERABLE_STATUSES or (
@@ -186,8 +206,66 @@ def _needs_roi_resume(manifest: dict, files: dict[str, str]) -> bool:
     )
 
 
+def _missing_intel_resume_stages(manifest: dict, files: dict[str, str]) -> list[str]:
+    current_statuses = {stage: _stage_status(manifest, stage).strip().lower() for stage in INTEL_STAGES}
+    has_resume_anchor = bool(
+        any(files.get(key) for key in (*INTEL_STAGES, "p5"))
+        or any(current_statuses.values())
+        or _stage_status(manifest, "collect_intel")
+    )
+    if not has_resume_anchor:
+        return []
+
+    missing: list[str] = []
+    for stage_name in INTEL_STAGES:
+        if _pick_existing_file(files.get(stage_name, ""), require_nonempty=True):
+            continue
+
+        status = current_statuses[stage_name]
+        if stage_name == "p2":
+            retryable = (
+                not status
+                or status in {"pending", "running", "retrying"}
+                or status.startswith("failed")
+                or status.startswith("auth_failed_")
+            )
+        else:
+            retryable = status not in {"skipped_no_results", "completed_no_results"}
+
+        if retryable:
+            missing.append(stage_name)
+    return missing
+
+
+def _needs_p6_resume(manifest: dict, files: dict[str, str]) -> bool:
+    has_recoverable_upstream = any(
+        _pick_existing_file(files.get(stage_name, ""), require_nonempty=True)
+        for stage_name in ("p2", "p3", "p4", "p5")
+    )
+    if not has_recoverable_upstream:
+        return False
+
+    p6_payload = _current_stage_payload(manifest, "p6")
+    p6_status = str(p6_payload.get("status", "")).strip().lower()
+    market_mapping_status = _stage_status(manifest, "market_mapping").strip().lower()
+    p6_was_attempted = bool(p6_status) or market_mapping_status in {
+        "running",
+        "retrying",
+        "completed",
+    } or market_mapping_status.startswith("failed")
+    if not p6_was_attempted:
+        return False
+
+    p6_files = p6_payload.get("files", {}) if isinstance(p6_payload, dict) else {}
+    current_markdown = _pick_existing_file(
+        str(p6_files.get("md", "")),
+        require_nonempty=True,
+    )
+    return not (p6_status in STAGE_SUCCESS_STATUSES and current_markdown)
+
+
 def _load_files_from_manifest(ckpt: dict, manifest: dict) -> None:
-    stages = manifest.get("stages", {})
+    manifest_run_ts = str(manifest.get("run_timestamp") or "").strip()
 
     def _store(
         stage_name: str,
@@ -195,11 +273,16 @@ def _load_files_from_manifest(ckpt: dict, manifest: dict) -> None:
         *preferred_keys: str,
         require_nonempty: bool = False,
     ) -> None:
-        payload = stages.get(stage_name, {})
+        payload = _current_stage_payload(manifest, stage_name)
         files = payload.get("files", {})
         for preferred in preferred_keys:
             existing = _pick_existing_file(files.get(preferred, ""), require_nonempty=require_nonempty)
-            if existing:
+            artifact_run_ts = extract_timestamp_from_name(existing)
+            if existing and not (
+                manifest_run_ts
+                and artifact_run_ts
+                and artifact_run_ts != manifest_run_ts
+            ):
                 ckpt["files"][file_key] = existing
                 return
 
@@ -217,32 +300,85 @@ def _load_files_from_manifest(ckpt: dict, manifest: dict) -> None:
     _store("p9", "war_report", "md", require_nonempty=True)
 
 
-def _merge_files_from_fallback(ckpt: dict, day_dir: Path) -> None:
+def _merge_files_from_fallback(
+    ckpt: dict,
+    day_dir: Path,
+    *,
+    run_timestamp: str = "",
+) -> None:
+    candidates_by_key: dict[str, list[Path]] = {}
+    timestamped_candidates: list[str] = []
+
     for file_key, patterns in FALLBACK_PATTERNS.items():
+        candidates: list[Path] = []
+        seen_paths: set[str] = set()
+        for pattern in patterns:
+            for match in sorted(day_dir.rglob(pattern), reverse=True):
+                normalized = str(match)
+                if normalized in seen_paths:
+                    continue
+                seen_paths.add(normalized)
+                candidates.append(match)
+                timestamp = extract_timestamp_from_name(normalized)
+                if timestamp:
+                    timestamped_candidates.append(timestamp)
+        candidates_by_key[file_key] = candidates
+
+    target_run_ts = str(run_timestamp or "").strip()
+    if not target_run_ts and timestamped_candidates:
+        target_run_ts = max(timestamped_candidates)
+        ckpt["run_timestamp"] = target_run_ts
+
+    for file_key, candidates in candidates_by_key.items():
         if file_key in ckpt["files"]:
             continue
         matched_path = ""
-        for pattern in patterns:
-            matches = sorted(day_dir.rglob(pattern), reverse=True)
-            for match in matches:
-                candidate = _pick_existing_file(str(match), require_nonempty=file_key == "war_report")
-                if candidate:
-                    matched_path = candidate
-                    break
-            if matched_path:
+        for match in candidates:
+            candidate_run_ts = extract_timestamp_from_name(str(match))
+            if target_run_ts and candidate_run_ts != target_run_ts:
+                continue
+            if not target_run_ts and candidate_run_ts:
+                continue
+            candidate = _pick_existing_file(str(match), require_nonempty=file_key == "war_report")
+            if candidate:
+                matched_path = candidate
                 break
         if matched_path:
             ckpt["files"][file_key] = matched_path
 
 
+def _manifest_has_recovery_state(manifest: dict) -> bool:
+    run_timestamp = str(manifest.get("run_timestamp") or "").strip()
+    if (
+        manifest.get("corrupt_manifest")
+        or not run_timestamp
+        or extract_timestamp_from_name(run_timestamp) != run_timestamp
+    ):
+        return False
+
+    stages = manifest.get("stages", {})
+    return bool(
+        (isinstance(stages, dict) and stages)
+        or str(manifest.get("status") or "").strip()
+        or str(manifest.get("updated_at") or "").strip()
+    )
+
+
 def _derive_stage(files: dict[str, str], manifest: dict) -> str:
     _drop_stale_downstream_files(files, _manifest_p6_input_hashes(manifest))
+    intel_resume_stages = _missing_intel_resume_stages(manifest, files)
+    if intel_resume_stages == ["p2"]:
+        return "p2_resume"
     if _has_terminal_success(manifest, files):
         return "p9_done"
     if _needs_delivery_resume(manifest, files):
         return "delivery_resume"
     if _needs_roi_resume(manifest, files):
         return "roi_resume"
+    if intel_resume_stages:
+        return "intel_resume"
+    if _needs_p6_resume(manifest, files):
+        return "p6_resume"
     if files.get("p8"):
         return "p9_resume"
     if files.get("p7") or files.get("p7a"):
@@ -263,22 +399,37 @@ def detect_checkpoint() -> dict:
         "files": {},
         "p6_input_sha256": {},
         "p6_metrics": {},
+        "p9_metrics": {},
+        "intel_resume_stages": [],
         "run_timestamp": "",
     }
 
     manifest = load_run_manifest()
-    if manifest:
+    manifest_is_authoritative = _manifest_has_recovery_state(manifest)
+    recovery_manifest = manifest if manifest_is_authoritative else {}
+    if manifest_is_authoritative:
         ckpt["run_timestamp"] = manifest.get("run_timestamp", "")
         ckpt["p6_input_sha256"] = _manifest_p6_input_hashes(manifest)
-        p6_metrics = manifest.get("stages", {}).get("p6", {}).get("metrics", {})
+        p6_metrics = _current_stage_payload(manifest, "p6").get("metrics", {})
         ckpt["p6_metrics"] = dict(p6_metrics) if isinstance(p6_metrics, dict) else {}
+        p9_metrics = _current_stage_payload(manifest, "p9").get("metrics", {})
+        ckpt["p9_metrics"] = dict(p9_metrics) if isinstance(p9_metrics, dict) else {}
         _load_files_from_manifest(ckpt, manifest)
+        ckpt["intel_resume_stages"] = _missing_intel_resume_stages(manifest, ckpt["files"])
         ckpt["stage"] = _derive_stage(ckpt["files"], manifest)
         if ckpt["stage"] == "p9_done":
             return ckpt
 
-    _merge_files_from_fallback(ckpt, day_dir)
-    ckpt["stage"] = _derive_stage(ckpt["files"], manifest)
+    _merge_files_from_fallback(
+        ckpt,
+        day_dir,
+        run_timestamp=ckpt["run_timestamp"] if manifest_is_authoritative else "",
+    )
+    ckpt["intel_resume_stages"] = _missing_intel_resume_stages(
+        recovery_manifest,
+        ckpt["files"],
+    )
+    ckpt["stage"] = _derive_stage(ckpt["files"], recovery_manifest)
 
     if not ckpt["run_timestamp"]:
         for candidate in ckpt["files"].values():

@@ -41,8 +41,11 @@ from settings import (
     ANTIGRAVITY_API_KEY,
     EMAIL_ADDRESS,
     EMAIL_PASSWORD,
+    RECEIVER_EMAIL,
     GROK_API_KEY,
     INSECURE_TLS_ALLOWLIST,
+    OPUS_FALLBACK_API_KEY,
+    OPUS_FALLBACK_BASE_URL,
     PRO_OPUS_API_KEY,
     PRO_OPUS_BASE_URL,
     SEARCH_API_KEY_POOL,
@@ -63,6 +66,8 @@ REQUIRED_PROMPTS = (
     "p7a_audit.txt",
     "p9_report.txt",
 )
+LOCAL_ONLY_PREFLIGHT_RESUME_STAGES = frozenset({"roi_resume", "p9_done"})
+DELIVERY_PREFLIGHT_RESUME_STAGES = frozenset({"delivery_resume"})
 RUNTIME_IMPORTS = (
     ("requests", "requests", "error"),
     ("feedparser", "feedparser", "error"),
@@ -151,15 +156,20 @@ def configure_run_logging() -> None:
 
 
 def _run_orchestrator(flags: list[str], *, command_name: str) -> int:
-    preflight_result = _collect_preflight(strict=True)
-    preflight_summary = preflight_result["summary"]
-    preflight_exit_code = int(preflight_summary.get("exit_code", EXIT_CHECK_FAILED))
-    if preflight_exit_code != EXIT_OK:
-        _print_preflight(preflight_result)
-        return preflight_exit_code
-
     try:
-        with acquire_run_lock(command=command_name):
+        with acquire_run_lock(command=command_name) as lock_payload:
+            resume_stage = _resolve_preflight_resume_stage(flags)
+            preflight_result = _collect_preflight(
+                strict=True,
+                resume_stage=resume_stage,
+                expected_lock_owner_token=str(lock_payload.get("owner_token") or ""),
+            )
+            preflight_summary = preflight_result["summary"]
+            preflight_exit_code = int(preflight_summary.get("exit_code", EXIT_CHECK_FAILED))
+            if preflight_exit_code != EXIT_OK:
+                _print_preflight(preflight_result)
+                return preflight_exit_code
+
             set_preflight_summary(preflight_summary)
             configure_run_logging()
             update_manifest_context(
@@ -179,6 +189,16 @@ def _run_orchestrator(flags: list[str], *, command_name: str) -> int:
         )
         return EXIT_LOCK_ACTIVE
     return 0
+
+
+def _resolve_preflight_resume_stage(flags: list[str]) -> str:
+    if "--force" in flags or "--force-restart" in flags:
+        return "none"
+
+    from checkpoint import detect_checkpoint
+
+    checkpoint = detect_checkpoint()
+    return str(checkpoint.get("stage") or "none").strip() or "none"
 
 
 def cmd_run(_: argparse.Namespace) -> int:
@@ -453,8 +473,18 @@ def _format_check_line(name: str, ok: bool, detail: str, severity: str) -> str:
     return f"[{status}] {name}: {detail}"
 
 
-def _collect_preflight(strict: bool, *, allow_maintenance_lock: bool = False) -> dict:
+def _collect_preflight(
+    strict: bool,
+    *,
+    allow_maintenance_lock: bool = False,
+    resume_stage: str = "",
+    expected_lock_owner_token: str = "",
+) -> dict:
     checks: list[dict] = []
+    normalized_resume_stage = str(resume_stage or "").strip().lower()
+    local_only = normalized_resume_stage in LOCAL_ONLY_PREFLIGHT_RESUME_STAGES
+    delivery_only = normalized_resume_stage in DELIVERY_PREFLIGHT_RESUME_STAGES
+    full_preflight = not (local_only or delivery_only)
 
     def add_check(name: str, ok: bool, detail: str, severity: str = "error") -> None:
         checks.append(
@@ -468,67 +498,127 @@ def _collect_preflight(strict: bool, *, allow_maintenance_lock: bool = False) ->
 
     today_dir = Path(settings_today_output_dir())
     logs_dir = Path(get_today_logs_dir())
-    prompt_dir = Path(__file__).resolve().parent / "prompts"
 
     add_check("output_root", os.path.isdir(OUTPUT_DIR), OUTPUT_DIR)
     add_check("today_output", today_dir.is_dir(), str(today_dir))
     add_check("logs_dir", logs_dir.is_dir(), str(logs_dir))
-    add_check("prompts_dir", prompt_dir.is_dir(), str(prompt_dir))
+    calendar_mode = "not_checked"
 
-    add_check("search_keys", bool(SEARCH_API_KEY_POOL), f"count={len(SEARCH_API_KEY_POOL)}")
-    add_check("antigravity_key", bool(ANTIGRAVITY_API_KEY), "configured" if ANTIGRAVITY_API_KEY else "missing")
-    endpoint_ok, endpoint_detail = _probe_local_model_endpoint(PRO_OPUS_BASE_URL, PRO_OPUS_API_KEY)
-    add_check("model_endpoint", endpoint_ok, endpoint_detail)
-    email_configured = bool(EMAIL_ADDRESS and EMAIL_PASSWORD)
-    add_check(
-        "email_credentials",
-        email_configured,
-        "configured" if email_configured else "missing address or SMTP authorization code",
-    )
-    add_check("grok_key", bool(GROK_API_KEY), "configured" if GROK_API_KEY else "missing", severity="warning")
-    add_check(
-        "tls_allowlist",
-        True,
-        f"count={len(INSECURE_TLS_ALLOWLIST)} values={','.join(INSECURE_TLS_ALLOWLIST) if INSECURE_TLS_ALLOWLIST else 'none'}",
-    )
+    if full_preflight:
+        prompt_dir = Path(__file__).resolve().parent / "prompts"
+        add_check("prompts_dir", prompt_dir.is_dir(), str(prompt_dir))
+        add_check("search_keys", bool(SEARCH_API_KEY_POOL), f"count={len(SEARCH_API_KEY_POOL)}")
+        add_check(
+            "antigravity_key",
+            bool(ANTIGRAVITY_API_KEY),
+            "configured" if ANTIGRAVITY_API_KEY else "missing",
+        )
+        endpoint_ok, endpoint_detail = _probe_local_model_endpoint(PRO_OPUS_BASE_URL, PRO_OPUS_API_KEY)
+        add_check("model_endpoint", endpoint_ok, endpoint_detail)
+        fallback_endpoint_ok, _, fallback_endpoint_error = validate_model_base_url(
+            OPUS_FALLBACK_BASE_URL
+        )
+        fallback_is_independent = bool(
+            fallback_endpoint_ok
+            and OPUS_FALLBACK_API_KEY
+            and OPUS_FALLBACK_BASE_URL.rstrip('/') != PRO_OPUS_BASE_URL.rstrip('/')
+        )
+        fallback_host = (urlparse(OPUS_FALLBACK_BASE_URL).hostname or "").strip().lower()
+        fallback_detail = (
+            f"independent endpoint configured host={fallback_host}"
+            if fallback_is_independent
+            else fallback_endpoint_error
+            or "independent fallback endpoint or API key is missing"
+        )
+        add_check("opus_fallback", fallback_is_independent, fallback_detail)
 
-    for prompt_name in REQUIRED_PROMPTS:
+    if full_preflight or delivery_only:
+        delivery_requires_email = True
+        if delivery_only:
+            try:
+                manifest = load_run_manifest()
+                p9_payload = manifest.get("stages", {}).get("p9", {})
+                p9_metrics = p9_payload.get("metrics", {}) if isinstance(p9_payload, dict) else {}
+                delivery_requires_email = not (
+                    isinstance(p9_metrics, dict)
+                    and p9_metrics.get("email_configured") is False
+                )
+            except Exception:
+                delivery_requires_email = True
+
+        email_configured = bool(EMAIL_ADDRESS and EMAIL_PASSWORD and RECEIVER_EMAIL)
+        if delivery_only and not delivery_requires_email:
+            add_check(
+                "email_credentials",
+                True,
+                "not required by saved local-only report",
+            )
+        else:
+            add_check(
+                "email_credentials",
+                email_configured,
+                (
+                    "configured"
+                    if email_configured
+                    else "missing sender, receiver, or SMTP authorization code"
+                ),
+            )
+
+    if full_preflight:
+        add_check("grok_key", bool(GROK_API_KEY), "configured" if GROK_API_KEY else "missing", severity="warning")
+        add_check(
+            "tls_allowlist",
+            True,
+            f"count={len(INSECURE_TLS_ALLOWLIST)} values={','.join(INSECURE_TLS_ALLOWLIST) if INSECURE_TLS_ALLOWLIST else 'none'}",
+        )
+
+        for prompt_name in REQUIRED_PROMPTS:
+            try:
+                require_prompt(prompt_name)
+                add_check(f"prompt:{prompt_name}", True, "ok")
+            except Exception as exc:
+                add_check(f"prompt:{prompt_name}", False, str(exc))
+
+        for module_name, package_name, default_severity in RUNTIME_IMPORTS:
+            severity = "error" if strict and default_severity == "warning" else default_severity
+            try:
+                importlib.import_module(module_name)
+                add_check(f"import:{module_name}", True, package_name)
+            except Exception as exc:
+                add_check(f"import:{module_name}", False, f"{package_name}: {exc}", severity=severity)
+
+        calendar_status = get_calendar_status()
+        calendar_mode = calendar_status.get("mode", "unknown")
+        calendar_package = calendar_status.get("package_name", "unknown")
+        calendar_import = calendar_status.get("import_name", "unknown")
+        calendar_version = calendar_status.get("package_version") or "unknown"
+        add_check(
+            "calendar_mode",
+            calendar_mode == "chinese_calendar" or not strict,
+            f"{calendar_mode} package={calendar_package} import={calendar_import} version={calendar_version}",
+            severity="warning",
+        )
         try:
-            require_prompt(prompt_name)
-            add_check(f"prompt:{prompt_name}", True, "ok")
+            is_today_trading = is_trading_day(date.today())
+            add_check("calendar_probe", True, f"today_trading={is_today_trading}")
         except Exception as exc:
-            add_check(f"prompt:{prompt_name}", False, str(exc))
-
-    for module_name, package_name, default_severity in RUNTIME_IMPORTS:
-        severity = "error" if strict and default_severity == "warning" else default_severity
-        try:
-            importlib.import_module(module_name)
-            add_check(f"import:{module_name}", True, package_name)
-        except Exception as exc:
-            add_check(f"import:{module_name}", False, f"{package_name}: {exc}", severity=severity)
-
-    calendar_status = get_calendar_status()
-    calendar_mode = calendar_status.get("mode", "unknown")
-    calendar_package = calendar_status.get("package_name", "unknown")
-    calendar_import = calendar_status.get("import_name", "unknown")
-    calendar_version = calendar_status.get("package_version") or "unknown"
-    add_check(
-        "calendar_mode",
-        calendar_mode == "chinese_calendar" or not strict,
-        f"{calendar_mode} package={calendar_package} import={calendar_import} version={calendar_version}",
-        severity="warning",
-    )
-    try:
-        is_today_trading = is_trading_day(date.today())
-        add_check("calendar_probe", True, f"today_trading={is_today_trading}")
-    except Exception as exc:
-        add_check("calendar_probe", False, str(exc))
+            add_check("calendar_probe", False, str(exc))
 
     lock_info = read_run_lock()
     lock_state = get_run_lock_state(lock_info)
     if lock_state == "valid":
-        stale_reason = get_lock_stale_reason(lock_info, stale_after_seconds=RUN_LOCK_STALE_AFTER_SECONDS)
-        if stale_reason:
+        current_owner_token = str(lock_info.get("owner_token") or "")
+        lock_is_owned = bool(
+            expected_lock_owner_token
+            and current_owner_token
+            and current_owner_token == expected_lock_owner_token
+        )
+        stale_reason = ""
+        if not lock_is_owned:
+            stale_reason = get_lock_stale_reason(lock_info, stale_after_seconds=RUN_LOCK_STALE_AFTER_SECONDS)
+        if lock_is_owned:
+            add_check("run_lock", True, f"owned pid={lock_info.get('pid')}")
+        elif stale_reason:
             add_check("run_lock", True, f"stale_reason={stale_reason} stale={lock_info}")
         elif allow_maintenance_lock and lock_info.get("command") == "maintenance":
             add_check("run_lock", True, f"maintenance_allowed pid={lock_info.get('pid')}")

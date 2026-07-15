@@ -22,6 +22,7 @@ from artifact_store import (
     get_preflight_summary,
     load_run_manifest,
     record_run_state,
+    reset_run_manifest,
     set_run_timestamp,
     summarize_stage_degradations,
     update_manifest_context,
@@ -39,6 +40,12 @@ from checkpoint import (
 from contribution_metrics import build_layer_roi_report, render_layer_roi_markdown
 from pipeline_runtime import StageSpec, StageTimeoutError, run_stage_registry
 from run_config import get_run_config, get_schedule_decision
+from settings import (
+    EMAIL_ADDRESS,
+    EMAIL_PASSWORD,
+    OPUS_STAGE_TIMEOUT_SECONDS,
+    RECEIVER_EMAIL,
+)
 
 from p1_rss import collect_from_rss
 from p1_web import collect_from_web
@@ -61,7 +68,10 @@ from tdx_stock_universe import IDENTITY_VALIDATION_VERSION, normalize_rejected_s
 CONTROL_STAGE_START = {
     "none": "collect_intel",
     "p1": "collect_intel",
+    "intel_resume": "collect_intel",
+    "p2_resume": "recover_p2",
     "p5": "audit_evidence",
+    "p6_resume": "market_mapping",
     "p6": "market_mapping",
     "p8_resume": "market_mapping",
     "p9_resume": "market_mapping",
@@ -71,11 +81,12 @@ CONTROL_STAGE_START = {
 
 CONTROL_STAGE_TIMEOUTS = {
     "collect_intel": 900,
-    "audit_evidence": 480,
-    "market_mapping": 900,
+    "recover_p2": 480,
+    "audit_evidence": 900,
+    "market_mapping": OPUS_STAGE_TIMEOUT_SECONDS,
     "research": 900,
     "technical": 300,
-    "report": 900,
+    "report": OPUS_STAGE_TIMEOUT_SECONDS,
     "delivery_resume": 600,
     "roi": 180,
 }
@@ -204,8 +215,8 @@ def _load_p6_identity_validation(metrics: dict[str, Any] | None = None) -> dict[
 
 
 def _parse_flags(argv: list[str]) -> tuple[bool, bool]:
-    force_run = "--force" in argv or "--force-run" in argv
     force_restart = "--force" in argv or "--force-restart" in argv
+    force_run = "--force" in argv or "--force-run" in argv or force_restart
     return force_run, force_restart
 
 
@@ -223,6 +234,7 @@ def _build_context(now: datetime, run_ts: str, ckpt: dict, resume_from: str) -> 
         "p5_evidence": "",
         "p1_results": [],
         "p1_stats": {},
+        "evidence_raw": "",
         "p2_data": "",
         "p3_data": "",
         "p3_stats": {},
@@ -252,6 +264,7 @@ def _build_context(now: datetime, run_ts: str, ckpt: dict, resume_from: str) -> 
         "search_queries": [],
         "final_report": "",
         "report_ts": "",
+        "intel_resume_stages": list(ckpt.get("intel_resume_stages", [])),
     }
 
     if resume_from in {"delivery_resume", "roi_resume"}:
@@ -260,6 +273,21 @@ def _build_context(now: datetime, run_ts: str, ckpt: dict, resume_from: str) -> 
             "saved P9 report",
         )
         context["report_ts"] = run_ts
+
+    if resume_from in {"p2_resume", "intel_resume"}:
+        context["backtrack"] = get_run_config(now)
+        p1_path = ckpt.get("files", {}).get("p1", "")
+        if p1_path:
+            recovered_results = _read_json_checkpoint(p1_path, "P1 raw results")
+            if isinstance(recovered_results, list):
+                context["p1_results"] = recovered_results
+        context["evidence_raw"] = _read_text_checkpoint(
+            ckpt.get("files", {}).get("p1_md", ""),
+            "P1 markdown",
+        )
+        if not context["evidence_raw"] and context["p1_results"]:
+            context["evidence_raw"] = format_evidence(context["p1_results"])
+        context["p2_data"], context["p3_data"] = _recover_p2_p3_from_checkpoint(ckpt)
 
     if resume_from == "roi_resume":
         context["p2_data"], context["p3_data"] = _recover_p2_p3_from_checkpoint(ckpt)
@@ -315,27 +343,71 @@ def _persist_p1_artifacts(
     p1_duration: float,
     p1_stats: dict[str, Any],
 ) -> None:
+    source_failures = int(p1_stats.get("source_failures", 0) or 0)
+    metrics = {
+        "records": len(p1_results),
+        "failed_urls": len(p1_failed_urls),
+        "evidence_chars": len(evidence_raw),
+        "duration_seconds": round(p1_duration, 1),
+        **p1_stats,
+    }
+    if source_failures:
+        metrics["degrade_reason"] = "; ".join(
+            str(item) for item in p1_stats.get("source_failure_details", []) if item
+        )[:2000]
     if not p1_results:
+        status = "failed_no_results" if source_failures else "skipped_no_results"
+        update_run_manifest("p1", status=status, metrics=metrics)
         return
 
     p1_json_path = write_json_artifact("P1_RSS原始数据", p1_results)
     p1_md_path = write_text_artifact("P1_RSS原始数据", evidence_raw)
     update_run_manifest(
         "p1",
-        status="completed",
+        status="completed_structured_degraded" if source_failures else "completed",
         files={"json": p1_json_path, "md": p1_md_path},
-        metrics={
-            "records": len(p1_results),
-            "failed_urls": len(p1_failed_urls),
-            "evidence_chars": len(evidence_raw),
-            "duration_seconds": round(p1_duration, 1),
-            **p1_stats,
-        },
+        metrics=metrics,
     )
 
 
+def _fill_missing_p2_p3_from_checkpoint(context: dict[str, Any], ckpt: dict) -> None:
+    if context.get("p2_data") and context.get("p3_data"):
+        return
+    recovered_p2, recovered_p3 = _recover_p2_p3_from_checkpoint(ckpt)
+    if not context.get("p2_data"):
+        context["p2_data"] = recovered_p2
+    if not context.get("p3_data"):
+        context["p3_data"] = recovered_p3
+
+
 def _persist_p3_artifacts(p3_data: str, p3_stats: dict[str, Any]) -> None:
+    if not isinstance(p3_stats, dict):
+        p3_stats = {}
+    source_status = str(p3_stats.get("status") or "").strip().lower()
+    metrics = {
+        "content_chars": len(p3_data),
+        "duration_seconds": p3_stats.get("duration_seconds", 0),
+        "jinnang_1_count": p3_stats.get("jinnang_1_count", 0),
+        "jinnang_2_count": p3_stats.get("jinnang_2_count", 0),
+        "jinnang_3_count": p3_stats.get("jinnang_3_count", 0),
+        "structured_items": p3_stats.get("structured_items", 0),
+        "query_failures": p3_stats.get("query_failures", 0),
+        "failure_errors": p3_stats.get("failure_errors", []),
+    }
+    if p3_stats.get("error"):
+        metrics["error"] = str(p3_stats["error"])
+    if p3_stats.get("failure_errors"):
+        metrics["degrade_reason"] = "; ".join(
+            str(item) for item in p3_stats.get("failure_errors", []) if item
+        )[:2000]
     if not p3_data:
+        if source_status == "empty":
+            status = "skipped_no_results"
+        elif source_status.startswith("skipped") or source_status.startswith("failed"):
+            status = source_status
+        else:
+            status = "failed_empty_output"
+        update_run_manifest("p3", status=status, metrics=metrics)
         return
 
     p3_path = write_text_artifact("P3_机动情报", p3_data)
@@ -354,16 +426,13 @@ def _persist_p3_artifacts(p3_data: str, p3_stats: dict[str, Any]) -> None:
         p3_files["json"] = p3_json_path
     update_run_manifest(
         "p3",
-        status="completed",
+        status=(
+            "completed_structured_degraded"
+            if source_status.startswith(("partial", "failed"))
+            else "completed"
+        ),
         files=p3_files,
-        metrics={
-            "content_chars": len(p3_data),
-            "duration_seconds": p3_stats.get("duration_seconds", 0),
-            "jinnang_1_count": p3_stats.get("jinnang_1_count", 0),
-            "jinnang_2_count": p3_stats.get("jinnang_2_count", 0),
-            "jinnang_3_count": p3_stats.get("jinnang_3_count", 0),
-            "structured_items": p3_stats.get("structured_items", 0),
-        },
+        metrics=metrics,
     )
 
 
@@ -372,7 +441,7 @@ def _stage_collect_intel(context: dict[str, Any]) -> None:
     ckpt = context["ckpt"]
     now = context["now"]
 
-    if resume_from not in {"none", "p1"}:
+    if resume_from not in {"none", "p1", "intel_resume"}:
         return
 
     context["backtrack"] = get_run_config(now)
@@ -387,47 +456,88 @@ def _stage_collect_intel(context: dict[str, Any]) -> None:
         context["evidence_raw"] = evidence_raw
         return
 
-    p1_results: list[dict[str, Any]] = []
+    resume_stages = (
+        {"p1", "p2", "p3"}
+        if resume_from == "none"
+        else set(context.get("intel_resume_stages") or ckpt.get("intel_resume_stages", []))
+    )
+    run_p1 = "p1" in resume_stages
+    run_p2 = "p2" in resume_stages
+    run_p3 = "p3" in resume_stages
+
+    p1_results: list[dict[str, Any]] = [] if run_p1 else list(context.get("p1_results") or [])
     rss_stats: dict[str, Any] = {}
     web_stats: dict[str, Any] = {}
-    p2_data = ""
-    p3_data = ""
-    p3_stats: dict[str, Any] = {}
+    p2_data = "" if run_p2 else str(context.get("p2_data") or "")
+    p3_data = "" if run_p3 else str(context.get("p3_data") or "")
+    p3_stats: dict[str, Any] = {} if run_p3 else dict(context.get("p3_stats") or {})
     p1_failed_urls: list[dict[str, Any]] = []
+    p1_source_failure_details: list[str] = []
     collect_started = time.time()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        rss_future = pool.submit(collect_from_rss, context["backtrack"])
-        web_future = pool.submit(collect_from_web, context["backtrack"])
-        x_future = pool.submit(collect_from_x, context["backtrack"])
-        p3_future = pool.submit(collect_p3_parallel_only, context["backtrack"])
+        rss_future = pool.submit(collect_from_rss, context["backtrack"]) if run_p1 else None
+        web_future = pool.submit(collect_from_web, context["backtrack"]) if run_p1 else None
+        x_future = pool.submit(collect_from_x, context["backtrack"]) if run_p2 else None
+        p3_future = pool.submit(collect_p3_parallel_only, context["backtrack"]) if run_p3 else None
 
-        try:
-            rss_results, rss_stats = rss_future.result()
-            p1_results.extend(rss_results)
-            p1_failed_urls.extend(rss_stats.get("failed_urls", []))
-        except Exception as exc:
-            logging.warning("RSS collection failed: %s", exc)
+        if rss_future is not None:
+            try:
+                rss_results, rss_stats = rss_future.result()
+                p1_results.extend(rss_results)
+                p1_failed_urls.extend(rss_stats.get("failed_urls", []))
+            except Exception as exc:
+                logging.warning("RSS collection failed: %s", exc)
+                p1_source_failure_details.append(f"rss: {exc}")
 
-        try:
-            web_results, web_stats = web_future.result()
-            p1_results.extend(web_results)
-        except Exception as exc:
-            logging.warning("web collection failed: %s", exc)
+        if web_future is not None:
+            try:
+                web_results, web_stats = web_future.result()
+                p1_results.extend(web_results)
+            except Exception as exc:
+                logging.warning("web collection failed: %s", exc)
+                p1_source_failure_details.append(f"web: {exc}")
 
-        try:
-            p2_data, _ = x_future.result()
-        except Exception as exc:
-            logging.warning("X collection failed: %s", exc)
+        if x_future is not None:
+            try:
+                p2_data, _ = x_future.result()
+            except Exception as exc:
+                logging.warning("X collection failed: %s", exc)
+                update_run_manifest(
+                    "p2",
+                    status="failed_exception",
+                    metrics={"error": str(exc), "collection_mode": "parallel"},
+                )
 
-        try:
-            p3_data, p3_stats = p3_future.result()
-        except Exception as exc:
-            logging.warning("P3 collection failed: %s", exc)
+        if p3_future is not None:
+            try:
+                p3_data, p3_stats = p3_future.result()
+            except Exception as exc:
+                logging.warning("P3 collection failed: %s", exc)
+                p3_stats = {
+                    "status": "failed_exception",
+                    "error": str(exc),
+                    "failure_errors": [str(exc)],
+                    "query_failures": 1,
+                }
 
-    evidence_raw = format_evidence(p1_results) if p1_results else ""
-    p1_duration = time.time() - collect_started
-    p1_stats = _build_p1_stats(rss_stats, web_stats, p1_failed_urls)
+    evidence_raw = (
+        format_evidence(p1_results) if run_p1 and p1_results else context.get("evidence_raw", "")
+    )
+    if run_p1:
+        p1_duration = time.time() - collect_started
+        p1_stats = _build_p1_stats(rss_stats, web_stats, p1_failed_urls)
+        for source_label, source_stats in (("rss", rss_stats), ("web", web_stats)):
+            for failure in source_stats.get("failed", []) if isinstance(source_stats, dict) else []:
+                if isinstance(failure, (list, tuple)) and len(failure) >= 2:
+                    p1_source_failure_details.append(f"{source_label}/{failure[0]}: {failure[1]}")
+                else:
+                    p1_source_failure_details.append(f"{source_label}: {failure}")
+        p1_stats["source_failures"] = len(p1_source_failure_details)
+        p1_stats["source_failure_details"] = p1_source_failure_details
+    else:
+        p1_duration = float(context.get("p1_duration", 0.0) or 0.0)
+        p1_stats = dict(context.get("p1_stats") or {})
 
     context.update(
         {
@@ -441,10 +551,12 @@ def _stage_collect_intel(context: dict[str, Any]) -> None:
         }
     )
 
-    _persist_p1_artifacts(p1_results, evidence_raw, p1_failed_urls, p1_duration, p1_stats)
-    _persist_p3_artifacts(p3_data, p3_stats)
+    if run_p1:
+        _persist_p1_artifacts(p1_results, evidence_raw, p1_failed_urls, p1_duration, p1_stats)
+    if run_p3:
+        _persist_p3_artifacts(p3_data, p3_stats)
 
-    if p1_failed_urls:
+    if run_p1 and run_p3 and p1_failed_urls:
         try:
             jinnang_1_results = run_jinnang_1(p1_failed_urls)
             if jinnang_1_results:
@@ -464,52 +576,89 @@ def _stage_collect_intel(context: dict[str, Any]) -> None:
             logging.warning("jinnang_1 recovery failed: %s", exc)
 
 
+def _run_p5_audit(context: dict[str, Any]) -> None:
+    with log_heartbeat("P5 audit"):
+        try:
+            context["p5_evidence"] = gemini_pro_audit(
+                context.get("evidence_raw", ""),
+                audit_type="p5",
+                backtrack=context["backtrack"] or get_run_config(context["now"]),
+            )
+        except Exception as exc:
+            logging.error("[P5] audit raised unexpectedly; falling back to raw P1 evidence: %s", exc)
+            update_run_manifest(
+                "p5",
+                status="failed_exception",
+                metrics={
+                    "input_chars": len(context.get("evidence_raw", "") or ""),
+                    "fallback_reason": str(exc),
+                },
+            )
+            context["p5_evidence"] = ""
+
+    if not context["p5_evidence"].strip() and context.get("evidence_raw", "").strip():
+        fallback_text = (
+            "## P5 Pro 审计失败兜底\n\n"
+            "> Gemini Pro 审计层未返回有效结果。以下内容是未经 P5 Pro 清洗的 P1 原始情报，"
+            "仅用于保持后续 P6/P9 链路不断流；下游必须按未审计数据降权处理。\n\n"
+            + context["evidence_raw"].strip()
+        )
+        context["p5_evidence"] = fallback_text
+        fallback_path = write_text_artifact("P5_审计_RAW_P1_FALLBACK", fallback_text)
+        update_run_manifest(
+            "p5",
+            status="failed_empty_output_raw_p1_fallback",
+            files={"md": fallback_path},
+            metrics={
+                "fallback": "raw_p1_unreviewed",
+                "fallback_chars": len(fallback_text),
+            },
+        )
+
+
+def _stage_recover_p2(context: dict[str, Any]) -> None:
+    if context.get("resume_from") != "p2_resume" or context.get("p2_resume_attempted"):
+        return
+
+    context["p2_resume_attempted"] = True
+    context["backtrack"] = context.get("backtrack") or get_run_config(context["now"])
+    logging.info("[P2] checkpoint is incomplete without an artifact; rerunning P2 only")
+    try:
+        with log_heartbeat("P2 targeted resume"):
+            context["p2_data"], _ = collect_from_x(context["backtrack"])
+    except Exception as exc:
+        context["p2_data"] = ""
+        logging.error("[P2] targeted resume failed; continuing with an explicit degraded state: %s", exc)
+        update_run_manifest(
+            "p2",
+            status="failed_exception",
+            metrics={"fallback_reason": str(exc), "targeted_resume": True},
+        )
+
+
 def _stage_audit_evidence(context: dict[str, Any]) -> None:
     resume_from = context["resume_from"]
     ckpt = context["ckpt"]
 
-    if resume_from in {"none", "p1"}:
-        with log_heartbeat("P5 audit"):
-            try:
-                context["p5_evidence"] = gemini_pro_audit(
-                    context.get("evidence_raw", ""),
-                    audit_type="p5",
-                    backtrack=context["backtrack"] or get_run_config(context["now"]),
-                )
-            except Exception as exc:
-                logging.error("[P5] audit raised unexpectedly; falling back to raw P1 evidence: %s", exc)
-                update_run_manifest(
-                    "p5",
-                    status="failed_exception",
-                    metrics={
-                        "input_chars": len(context.get("evidence_raw", "") or ""),
-                        "fallback_reason": str(exc),
-                    },
-                )
-                context["p5_evidence"] = ""
-        if not context["p5_evidence"].strip() and context.get("evidence_raw", "").strip():
-            fallback_text = (
-                "## P5 Pro 审计失败兜底\n\n"
-                "> Gemini Pro 审计层未返回有效结果。以下内容是未经 P5 Pro 清洗的 P1 原始情报，"
-                "仅用于保持后续 P6/P9 链路不断流；下游必须按未审计数据降权处理。\n\n"
-                + context["evidence_raw"].strip()
-            )
-            context["p5_evidence"] = fallback_text
-            fallback_path = write_text_artifact("P5_审计_RAW_P1_FALLBACK", fallback_text)
-            update_run_manifest(
-                "p5",
-                status="failed_empty_output_raw_p1_fallback",
-                files={"md": fallback_path},
-                metrics={
-                    "fallback": "raw_p1_unreviewed",
-                    "fallback_chars": len(fallback_text),
-                },
-            )
+    if resume_from == "p2_resume" and not context.get("p2_resume_attempted"):
+        _stage_recover_p2(context)
+
+    intel_resume_stages = set(context.get("intel_resume_stages") or [])
+    should_run_p5 = (
+        resume_from in {"none", "p1"}
+        or (resume_from == "p2_resume" and not ckpt.get("files", {}).get("p5"))
+        or (
+            resume_from == "intel_resume"
+            and ("p1" in intel_resume_stages or not ckpt.get("files", {}).get("p5"))
+        )
+    )
+    if should_run_p5:
+        _run_p5_audit(context)
+        _fill_missing_p2_p3_from_checkpoint(context, ckpt)
         return
 
     context["p5_evidence"] = _read_text_checkpoint(ckpt["files"].get("p5", ""), "P5 audit result")
-    if not context["p2_data"] or not context["p3_data"]:
-        context["p2_data"], context["p3_data"] = _recover_p2_p3_from_checkpoint(ckpt)
+    _fill_missing_p2_p3_from_checkpoint(context, ckpt)
 
 
 def _stage_market_mapping(context: dict[str, Any]) -> None:
@@ -530,8 +679,7 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
             context["p6_mapping"] = _read_text_checkpoint(ckpt["files"].get("p6", ""), "P6 mapping")
             context["p5_evidence"] = context["p5_evidence"] or _read_text_checkpoint(ckpt["files"].get("p5", ""), "P5 audit")
             context["p4_data"] = _read_text_checkpoint(ckpt["files"].get("p4", ""), "P4 market snapshot")
-            if not context["p2_data"] or not context["p3_data"]:
-                context["p2_data"], context["p3_data"] = _recover_p2_p3_from_checkpoint(ckpt)
+            _fill_missing_p2_p3_from_checkpoint(context, ckpt)
             context["p7_deep"] = _read_fresh_text_checkpoint(
                 ckpt,
                 "p7",
@@ -554,10 +702,17 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
             context["price_data"] = _read_text_checkpoint(ckpt["files"].get("p8", ""), "P8 technical data")
             return
 
-    if not context.get("p5_evidence") and ckpt["files"].get("p5"):
+    p1_was_recollected = (
+        resume_from == "intel_resume"
+        and "p1" in set(context.get("intel_resume_stages") or ckpt.get("intel_resume_stages", []))
+    )
+    if (
+        not context.get("p5_evidence")
+        and ckpt["files"].get("p5")
+        and not p1_was_recollected
+    ):
         context["p5_evidence"] = _read_text_checkpoint(ckpt["files"].get("p5", ""), "P5 audit")
-    if not context["p2_data"] or not context["p3_data"]:
-        context["p2_data"], context["p3_data"] = _recover_p2_p3_from_checkpoint(ckpt)
+    _fill_missing_p2_p3_from_checkpoint(context, ckpt)
 
     if ckpt["files"].get("p4"):
         context["p4_data"] = _read_text_checkpoint(ckpt["files"].get("p4", ""), "P4 market snapshot")
@@ -593,23 +748,42 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
         except Exception as exc:
             logging.error("[P6] mapping failed: %s", exc)
             context["p6_mapping"] = ""
+            update_run_manifest(
+                "p6",
+                status="failed_exception",
+                metrics={
+                    "input_chars": len(combined_evidence),
+                    "error": str(exc),
+                },
+            )
+            raise RuntimeError(f"P6 mapping failed: {exc}") from exc
 
-    if context["p6_mapping"]:
-        p6_path = write_text_artifact("P6_映射", context["p6_mapping"])
-        context["ckpt"].setdefault("files", {})["p6"] = p6_path
+    if not context["p6_mapping"].strip():
         update_run_manifest(
             "p6",
-            status="completed",
-            files={"md": p6_path},
-            metrics={"mapping_chars": len(context["p6_mapping"])},
+            status="failed_empty_output",
+            metrics={
+                "input_chars": len(combined_evidence),
+                "error": "P6 mapping returned empty output",
+            },
         )
-        identity_validation = _load_p6_identity_validation()
-        context["rejected_target_names"] = identity_validation["rejected_target_names"]
-        context["ckpt"]["p6_metrics"] = {
-            "rejected_target_names": identity_validation["rejected_target_names"],
-            "rejected_targets": identity_validation["rejected_targets"],
-            "identity_validation_version": identity_validation["identity_validation_version"],
-        }
+        raise RuntimeError("P6 mapping returned empty output")
+
+    p6_path = write_text_artifact("P6_映射", context["p6_mapping"])
+    context["ckpt"].setdefault("files", {})["p6"] = p6_path
+    update_run_manifest(
+        "p6",
+        status="completed",
+        files={"md": p6_path},
+        metrics={"mapping_chars": len(context["p6_mapping"])},
+    )
+    identity_validation = _load_p6_identity_validation()
+    context["rejected_target_names"] = identity_validation["rejected_target_names"]
+    context["ckpt"]["p6_metrics"] = {
+        "rejected_target_names": identity_validation["rejected_target_names"],
+        "rejected_targets": identity_validation["rejected_targets"],
+        "identity_validation_version": identity_validation["identity_validation_version"],
+    }
 
 
 def _stage_research(context: dict[str, Any]) -> None:
@@ -636,7 +810,7 @@ def _stage_research(context: dict[str, Any]) -> None:
     except Exception as exc:
         logging.error("[P7] research plan failed; skipping optional research layers: %s", exc)
         update_run_manifest(
-            "research",
+            "p7_plan",
             status="failed_plan_fallback",
             metrics={"fallback_reason": str(exc)},
         )
@@ -677,6 +851,7 @@ def _stage_research(context: dict[str, Any]) -> None:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 p7_future = pool.submit(run_deep_research, research_plan) if need_run_p7 else None
                 supplement_results: list[str] = []
+                supplement_query_failures = 0
                 capped_queries = search_queries[:5]
                 if need_run_p75 and capped_queries:
                     p75_started = time.time()
@@ -691,6 +866,7 @@ def _stage_research(context: dict[str, Any]) -> None:
                             if text and text.lower().replace(".", "") not in ("not found", "no results", "no relevant results"):
                                 supplement_results.append(text)
                         except Exception as exc:
+                            supplement_query_failures += 1
                             logging.error("[P7.5] supplement search failed: %s", exc)
 
                 if p7_future is not None:
@@ -700,9 +876,27 @@ def _stage_research(context: dict[str, Any]) -> None:
                         context["p7_rejected_identity_lines_removed"] = int(
                             p7_result.get("rejected_identity_lines_removed", 0) or 0
                         )
+                        p7_status = str(p7_result.get("status") or "").strip()
+                        if not context["p7_deep"].strip() and p7_status.startswith("failed"):
+                            update_run_manifest(
+                                "p7",
+                                status=p7_status,
+                                metrics={
+                                    "output_chars": 0,
+                                    **p6_hash_metrics,
+                                },
+                            )
                     except Exception as exc:
                         logging.error("[P7] deep research failed: %s", exc)
                         context["p7_deep"] = ""
+                        update_run_manifest(
+                            "p7",
+                            status="failed_exception",
+                            metrics={
+                                "fallback_reason": str(exc),
+                                **p6_hash_metrics,
+                            },
+                        )
 
                 if need_run_p75:
                     if supplement_results:
@@ -726,8 +920,17 @@ def _stage_research(context: dict[str, Any]) -> None:
                         context["p75_supplement"] = ""
                         update_run_manifest(
                             "p75",
-                            status="skipped_no_results",
-                            metrics={"queries": len(capped_queries), "raw_chars": 0},
+                            status=(
+                                "failed_query_errors"
+                                if supplement_query_failures
+                                else "skipped_no_results"
+                            ),
+                            metrics={
+                                "queries": len(capped_queries),
+                                "query_failures": supplement_query_failures,
+                                "raw_chars": 0,
+                                **p6_hash_metrics,
+                            },
                         )
 
     if p75_started is not None:
@@ -760,9 +963,9 @@ def _stage_research(context: dict[str, Any]) -> None:
             },
         )
 
-    if context.get("p7a_audited"):
-        return
-    if context.get("p7_deep", "").strip() and len(context["p7_deep"].strip()) > 200:
+    if not context.get("p7a_audited") and (
+        context.get("p7_deep", "").strip() and len(context["p7_deep"].strip()) > 200
+    ):
         with log_heartbeat("P7a audit"):
             try:
                 if p6_hash_metrics:
@@ -782,7 +985,7 @@ def _stage_research(context: dict[str, Any]) -> None:
                     },
                 )
                 context["p7a_audited"] = context.get("p7_deep", "")
-    else:
+    elif not context.get("p7a_audited"):
         context["p7a_audited"] = context.get("p7_deep", "")
 
     context["search_queries"] = search_queries[:5]
@@ -831,6 +1034,9 @@ def _stage_technical(context: dict[str, Any]) -> None:
 
 
 def _stage_report(context: dict[str, Any]) -> None:
+    if not str(context.get("p6_mapping", "")).strip():
+        raise RuntimeError("P6 mapping is missing; P9 report generation is blocked")
+
     with log_heartbeat("P9 report"):
         try:
             final_report, report_ts = p9_risk_analysis(
@@ -867,7 +1073,13 @@ def _stage_delivery_resume(context: dict[str, Any]) -> None:
     if not final_report or not final_report.strip():
         raise RuntimeError("saved report is missing or empty; delivery cannot resume")
 
-    delivery = send_report_email(final_report, report_ts)
+    p9_metrics = context.get("ckpt", {}).get("p9_metrics", {})
+    saved_email_policy = p9_metrics.get("email_configured") if isinstance(p9_metrics, dict) else None
+    email_required = saved_email_policy if isinstance(saved_email_policy, bool) else None
+    if email_required is True and not (EMAIL_ADDRESS and EMAIL_PASSWORD and RECEIVER_EMAIL):
+        raise RuntimeError("email configuration is incomplete; required delivery cannot resume")
+
+    delivery = send_report_email(final_report, report_ts, email_required=email_required)
     if not delivery.get("ok"):
         raise RuntimeError(f"report delivery failed: {delivery.get('status', 'unknown')}")
 
@@ -960,7 +1172,10 @@ def _stage_roi(context: dict[str, Any]) -> None:
 
     manifest_after_roi = load_run_manifest()
     for stage_name, payload in roi_payload.get("layers", {}).items():
-        stage_status = manifest_after_roi.get("stages", {}).get(stage_name, {}).get("status", "completed")
+        stage_payload = manifest_after_roi.get("stages", {}).get(stage_name, {})
+        if not isinstance(stage_payload, dict) or not str(stage_payload.get("status") or "").strip():
+            continue
+        stage_status = stage_payload["status"]
         update_run_manifest(
             stage_name,
             status=stage_status,
@@ -987,6 +1202,12 @@ def _build_stage_registry() -> list[StageSpec]:
             description="P1-P3 collection and resume loading",
         ),
         StageSpec(
+            name="recover_p2",
+            handler=_stage_recover_p2,
+            timeout_seconds=CONTROL_STAGE_TIMEOUTS["recover_p2"],
+            description="Targeted P2 recovery without rerunning P1 or P3",
+        ),
+        StageSpec(
             name="audit_evidence",
             handler=_stage_audit_evidence,
             timeout_seconds=CONTROL_STAGE_TIMEOUTS["audit_evidence"],
@@ -1002,12 +1223,14 @@ def _build_stage_registry() -> list[StageSpec]:
             name="research",
             handler=_stage_research,
             timeout_seconds=CONTROL_STAGE_TIMEOUTS["research"],
+            continue_on_error=True,
             description="P7/P7a/P7.5 research pipeline",
         ),
         StageSpec(
             name="technical",
             handler=_stage_technical,
             timeout_seconds=CONTROL_STAGE_TIMEOUTS["technical"],
+            continue_on_error=True,
             description="P8 technical layer",
         ),
         StageSpec(
@@ -1074,6 +1297,9 @@ def orchestrator_main(argv: list[str] | None = None):
         run_ts = set_run_timestamp(ckpt.get("run_timestamp") or None)
     else:
         run_ts = set_run_timestamp()
+        archive_path = reset_run_manifest(run_ts)
+        if archive_path:
+            logging.info("[restart] archived previous manifest: %s", archive_path)
 
     resume_from = ckpt["stage"]
     start_at = _resolve_start_stage(resume_from)

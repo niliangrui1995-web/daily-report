@@ -8,7 +8,7 @@ import os
 import tempfile
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
 from artifact_store import (
@@ -73,7 +73,7 @@ class StageSpec:
     handler: StageHandler
     timeout_seconds: int | None = None
     retry_limit: int = 0
-    depends_on: tuple[str, ...] = field(default_factory=tuple)
+    continue_on_error: bool = False
     description: str = ""
 
 
@@ -83,9 +83,13 @@ def run_stage_registry(
     *,
     start_at: str | None = None,
 ) -> None:
+    stage_list = list(stages)
+    if start_at is not None and not any(stage.name == start_at for stage in stage_list):
+        raise ValueError(f"unknown start_at stage: {start_at}")
+
     started = start_at is None
 
-    for stage in stages:
+    for stage in stage_list:
         if not started and stage.name != start_at:
             continue
         started = True
@@ -125,6 +129,13 @@ def _run_single_stage(stage: StageSpec, context: dict[str, Any]) -> None:
             )
             logging.error("[control] stage %s timed out on attempt %s", stage.name, attempt)
             if is_last_attempt:
+                if stage.continue_on_error:
+                    context.setdefault("optional_stage_failures", {})[stage.name] = {
+                        "status": "failed_timeout",
+                        "error": str(exc),
+                    }
+                    logging.warning("[control] optional stage %s timed out; continuing", stage.name)
+                    return
                 raise
             time.sleep(min(2 ** (attempt - 1), 5))
             continue
@@ -143,6 +154,13 @@ def _run_single_stage(stage: StageSpec, context: dict[str, Any]) -> None:
             )
             logging.exception("[control] stage %s failed on attempt %s", stage.name, attempt)
             if is_last_attempt:
+                if stage.continue_on_error:
+                    context.setdefault("optional_stage_failures", {})[stage.name] = {
+                        "status": "failed_exception",
+                        "error": str(exc),
+                    }
+                    logging.warning("[control] optional stage %s failed; continuing", stage.name)
+                    return
                 raise
             time.sleep(min(2 ** (attempt - 1), 5))
             continue

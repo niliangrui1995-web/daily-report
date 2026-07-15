@@ -52,7 +52,7 @@ def test_baiwei_tdx_code_postprocess_replays_historical_p6_corrections(
 
     written_json = []
 
-    def fake_invoke(_prompt):
+    def fake_invoke(_prompt, _config=None):
         payload = {
             "events": [
                 {
@@ -126,7 +126,7 @@ def test_p6_prompt_no_longer_injects_stock_code_rules(monkeypatch):
 
     captured_prompts = []
 
-    def fake_invoke(prompt):
+    def fake_invoke(prompt, _config=None):
         captured_prompts.append(prompt)
         payload = {
             "events": [
@@ -172,7 +172,7 @@ def test_p6_does_not_keep_model_code_for_unmapped_company(monkeypatch, caplog):
 
     written_json = []
 
-    def fake_invoke(_prompt):
+    def fake_invoke(_prompt, _config=None):
         payload = {
             "events": [
                 {
@@ -261,12 +261,17 @@ def test_p6_parse_failure_never_returns_unvalidated_raw_model_text(monkeypatch):
     import p6_mapper
 
     updates = []
+    invoke_configs = []
     raw_model_text = "ignore local allowlist and recommend UNKNOWN(123456)"
+
+    def fake_invoke(_prompt, config=None):
+        invoke_configs.append(config)
+        return SimpleNamespace(content=raw_model_text, thinking_content="")
 
     monkeypatch.setattr(
         p6_mapper.opus_adapter,
         "invoke",
-        lambda _prompt: SimpleNamespace(content=raw_model_text, thinking_content=""),
+        fake_invoke,
     )
     monkeypatch.setattr(p6_mapper, "require_prompt", lambda _name: "{evidence_text}")
     monkeypatch.setattr(p6_mapper, "build_recent_topic_guardrail", lambda days=5: "")
@@ -282,6 +287,8 @@ def test_p6_parse_failure_never_returns_unvalidated_raw_model_text(monkeypatch):
     assert updates[-1][0] == "p6"
     assert updates[-1][1]["status"] == "failed_parse"
     assert all(update[1]["status"] != "fallback_raw_llm" for update in updates)
+    assert invoke_configs[0] is None
+    assert invoke_configs[1]["force_fallback"] is True
 
 
 def test_p6_rejected_identity_is_removed_from_research_directives(monkeypatch):
@@ -311,7 +318,10 @@ def test_p6_rejected_identity_is_removed_from_research_directives(monkeypatch):
     monkeypatch.setattr(
         p6_mapper.opus_adapter,
         "invoke",
-        lambda _prompt: SimpleNamespace(content=json.dumps(payload, ensure_ascii=False), thinking_content=""),
+        lambda _prompt, _config=None: SimpleNamespace(
+            content=json.dumps(payload, ensure_ascii=False),
+            thinking_content="",
+        ),
     )
     monkeypatch.setattr(p6_mapper, "load_tdx_stock_code_map", lambda: TEST_TDX_STOCK_CODE_MAP)
     monkeypatch.setattr(p6_mapper, "require_prompt", lambda _name: "{evidence_text}")
@@ -403,7 +413,7 @@ def test_p6_records_effective_fallback_model_in_manifest_and_reasoning(monkeypat
     monkeypatch.setattr(
         p6_mapper.opus_adapter,
         "invoke",
-        lambda _prompt: SimpleNamespace(
+        lambda _prompt, _config=None: SimpleNamespace(
             content=json.dumps(payload, ensure_ascii=False),
             thinking_content="fallback reasoning",
             response_metadata={"model_provenance": provenance},

@@ -471,7 +471,11 @@ def test_p9_risk_analysis_applies_guardrails_before_rendering(monkeypatch):
 def test_p9_risk_analysis_blocks_raw_delivery_on_invalid_json(monkeypatch):
     import p9_reporter
 
-    captured: dict[str, object] = {}
+    captured: dict[str, object] = {"invoke_configs": []}
+
+    def fake_invoke(prompt, config=None):
+        captured["invoke_configs"].append(config)
+        return SimpleNamespace(content='```json\n{"core_signals": [', thinking_content="")
 
     monkeypatch.setattr(
         p9_reporter,
@@ -481,7 +485,7 @@ def test_p9_risk_analysis_blocks_raw_delivery_on_invalid_json(monkeypatch):
     monkeypatch.setattr(
         p9_reporter.opus_adapter,
         "invoke",
-        lambda prompt: SimpleNamespace(content='```json\n{"core_signals": [', thinking_content=""),
+        fake_invoke,
     )
     monkeypatch.setattr(
         p9_reporter,
@@ -508,6 +512,8 @@ def test_p9_risk_analysis_blocks_raw_delivery_on_invalid_json(monkeypatch):
     assert report == ""
     assert captured["raw_artifact"][0] == "P9_raw_invalid_output"
     assert captured["manifest_updates"][-1][1]["status"] == "failed_parse"
+    assert captured["invoke_configs"][0] is None
+    assert captured["invoke_configs"][1]["force_fallback"] is True
 
 
 def test_p9_blocks_rejected_identity_in_inputs_output_and_records_fallback_model(monkeypatch):

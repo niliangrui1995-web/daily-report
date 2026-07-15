@@ -37,7 +37,7 @@ def test_ci_uses_pinned_actions_and_locked_install() -> None:
     assert "uv lock --check" in workflow
     assert "uv sync --locked" in workflow
     assert "uv run pytest" in workflow
-    assert "--cov-fail-under=65" in workflow
+    assert "--cov-fail-under=90" in workflow
     assert "uv run pip-audit" in workflow
     assert "detect-secrets" in workflow
     assert 'PYTHON_DOTENV_DISABLED: "1"' in workflow
@@ -49,6 +49,9 @@ def test_ci_uses_pinned_actions_and_locked_install() -> None:
     assert "if: ${{ !cancelled() }}" in workflow
     assert "uv run ruff check 每日战报 ops 亚洲寡头行情" in workflow
     assert not re.search(r"uses:\s*[^\s]+@(v\d+|main|master)\s*$", workflow, re.MULTILINE)
+
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["tool"]["coverage"]["report"]["fail_under"] == 90
 
 
 def test_dependabot_tracks_uv_lockfile() -> None:

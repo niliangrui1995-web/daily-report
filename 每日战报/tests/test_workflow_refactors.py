@@ -445,6 +445,18 @@ class TestTechnicalResume:
 
         context = {
             "resume_from": "p9_resume",
+            "ckpt": {
+                "files": {},
+                "p8_status": "skipped_no_stocks",
+                "p8_metrics": {"stocks_requested": 0, "stocks_with_data": 0},
+                "p8_assessment": {
+                    "state": "valid_empty",
+                    "reusable": True,
+                    "reason": "valid_business_empty",
+                    "stocks_requested": 0,
+                    "stocks_with_data": 0,
+                },
+            },
             "p6_mapping": "recovered P6 mapping",
             "price_data": "本次未从 P6 映射中提取到 A 股标的，技术面分析跳过。",
         }
@@ -500,12 +512,12 @@ class TestTechnicalResume:
         context = {
             "resume_from": "p9_resume",
             "p6_mapping": "recovered P6 mapping",
-            "price_data": "P8 技术面数据",
+            "price_data": "# P8 技术面数据\n\n### 源杰科技（688498）\n- 收盘 100.00 元",
         }
 
         orchestrator._stage_technical(context)
 
-        assert context["price_data"] == "P8 技术面数据"
+        assert "688498" in context["price_data"]
 
 
 class TestP9Rendering:

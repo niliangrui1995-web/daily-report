@@ -262,6 +262,7 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
             json_fname = ''
             
         lines = []
+        rendered_stock_codes = set()
         for event in data.get('events', []):
             if not isinstance(event, dict):
                 continue
@@ -278,6 +279,8 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
                 elas = target.get('elasticity', '⚡中弹性')
                 reason = target.get('reasoning', '无')
                 lines.append(f'- {name}（{code}） | {elas} | {reason}')
+                if re.fullmatch(r'\d{6}', str(code).strip()):
+                    rendered_stock_codes.add(str(code).strip())
             lines.append('')
             
         for s in data.get('optional_searches', []):
@@ -288,15 +291,55 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
                 lines.append(f'DEEP_RESEARCH: {dr}')
         report = '\n'.join(lines).strip()
         
-        stock_pattern = re.compile(r'[\u4e00-\u9fa5]{2,6}[（(]\s*\d{6}\s*[）)]')
-        stock_count = len(stock_pattern.findall(report))
-        if len(report) < 1000 or stock_count < 5:
+        stock_count = len(rendered_stock_codes)
+        valid_events = len(data.get('events', [])) if isinstance(data.get('events'), list) else 0
+        valid_targets = int(target_metrics.get('accepted_targets') or 0)
+        incomplete_reasons = []
+        if valid_events < 1 or valid_targets < 1:
+            incomplete_reasons.append('no_valid_event_targets')
+        if len(report) < 1000:
+            incomplete_reasons.append('report_too_short')
+        if stock_count < 5:
+            incomplete_reasons.append('too_few_rendered_targets')
+
+        if incomplete_reasons:
             if _retry_count < 1:
-                logging.warning(f'⚠️ [P6 映射] 渲染不完整（{len(report)} 字, {stock_count} 只标的），疑似 GPT-5.6 Sol Max 返回了压缩版，自动重试第 {_retry_count + 1} 次...')
+                logging.warning(
+                    '⚠️ [P6 映射] 输出不完整（%s 字, %s 只标的, reasons=%s），自动重试第 %s 次...',
+                    len(report),
+                    stock_count,
+                    ','.join(incomplete_reasons),
+                    _retry_count + 1,
+                )
                 time.sleep(10)
                 return generate_report(evidence_text, _retry_count=_retry_count + 1)
-            else:
-                logging.error(f'❌ [P6 映射] 连续 {_retry_count + 1} 次充当残缺渲染，已达强行放弃阈值，放行当前结果以防死循环。')
+            logging.error(
+                '❌ [P6 映射] 连续 %s 次输出不完整，拒绝放行当前结果: %s',
+                _retry_count + 1,
+                ','.join(incomplete_reasons),
+            )
+            manifest_files = {}
+            if json_fname:
+                manifest_files['json'] = json_fname
+            if thinking_fname:
+                manifest_files['thinking'] = thinking_fname
+            update_run_manifest(
+                'p6',
+                status='failed_incomplete_output',
+                files=manifest_files or None,
+                metrics={
+                    'input_chars': len(evidence_text),
+                    'output_chars': len(report),
+                    'stock_count': stock_count,
+                    'valid_events': valid_events,
+                    'valid_targets': valid_targets,
+                    'incomplete_reasons': incomplete_reasons,
+                    'retry_count': _retry_count,
+                    'model_provenance': model_provenance,
+                    **target_metrics,
+                },
+            )
+            return ''
                 
         manifest_files = {}
         if json_fname:
@@ -311,6 +354,8 @@ def generate_report(evidence_text: str, _retry_count: int = 0) -> str:
                 'input_chars': len(evidence_text),
                 'output_chars': len(report),
                 'stock_count': stock_count,
+                'valid_events': valid_events,
+                'valid_targets': valid_targets,
                 'retry_count': _retry_count,
                 'model_provenance': model_provenance,
                 **target_metrics,

@@ -489,15 +489,19 @@ def update_run_manifest(
                 str(run_ts),
                 str(manifest.get("run_timestamp") or ""),
             )
+            now_iso = datetime.now().isoformat()
             manifest["run_timestamp"] = run_ts
-            manifest["updated_at"] = datetime.now().isoformat()
+            manifest["updated_at"] = now_iso
             manifest["manifest_version"] = 3
 
             stages = manifest.setdefault("stages", {})
             stage_payload = stages.setdefault(stage, {})
+            previous_status = str(stage_payload.get("status") or "")
             stage_payload["status"] = status
-            stage_payload["updated_at"] = datetime.now().isoformat()
+            stage_payload["updated_at"] = now_iso
             stage_payload["run_timestamp"] = run_ts
+            if previous_status != status or files:
+                stage_payload["output_updated_at"] = now_iso
 
             if files:
                 stage_payload.setdefault("files", {}).update(files)

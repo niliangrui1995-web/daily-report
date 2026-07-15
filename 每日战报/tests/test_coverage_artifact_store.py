@@ -210,6 +210,30 @@ def test_clean_success_clears_transient_failure_metrics(tmp_path, monkeypatch):
     assert metrics == {"content_chars": 120}
 
 
+def test_metrics_only_bookkeeping_does_not_touch_stage_output_time(tmp_path, monkeypatch):
+    import artifact_store
+
+    monkeypatch.setattr(artifact_store, "get_today_output_dir", lambda: str(tmp_path))
+    artifact_store.update_run_manifest(
+        "p3",
+        status="completed",
+        files={"md": str(tmp_path / "p3.md")},
+        timestamp="20260715090000",
+    )
+    first = artifact_store.load_run_manifest()["stages"]["p3"]["output_updated_at"]
+
+    artifact_store.update_run_manifest(
+        "p3",
+        status="completed",
+        metrics={"roi_score": 0.5},
+        timestamp="20260715090000",
+    )
+
+    payload = artifact_store.load_run_manifest()["stages"]["p3"]
+    assert payload["output_updated_at"] == first
+    assert payload["metrics"]["roi_score"] == 0.5
+
+
 def test_artifact_store_posix_manifest_lock_helpers(monkeypatch):
     import artifact_store
 

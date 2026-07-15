@@ -421,13 +421,14 @@ def test_identity_validation_loads_manifest_when_metrics_omitted(monkeypatch):
     assert result["rejected_target_names"] == ["BadCo"]
 
 
-def test_build_context_hydrates_roi_resume_and_p7a(monkeypatch, tmp_path):
+@pytest.mark.parametrize("resume_from", ["roi_resume", "delivery_resume"])
+def test_build_context_hydrates_roi_inputs_and_p7a(monkeypatch, tmp_path, resume_from):
     files = {}
     for key in ("war_report", "p2", "p3", "p4", "p6"):
         path = tmp_path / f"{key}.md"
         path.write_text(key, encoding="utf-8-sig")
         files[key] = str(path)
-    ckpt = {"stage": "roi_resume", "files": files}
+    ckpt = {"stage": resume_from, "files": files}
     fresh = {"p7": "deep", "p75": "supplement", "p7a": "audited"}
     monkeypatch.setattr(
         orchestrator,
@@ -435,7 +436,12 @@ def test_build_context_hydrates_roi_resume_and_p7a(monkeypatch, tmp_path):
         lambda _ckpt, key, _label, **_kwargs: fresh[key],
     )
 
-    context = orchestrator._build_context(datetime(2026, 6, 23), "20260623090000", ckpt, "roi_resume")
+    context = orchestrator._build_context(
+        datetime(2026, 6, 23),
+        "20260623090000",
+        ckpt,
+        resume_from,
+    )
 
     assert context["final_report"] == "war_report"
     assert context["p2_data"] == "p2"
@@ -443,6 +449,27 @@ def test_build_context_hydrates_roi_resume_and_p7a(monkeypatch, tmp_path):
     assert context["p7_deep"] == "deep"
     assert context["p7a_audited"] == "audited"
     assert context["report_ts"] == "20260623090000"
+
+
+def test_recover_p75_checkpoint_uses_raw_passthrough(monkeypatch, tmp_path):
+    raw_path = tmp_path / "p75_raw.md"
+    raw_path.write_text("raw supplement evidence", encoding="utf-8")
+    ckpt = {
+        "files": {"p75_raw": str(raw_path)},
+        "stage_assessments": {
+            "p75": {"state": "valid_passthrough", "reusable": True}
+        },
+    }
+    monkeypatch.setattr(
+        orchestrator,
+        "_read_fresh_text_checkpoint",
+        lambda *_args, **_kwargs: pytest.fail("passthrough must not load audited output"),
+    )
+
+    supplement, raw = orchestrator._recover_p75_checkpoint(ckpt)
+
+    assert supplement == "raw supplement evidence"
+    assert raw == "raw supplement evidence"
 
 
 def test_context_hash_and_empty_persistence_short_circuits(monkeypatch):
@@ -746,7 +773,7 @@ def test_persist_p1_partial_source_failure_is_degraded(monkeypatch):
     )
 
     orchestrator._persist_p1_artifacts(
-        [{"title": "one surviving item"}],
+        [{"title": "one surviving item", "text": "HBM supply remains tight"}],
         "evidence",
         [],
         1.0,
@@ -756,13 +783,65 @@ def test_persist_p1_partial_source_failure_is_degraded(monkeypatch):
     assert updates[-1][1]["status"] == "completed_structured_degraded"
 
 
+def test_persist_p1_semantic_empty_records_are_not_saved(monkeypatch):
+    updates = []
+    monkeypatch.setattr(
+        orchestrator,
+        "write_json_artifact",
+        lambda *_args, **_kwargs: pytest.fail("semantic-empty P1 JSON must not be saved"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "write_text_artifact",
+        lambda *_args, **_kwargs: pytest.fail("semantic-empty P1 Markdown must not be saved"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "update_run_manifest",
+        lambda stage, **kwargs: updates.append((stage, kwargs)),
+    )
+
+    orchestrator._persist_p1_artifacts(
+        [{"title": "empty", "text": "暂无相关证据。"}, {"title": "missing text"}],
+        "",
+        [],
+        1.0,
+        {},
+    )
+
+    assert updates[-1][1]["status"] == "skipped_no_results"
+    assert updates[-1][1]["metrics"]["records"] == 0
+    assert updates[-1][1]["metrics"]["semantic_rejected_records"] == 2
+
+
+def test_persist_p3_nonempty_shell_with_zero_items_is_failed(monkeypatch):
+    updates = []
+    monkeypatch.setattr(
+        orchestrator,
+        "write_text_artifact",
+        lambda *_args, **_kwargs: pytest.fail("incomplete P3 Markdown must not be saved"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "update_run_manifest",
+        lambda stage, **kwargs: updates.append((stage, kwargs)),
+    )
+
+    orchestrator._persist_p3_artifacts(
+        "# P3 结构化机动情报\n\n采集时间: 2026-07-15",
+        {"status": "success", "structured_items": 0},
+    )
+
+    assert updates[-1][1]["status"] == "failed_incomplete_output"
+
+
 def test_collect_stage_counts_internal_p1_source_failures(monkeypatch):
     updates = []
     monkeypatch.setattr(
         orchestrator,
         "collect_from_rss",
         lambda _value: (
-            [{"title": "surviving item"}],
+            [{"title": "surviving item", "text": "usable RSS evidence"}],
             {"failed": [("rss-source", "down")], "success": [], "failed_urls": []},
         ),
     )
@@ -1289,6 +1368,209 @@ def test_research_resume_reuses_both_optional_layers(monkeypatch):
 
     assert context["p7_deep"] == "saved deep"
     assert context["p75_supplement"] == "saved supplement"
+
+
+def test_research_resume_does_not_rerun_valid_empty_optional_layers(monkeypatch):
+    plan = {
+        "goal": "goal",
+        "triggers": [],
+        "supplement_queries": ["query"],
+        "should_run_p7": True,
+        "should_run_p75": True,
+    }
+    monkeypatch.setattr(orchestrator, "build_research_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(orchestrator, "write_json_artifact", lambda *_args: "plan.json")
+    monkeypatch.setattr(orchestrator, "_context_p6_input_sha256", lambda _context: "")
+    monkeypatch.setattr(
+        orchestrator,
+        "run_deep_research",
+        lambda _plan: pytest.fail("valid-empty P7 checkpoint must not be rerun"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "gemini_search",
+        lambda *_args: pytest.fail("valid-empty P7.5 checkpoint must not be rerun"),
+    )
+    context = _research_context(
+        resume_from="p8_resume",
+        ckpt={
+            "files": {"p6": "p6.md"},
+            "p6_metrics": {},
+            "stage_assessments": {
+                "p7": {"state": "valid_empty", "reusable": True},
+                "p75": {"state": "valid_empty", "reusable": True},
+            },
+        },
+    )
+
+    orchestrator._stage_research(context)
+
+    assert context["p7_deep"] == ""
+    assert context["p75_supplement"] == ""
+
+
+def test_research_new_p6_hash_clears_untriggered_stale_optional_layers(monkeypatch):
+    plan = {
+        "goal": "goal",
+        "triggers": [],
+        "supplement_queries": [],
+        "should_run_p7": False,
+        "should_run_p75": False,
+    }
+    monkeypatch.setattr(orchestrator, "build_research_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(orchestrator, "write_json_artifact", lambda *_args: "plan.json")
+    monkeypatch.setattr(orchestrator, "_context_p6_input_sha256", lambda _context: "new-hash")
+    monkeypatch.setattr(
+        orchestrator,
+        "run_deep_research",
+        lambda _plan: pytest.fail("the new plan must not run P7"),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "gemini_search",
+        lambda *_args: pytest.fail("the new plan must not run P7.5"),
+    )
+    updates = []
+    monkeypatch.setattr(
+        orchestrator,
+        "update_run_manifest",
+        lambda stage, **kwargs: updates.append((stage, kwargs)),
+    )
+    context = _research_context(
+        resume_from="p6",
+        ckpt={
+            "files": {"p6": "p6.md"},
+            "p6_metrics": {},
+            "p6_input_sha256": {
+                "p7": "old-hash",
+                "p7a": "old-hash",
+                "p75": "old-hash",
+            },
+            "stage_assessments": {
+                stage: {
+                    "status": "completed",
+                    "state": "invalid",
+                    "reusable": False,
+                    "reason": "stale_p6_input_hash",
+                }
+                for stage in ("p7", "p7a", "p75")
+            },
+        },
+    )
+
+    orchestrator._stage_research(context)
+
+    refreshed = {
+        stage: payload
+        for stage, payload in updates
+        if stage in {"p7", "p7a", "p75"}
+    }
+    assert set(refreshed) == {"p7", "p7a", "p75"}
+    for payload in refreshed.values():
+        assert payload["status"] == "skipped_not_triggered"
+        assert payload["metrics"]["data_state"] == "valid_empty"
+        assert payload["metrics"]["p6_input_sha256"] == "new-hash"
+
+
+def test_research_resume_does_not_rerun_valid_empty_p7a(monkeypatch):
+    plan = {
+        "goal": "goal",
+        "triggers": [],
+        "supplement_queries": [],
+        "should_run_p7": False,
+        "should_run_p75": False,
+    }
+    monkeypatch.setattr(orchestrator, "build_research_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(orchestrator, "write_json_artifact", lambda *_args: "plan.json")
+    monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *_args: "p7.md")
+    monkeypatch.setattr(orchestrator, "_context_p6_input_sha256", lambda _context: "")
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "p7a_deep_research_audit",
+        lambda *_args, **_kwargs: pytest.fail("valid-empty P7a checkpoint must not be rerun"),
+    )
+    context = _research_context(
+        resume_from="p8_resume",
+        p7_deep="research evidence " * 20,
+        ckpt={
+            "files": {"p6": "p6.md", "p7": "p7.md"},
+            "p6_metrics": {},
+            "stage_assessments": {
+                "p7": {"state": "valid", "reusable": True},
+                "p7a": {"state": "valid_empty", "reusable": True},
+            },
+        },
+    )
+
+    orchestrator._stage_research(context)
+
+    assert context["p7a_audited"] == ""
+
+
+def test_research_resume_reuses_short_p7a_passthrough(monkeypatch):
+    plan = {
+        "goal": "goal",
+        "triggers": [],
+        "supplement_queries": [],
+        "should_run_p7": False,
+        "should_run_p75": False,
+    }
+    monkeypatch.setattr(orchestrator, "build_research_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(orchestrator, "write_json_artifact", lambda *_args: "plan.json")
+    monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *_args: "p7.md")
+    monkeypatch.setattr(orchestrator, "_context_p6_input_sha256", lambda _context: "hash")
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "p7a_deep_research_audit",
+        lambda *_args, **_kwargs: pytest.fail("short P7a passthrough must not be rerun"),
+    )
+    raw_research = "short research"
+    context = _research_context(
+        resume_from="p8_resume",
+        p7_deep=raw_research,
+        ckpt={
+            "files": {"p6": "p6.md", "p7": "p7.md"},
+            "p6_metrics": {},
+            "stage_assessments": {
+                "p7": {"state": "valid", "reusable": True},
+                "p7a": {"state": "valid_passthrough", "reusable": True},
+            },
+        },
+    )
+
+    orchestrator._stage_research(context)
+
+    assert context["p7a_audited"] == raw_research
+
+
+def test_research_short_input_records_passthrough_checkpoint(monkeypatch):
+    plan = {
+        "goal": "goal",
+        "triggers": [],
+        "supplement_queries": [],
+        "should_run_p7": False,
+        "should_run_p75": False,
+    }
+    updates = []
+    monkeypatch.setattr(orchestrator, "build_research_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(orchestrator, "write_json_artifact", lambda *_args: "plan.json")
+    monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *_args: "p7.md")
+    monkeypatch.setattr(orchestrator, "_context_p6_input_sha256", lambda _context: "hash")
+    monkeypatch.setattr(
+        orchestrator,
+        "update_run_manifest",
+        lambda stage, **kwargs: updates.append((stage, kwargs)),
+    )
+    context = _research_context(p7_deep="short research")
+
+    orchestrator._stage_research(context)
+
+    p7a_update = next(payload for stage, payload in updates if stage == "p7a")
+    assert p7a_update["status"] == "skipped_short_input"
+    assert p7a_update["metrics"]["data_state"] == "valid_passthrough"
+    assert p7a_update["metrics"]["p6_input_sha256"] == "hash"
 
 
 def test_research_long_audit_without_p6_hash_skips_running_manifest(monkeypatch):

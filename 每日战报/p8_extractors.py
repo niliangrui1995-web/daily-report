@@ -7,6 +7,7 @@ import os
 import re
 import struct
 
+from p6_target_parser import extract_p6_targets
 from tdx_stock_universe import resolve_tdx_root
 
 
@@ -58,12 +59,12 @@ def resolve_tdx_market_and_path(vipdoc: str, code: str):
 
 
 def extract_stocks_from_report(report: str):
+    stocks = {code: name for name, code in extract_p6_targets(report)}
     patterns = [
         r'([\u4e00-\u9fa5]{2,6})[（\(]\s*(\d{6})\s*[）\)]',
         r'([\u4e00-\u9fa5]{2,6})\s+(\d{6})',
         r'\|\s*([\u4e00-\u9fa5]{2,6})\s*\|\s*(\d{6})\s*\|',
     ]
-    stocks = {}
     for pattern in patterns:
         for match in re.finditer(pattern, report):
             name, code = match.group(1), match.group(2)
@@ -81,6 +82,11 @@ def extract_stock_tracks(report: str):
             current_track = track_match.group(1).strip()
             continue
         if current_track:
+            parsed_targets = extract_p6_targets(line)
+            if parsed_targets:
+                for _name, code in parsed_targets:
+                    track_map[code] = current_track
+                continue
             stock_match = re.search(r'[\u4e00-\u9fa5]{2,6}[（\(]\s*(\d{6})\s*[）\)]', line)
             if stock_match:
                 track_map[stock_match.group(1)] = current_track

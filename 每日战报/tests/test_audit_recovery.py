@@ -247,3 +247,78 @@ def test_p7a_canonicalizes_known_alias_in_json_and_markdown(monkeypatch):
     assert "宏和科技" in str(json_artifacts[-1])
     assert "国际复材" in str(json_artifacts[-1])
     assert manifest_updates[-1][1]["metrics"]["rejected_identity_items_removed"] == 0
+
+
+def _install_p7a_semantic_stubs(monkeypatch, audit_engine, raw_content: str):
+    updates = []
+    text_artifacts = []
+    monkeypatch.setattr(audit_engine, "require_prompt", lambda _name: "{raw_deep_research}")
+    monkeypatch.setattr(
+        audit_engine,
+        "_invoke_audit_with_fallback",
+        lambda *_args, **_kwargs: (
+            SimpleNamespace(content=raw_content, thinking_content=""),
+            SimpleNamespace(last_error_category="", last_error_message=""),
+            {},
+        ),
+    )
+    monkeypatch.setattr(audit_engine, "write_json_artifact", lambda *args, **kwargs: "p7a.json")
+    monkeypatch.setattr(
+        audit_engine,
+        "write_text_artifact",
+        lambda prefix, content, **kwargs: text_artifacts.append((prefix, content)) or "p7a.md",
+    )
+    monkeypatch.setattr(
+        audit_engine,
+        "update_run_manifest",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+    return updates, text_artifacts
+
+
+def test_p7a_rejects_json_with_empty_markdown_section(monkeypatch):
+    import audit_engine
+
+    raw_content = '{"topics": [], "summary": "' + ("x" * 120) + '"}\n===MARKDOWN===\n'
+    updates, text_artifacts = _install_p7a_semantic_stubs(monkeypatch, audit_engine, raw_content)
+    raw_input = "deep research input " * 20
+
+    result = audit_engine.p7a_deep_research_audit(raw_input)
+
+    assert result == raw_input
+    assert updates[-1][1]["status"] == "failed_semantic_output"
+    assert updates[-1][1]["metrics"]["semantic_error"] == "empty_markdown_output"
+    assert text_artifacts == []
+
+
+def test_p7a_rejects_json_only_response_as_markdown(monkeypatch):
+    import audit_engine
+
+    raw_content = '{"topics": [], "summary": "' + ("x" * 120) + '"}'
+    updates, text_artifacts = _install_p7a_semantic_stubs(monkeypatch, audit_engine, raw_content)
+    raw_input = "deep research input " * 20
+
+    result = audit_engine.p7a_deep_research_audit(raw_input)
+
+    assert result == raw_input
+    assert updates[-1][1]["status"] == "failed_semantic_output"
+    assert updates[-1][1]["metrics"]["semantic_error"] == "json_without_markdown"
+    assert text_artifacts == []
+
+
+def test_p7a_no_evidence_markdown_is_valid_empty(monkeypatch):
+    import audit_engine
+
+    raw_content = (
+        '{"topics": [], "summary": "'
+        + ("x" * 120)
+        + '"}\n===MARKDOWN===\n未找到相关证据。'
+    )
+    updates, text_artifacts = _install_p7a_semantic_stubs(monkeypatch, audit_engine, raw_content)
+
+    result = audit_engine.p7a_deep_research_audit("deep research input " * 20)
+
+    assert result == ""
+    assert updates[-1][1]["status"] == "completed_no_results"
+    assert updates[-1][1]["metrics"]["data_state"] == "valid_empty"
+    assert text_artifacts == []

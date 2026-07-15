@@ -629,6 +629,55 @@ outside
     assert p2_x_intel._filter_x_leak_blocks("plain text", set()) == ""
 
 
+def test_filter_x_leak_blocks_rejects_semantic_empty_blocks():
+    content = """
+<x_leaks></x_leaks>
+<x_leaks>No relevant evidence found.</x_leaks>
+<x_leaks>HBM supply tightened at a named supplier.</x_leaks>
+"""
+
+    filtered = p2_x_intel._filter_x_leak_blocks(content, set())
+
+    assert "HBM supply tightened" in filtered
+    assert "No relevant evidence" not in filtered
+    assert filtered.count("<x_leaks>") == 1
+
+
+def test_collect_from_x_explicit_no_results_is_a_business_empty(monkeypatch):
+    manifests = _configure_p2(monkeypatch)
+    payload = {
+        "output": [
+            {
+                "role": "assistant",
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "<x_leaks>No relevant evidence found.</x_leaks>",
+                    }
+                ],
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        p2_x_intel.requests,
+        "post",
+        lambda *_args, **_kwargs: FakeResponse(payload=payload),
+    )
+
+    content, stats = p2_x_intel.collect_from_x(
+        max_retries=1,
+        max_total_seconds=1000,
+    )
+
+    assert content == ""
+    assert stats["status"] == "completed_no_results"
+    assert stats["provider_successful_chunks"] == 1
+    assert stats["semantic_empty_chunks"] == 1
+    assert stats["data_state"] == "valid_empty"
+    assert manifests[-1][1]["status"] == "completed_no_results"
+
+
 def _configure_p2(monkeypatch, *, keywords=None, reasoning="high"):
     manifests = []
     monkeypatch.setattr(p2_x_intel, "GROK_API_KEY", "test-key")
@@ -1149,9 +1198,12 @@ def test_fetch_vanguard_inline_market_branches_retries_and_artifact(monkeypatch)
     assert history_calls["RETRY"] == history_calls["FAIL"] == 2
     assert {name for name, _change in signals} == {"Super", "Retry"}
     assert artifacts[0][0] == "P4_核心行情" and report in artifacts[0][1]
-    assert manifests[-1][1]["status"] == "completed"
+    assert manifests[-1][1]["status"] == "completed_structured_degraded"
     assert manifests[-1][1]["files"] == {"md": "p4.md"}
     assert manifests[-1][1]["metrics"]["tickers"] == 7
+    assert manifests[-1][1]["metrics"]["usable_tickers"] == 2
+    assert manifests[-1][1]["metrics"]["no_data_tickers"] == 3
+    assert manifests[-1][1]["metrics"]["failed_tickers"] == 2
     assert "CURL_CA_BUNDLE" not in p4_vanguard.os.environ
 
 

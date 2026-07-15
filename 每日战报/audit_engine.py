@@ -20,6 +20,7 @@ from datetime import datetime
 
 from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
 from settings import get_audit_fallback_adapter, pro_adapter, require_prompt
+from semantic_output import is_no_evidence_text
 from industry_dict import ALL_OLIGARCHS_FLAT
 from tdx_stock_universe import (
     build_rejected_stock_guardrail,
@@ -38,6 +39,64 @@ STRICT OUTPUT LIMITS FOR MACHINE PARSING:
 - Keep deleted to at most 30 representative items; summary.deleted may still count all removed items.
 - If content is too long, prefer fewer items over invalid or truncated JSON.
 """
+
+
+class _AuditSemanticError(ValueError):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _audit_count(value, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _AuditSemanticError(f'invalid_{field_name}_count')
+    return value
+
+
+def _validate_audit_payload(data: dict, *, allow_empty: bool = False) -> dict:
+    if not isinstance(data, dict):
+        raise _AuditSemanticError('audit_payload_not_object')
+
+    summary = data.get('summary')
+    if not isinstance(summary, dict):
+        raise _AuditSemanticError('missing_summary')
+
+    passed_count = _audit_count(summary.get('passed'), 'passed')
+    deleted_count = _audit_count(summary.get('deleted'), 'deleted')
+
+    collections = {}
+    for field_name in ('high_trust', 'medium_trust', 'deleted'):
+        value = data.get(field_name)
+        if not isinstance(value, list):
+            raise _AuditSemanticError(f'invalid_{field_name}_collection')
+        collections[field_name] = [
+            item
+            for item in value
+            if not (isinstance(item, str) and is_no_evidence_text(item))
+        ]
+
+    high_trust = collections['high_trust']
+    medium_trust = collections['medium_trust']
+    deleted_items = collections['deleted']
+    if passed_count != len(high_trust) + len(medium_trust):
+        raise _AuditSemanticError('passed_count_mismatch')
+    if deleted_count < len(deleted_items):
+        raise _AuditSemanticError('deleted_count_mismatch')
+    if deleted_count > 0 and not deleted_items:
+        raise _AuditSemanticError('deleted_count_without_items')
+    if deleted_count == 0 and deleted_items:
+        raise _AuditSemanticError('deleted_items_without_count')
+    if passed_count == 0 and deleted_count == 0 and not allow_empty:
+        raise _AuditSemanticError('empty_audit_payload')
+
+    return {
+        'passed_count': passed_count,
+        'deleted_count': deleted_count,
+        'high_trust': high_trust,
+        'medium_trust': medium_trust,
+        'deleted_items': deleted_items,
+        'no_results': passed_count == 0,
+    }
 
 
 def _adapter_error(adapter) -> str:
@@ -187,17 +246,18 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
 
     try:
         data = extract_json_from_llm_response(raw_content, expect_type='dict', allow_partial=True)
+        audit_state = _validate_audit_payload(data, allow_empty=audit_type != 'p5')
         json_path = write_json_artifact(file_prefix, data)
         logging.info(f'💾 [{layer_name} 审计] 完美架构 JSON 数据已落盘: {json_path}')
 
         clean_lines = []
-        summary = data.get('summary', {})
+        summary = data['summary']
         clean_lines.append('## 审计摘要')
         clean_lines.append(f"通过: {summary.get('passed', 0)}条 / 删除: {summary.get('deleted', 0)}条")
         clean_lines.append('')
 
         clean_lines.append('## 🟢 高可信情报')
-        high_trust = data.get('high_trust', [])
+        high_trust = audit_state['high_trust']
         if high_trust:
             clean_lines.extend(high_trust)
         else:
@@ -205,7 +265,7 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
 
         clean_lines.append('')
         clean_lines.append('## 🟡 中可信情报')
-        medium_trust = data.get('medium_trust', [])
+        medium_trust = audit_state['medium_trust']
         if medium_trust:
             clean_lines.extend(medium_trust)
         else:
@@ -215,7 +275,7 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
 
         deleted_lines = []
         deleted_lines.append('## 🔴 删除清单（不传给 GPT-5.6 Sol Max，仅记录）')
-        deleted = data.get('deleted', [])
+        deleted = audit_state['deleted_items']
         if deleted:
             for d in deleted:
                 if isinstance(d, dict):
@@ -228,25 +288,68 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
             deleted_lines.append('无')
 
         deleted_log = '\n'.join(deleted_lines).strip()
-        full_text = clean_text + '\n\n' + deleted_log
 
-        md_path = write_text_artifact(file_prefix, full_text)
+        # Downstream recovery must load exactly the same audited body returned
+        # during the first run.  Keep rejected evidence in a separate
+        # diagnostic artifact so a P6/P9 resume cannot feed it back in.
+        md_path = write_text_artifact(file_prefix, clean_text)
+        deleted_path = ''
+        if deleted:
+            try:
+                deleted_path = write_text_artifact(f'{file_prefix}删除清单', deleted_log)
+            except Exception as write_exc:
+                logging.warning(f'[{layer_name} 审计] 删除清单落盘失败: {write_exc}')
+        manifest_files = {'md': md_path, 'json': json_path}
+        if deleted_path:
+            manifest_files['deleted'] = deleted_path
         update_run_manifest(
             stage_key,
-            status='completed',
-            files={'md': md_path, 'json': json_path},
+            status='completed_no_results' if audit_state['no_results'] else 'completed',
+            files=manifest_files,
             metrics={
                 'input_chars': len(raw_data),
                 'output_chars': len(clean_text),
                 'raw_output_chars': len(raw_content),
                 'elapsed_seconds': round(elapsed, 1),
                 'retry_count': _retry_count,
+                'passed_count': audit_state['passed_count'],
+                'high_trust_count': len(high_trust),
+                'medium_trust_count': len(medium_trust),
+                'deleted_count': audit_state['deleted_count'],
+                'deleted_items_count': len(deleted),
+                'data_state': 'valid_empty' if audit_state['no_results'] else 'valid',
                 **fallback_metrics,
             },
         )
 
         logging.info(f'✅ [{layer_name} 审计] 成功解析 JSON 并逆向渲染为 MarkDown ({elapsed:.1f}s)')
-        return clean_text
+        return '' if audit_state['no_results'] else clean_text
+
+    except _AuditSemanticError as e:
+        raw_path = ''
+        try:
+            raw_path = write_text_artifact(
+                f'{file_prefix}_RAW_SEMANTIC_INVALID',
+                raw_content,
+            )
+        except Exception as write_exc:
+            logging.warning(f'[{layer_name} audit] failed to save semantically invalid raw output: {write_exc}')
+        logging.error(f'❌ [{layer_name} 审计] 结构化输出语义校验失败: {e.reason}')
+        update_run_manifest(
+            stage_key,
+            status='failed_semantic_output',
+            files={'raw': raw_path} if raw_path else None,
+            metrics={
+                'input_chars': len(raw_data),
+                'raw_output_chars': len(raw_content),
+                'elapsed_seconds': round(elapsed, 1),
+                'retry_count': _retry_count,
+                'semantic_error': e.reason,
+                'data_state': 'invalid',
+                **fallback_metrics,
+            },
+        )
+        return ''
 
     except json.JSONDecodeError as e:
         raw_path = ''
@@ -387,8 +490,9 @@ def p7a_deep_research_audit(
     markdown_text = raw_content  # 默认整体作为 Markdown（降级兜底）
     structured_degraded = False
     degrade_reason = ""
+    has_markdown_separator = '===MARKDOWN===' in raw_content
 
-    if '===MARKDOWN===' in raw_content:
+    if has_markdown_separator:
         parts = raw_content.split('===MARKDOWN===', 1)
         json_part = parts[0].strip()
         markdown_part = parts[1].strip() if len(parts) > 1 else ''
@@ -415,8 +519,7 @@ def p7a_deep_research_audit(
                 'raw_json_attempt': json_part[:2000],
             }
 
-        if markdown_part:
-            markdown_text = markdown_part
+        markdown_text = markdown_part
     else:
         logging.warning('[P7a 审计] 响应中未找到 ===MARKDOWN=== 分隔符，整体作为 Markdown 处理')
         structured_degraded = True
@@ -450,6 +553,52 @@ def p7a_deep_research_audit(
             logging.info(f'💾 [P7a 审计] JSON 数据已落盘: {json_path}')
         except Exception as e:
             logging.warning(f'⚠️ [P7a 审计] JSON 落盘失败: {e}')
+
+    normalized_markdown = markdown_text.strip()
+    filtered_to_empty = bool(not normalized_markdown and output_identity_lines_removed)
+    semantic_no_results = bool(
+        filtered_to_empty
+        or (normalized_markdown and is_no_evidence_text(normalized_markdown))
+    )
+    looks_like_json_only = bool(
+        not has_markdown_separator
+        and normalized_markdown.startswith(('{', '['))
+        and normalized_markdown.endswith(('}', ']'))
+    )
+    if semantic_no_results:
+        update_run_manifest(
+            'p7a',
+            status='completed_no_results',
+            files={'json': json_path} if json_path else None,
+            metrics={
+                'input_chars': len(raw_deep_research),
+                'output_chars': 0,
+                'data_state': 'valid_empty',
+                'rejected_target_names': rejected_names,
+                'rejected_identity_items_removed': rejected_identity_items_removed,
+                **fallback_metrics,
+            },
+        )
+        logging.info('[P7a 审计] 审计后无可用证据，记录合法空结果')
+        return ''
+    if not normalized_markdown or looks_like_json_only:
+        reason = 'json_without_markdown' if looks_like_json_only else 'empty_markdown_output'
+        update_run_manifest(
+            'p7a',
+            status='failed_semantic_output',
+            files={'json': json_path} if json_path else None,
+            metrics={
+                'input_chars': len(raw_deep_research),
+                'output_chars': 0,
+                'data_state': 'invalid',
+                'semantic_error': reason,
+                'rejected_target_names': rejected_names,
+                'rejected_identity_items_removed': rejected_identity_items_removed,
+                **fallback_metrics,
+            },
+        )
+        logging.warning('[P7a 审计] %s，当前运行降级透传原始 P7', reason)
+        return raw_deep_research
 
     md_body = (
         '# P7a 深度研究审计报告\n\n'

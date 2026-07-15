@@ -16,6 +16,7 @@ from artifact_store import (
 )
 from p9_email import send_report_via_email
 from p9_rendering import build_report_markdown
+from semantic_output import is_no_evidence_text
 from settings import EMAIL_ADDRESS, EMAIL_PASSWORD, OPUS_MODEL, RECEIVER_EMAIL, opus_adapter, require_prompt
 from native_llm_adapter import get_model_provenance
 from tdx_stock_universe import (
@@ -118,6 +119,159 @@ class _P9ReportPayload(_ReportModel):
     fund_pathway: list[_ListText] = Field(max_length=3)
     today_advice: list[_TodayAdvice] = Field(max_length=8)
     risk_warning: list[_ListText] = Field(max_length=5)
+
+
+_P9_REPORT_OUTCOME_METRIC_KEYS = (
+    "report_outcome",
+    "signals_count",
+    "sniper_tables_count",
+    "targets_count",
+    "advice_count",
+    "fund_pathways_count",
+    "risk_warnings_count",
+    "x_intel_count",
+    "p3_intel_count",
+    "actionable_items_count",
+    "nonempty_sections_count",
+    "semantic_placeholder_items_removed",
+    "semantic_empty_sniper_tables_removed",
+)
+
+
+def _is_semantic_placeholder(value: Any) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip()
+    if not text:
+        return True
+    return (
+        text in _MISSING_FIELD_VALUES
+        or text.casefold() in {"n/a", "na", "none", "null"}
+        or is_no_evidence_text(text)
+    )
+
+
+def _sanitize_semantic_empty_report_payload(data: dict[str, Any]) -> dict[str, int]:
+    """Remove schema-valid objects whose business content is only a no-evidence sentinel."""
+    metrics = {
+        "semantic_placeholder_items_removed": 0,
+        "semantic_empty_sniper_tables_removed": 0,
+    }
+
+    for section in ("x_intel_snipe", "p3_machine_intel", "core_signals"):
+        accepted_items = []
+        for item in data.get(section, []) or []:
+            body = item.get("body") if isinstance(item, dict) else item
+            if _is_semantic_placeholder(body):
+                metrics["semantic_placeholder_items_removed"] += 1
+                continue
+            accepted_items.append(item)
+        data[section] = accepted_items
+
+    accepted_tables = []
+    for table in data.get("sniper_tables", []) or []:
+        if not isinstance(table, dict):
+            metrics["semantic_placeholder_items_removed"] += 1
+            continue
+        accepted_targets = []
+        for target in table.get("targets", []) or []:
+            name = target.get("name") if isinstance(target, dict) else target
+            if _is_semantic_placeholder(name):
+                metrics["semantic_placeholder_items_removed"] += 1
+                continue
+            accepted_targets.append(target)
+        if not accepted_targets:
+            metrics["semantic_empty_sniper_tables_removed"] += 1
+            continue
+        table["targets"] = accepted_targets
+        accepted_tables.append(table)
+    data["sniper_tables"] = accepted_tables
+
+    accepted_advice = []
+    for item in data.get("today_advice", []) or []:
+        if not isinstance(item, dict):
+            metrics["semantic_placeholder_items_removed"] += 1
+            continue
+        if _is_semantic_placeholder(item.get("name")) or all(
+            _is_semantic_placeholder(item.get(field))
+            for field in ("reason", "strategy")
+        ):
+            metrics["semantic_placeholder_items_removed"] += 1
+            continue
+        accepted_advice.append(item)
+    data["today_advice"] = accepted_advice
+
+    for section in ("fund_pathway", "risk_warning"):
+        accepted_strings = [
+            item
+            for item in data.get(section, []) or []
+            if not _is_semantic_placeholder(item)
+        ]
+        metrics["semantic_placeholder_items_removed"] += len(data.get(section, []) or []) - len(accepted_strings)
+        data[section] = accepted_strings
+
+    for section in ("core_signals", "today_advice"):
+        for item in data.get(section, []) or []:
+            evidence_refs = item.get("evidence_refs", []) if isinstance(item, dict) else []
+            cleaned_refs = [ref for ref in evidence_refs if not _is_semantic_placeholder(ref)]
+            metrics["semantic_placeholder_items_removed"] += len(evidence_refs) - len(cleaned_refs)
+            item["evidence_refs"] = cleaned_refs
+
+    return metrics
+
+
+def _report_outcome_metrics(data: dict[str, Any]) -> dict[str, int | str]:
+    def list_count(value: Any) -> int:
+        return len(value) if isinstance(value, list) else 0
+
+    sniper_tables = data.get("sniper_tables")
+    targets_count = sum(
+        list_count(table.get("targets"))
+        for table in sniper_tables
+        if isinstance(table, dict)
+    ) if isinstance(sniper_tables, list) else 0
+    section_counts = {
+        "signals": list_count(data.get("core_signals")),
+        "targets": targets_count,
+        "advice": list_count(data.get("today_advice")),
+        "fund_pathways": list_count(data.get("fund_pathway")),
+        "risk_warnings": list_count(data.get("risk_warning")),
+        "x_intel": list_count(data.get("x_intel_snipe")),
+        "p3_intel": list_count(data.get("p3_machine_intel")),
+    }
+    actionable_items_count = (
+        section_counts["signals"]
+        + section_counts["targets"]
+        + section_counts["advice"]
+    )
+    return {
+        "report_outcome": "actionable" if actionable_items_count else "completed_no_actionable_signals",
+        "signals_count": section_counts["signals"],
+        "sniper_tables_count": list_count(sniper_tables),
+        "targets_count": section_counts["targets"],
+        "advice_count": section_counts["advice"],
+        "fund_pathways_count": section_counts["fund_pathways"],
+        "risk_warnings_count": section_counts["risk_warnings"],
+        "x_intel_count": section_counts["x_intel"],
+        "p3_intel_count": section_counts["p3_intel"],
+        "actionable_items_count": actionable_items_count,
+        "nonempty_sections_count": sum(count > 0 for count in section_counts.values()),
+    }
+
+
+def _load_persisted_report_outcome_metrics() -> dict[str, Any]:
+    try:
+        metrics = load_run_manifest().get("stages", {}).get("p9", {}).get("metrics", {})
+    except Exception as exc:
+        logging.warning("[P9] failed to load persisted report outcome metrics: %s", exc)
+        return {}
+    if not isinstance(metrics, dict):
+        return {}
+    return {
+        key: metrics[key]
+        for key in _P9_REPORT_OUTCOME_METRIC_KEYS
+        if key in metrics
+    }
 
 
 def _parse_report_payload(raw_content: str) -> dict[str, Any]:
@@ -807,6 +961,10 @@ def p9_risk_analysis(
         p8_backfill_metrics = _backfill_sniper_tables_from_p8(data)
         if p8_backfill_metrics.get("p8_backfilled_targets"):
             logging.info("[P9] backfilled sniper table fields from P8: %s", p8_backfill_metrics)
+        semantic_metrics = _sanitize_semantic_empty_report_payload(data)
+        if any(semantic_metrics.values()):
+            logging.warning("[P9] removed semantic placeholder output: %s", semantic_metrics)
+        report_outcome_metrics = _report_outcome_metrics(data)
         result = normalize_common_text_mojibake(build_report_markdown(data, today_str))
         logging.info("[P9] rendered markdown report (%s chars)", len(result))
 
@@ -828,6 +986,8 @@ def p9_risk_analysis(
                     **code_metrics,
                     **soft_intel_metrics,
                     **p8_backfill_metrics,
+                    **semantic_metrics,
+                    **report_outcome_metrics,
                 },
             )
         except Exception as exc:
@@ -845,6 +1005,8 @@ def p9_risk_analysis(
                     **code_metrics,
                     **soft_intel_metrics,
                     **p8_backfill_metrics,
+                    **semantic_metrics,
+                    **report_outcome_metrics,
                 },
             )
 
@@ -925,10 +1087,15 @@ def send_report_email(
     file_ts = now_str or get_run_timestamp()
     credentials_available = bool(EMAIL_ADDRESS and EMAIL_PASSWORD and RECEIVER_EMAIL)
     email_configured = credentials_available if email_required is not False else False
+    report_outcome_metrics = _load_persisted_report_outcome_metrics()
+
+    def delivery_metrics(**metrics: Any) -> dict[str, Any]:
+        return {**report_outcome_metrics, **metrics}
+
     update_run_manifest(
         "p9",
         status="report_save_in_progress",
-        metrics={"email_configured": email_configured, "email_sent": False},
+        metrics=delivery_metrics(email_configured=email_configured, email_sent=False),
     )
     try:
         fname = write_text_artifact("战报", content, timestamp=file_ts)
@@ -936,14 +1103,14 @@ def send_report_email(
     except Exception as exc:
         logging.error("[P9] failed to save report markdown: %s", exc)
         status = "failed_md_write"
-        update_run_manifest("p9", status=status, metrics={"error": str(exc)})
+        update_run_manifest("p9", status=status, metrics=delivery_metrics(error=str(exc)))
         return {"ok": False, "status": status, "report_path": "", "email_sent": False}
 
     update_run_manifest(
         "p9",
         status="report_saved_pending_delivery",
         files={"md": fname},
-        metrics={"email_configured": email_configured, "email_sent": False},
+        metrics=delivery_metrics(email_configured=email_configured, email_sent=False),
     )
 
     if email_required is True and not credentials_available:
@@ -953,7 +1120,7 @@ def send_report_email(
             "p9",
             status=status,
             files={"md": fname},
-            metrics={"email_configured": True, "email_sent": False},
+            metrics=delivery_metrics(email_configured=True, email_sent=False),
         )
         return {"ok": False, "status": status, "report_path": fname, "email_sent": False}
 
@@ -964,7 +1131,7 @@ def send_report_email(
             "p9",
             status=status,
             files={"md": fname},
-            metrics={"email_configured": False},
+            metrics=delivery_metrics(email_configured=False, email_sent=False),
         )
         return {"ok": True, "status": status, "report_path": fname, "email_sent": False}
 
@@ -984,7 +1151,7 @@ def send_report_email(
             "p9",
             status=status,
             files={"md": fname},
-            metrics={"email_configured": True, "email_sent": True},
+            metrics=delivery_metrics(email_configured=True, email_sent=True),
         )
         return {"ok": True, "status": status, "report_path": fname, "email_sent": True}
     except Exception as exc:
@@ -994,6 +1161,6 @@ def send_report_email(
             "p9",
             status=status,
             files={"md": fname},
-            metrics={"email_configured": True, "email_sent": False, "error": str(exc)},
+            metrics=delivery_metrics(email_configured=True, email_sent=False, error=str(exc)),
         )
         return {"ok": False, "status": status, "report_path": fname, "email_sent": False}

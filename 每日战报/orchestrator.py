@@ -32,6 +32,8 @@ from artifact_store import (
 )
 from checkpoint import (
     P6_HASHED_RESEARCH_STAGES,
+    VALID_EMPTY_STATUSES,
+    assess_p8_checkpoint,
     compute_file_sha256,
     detect_checkpoint,
     is_older_than_any,
@@ -63,6 +65,7 @@ from p8_technical import (
 )
 from p9_reporter import p9_risk_analysis, send_report_email
 from search_engine import gemini_search
+from semantic_output import has_meaningful_semantic_text, is_no_evidence_text
 from tdx_stock_universe import IDENTITY_VALIDATION_VERSION, normalize_rejected_stock_names
 
 CONTROL_STAGE_START = {
@@ -71,6 +74,7 @@ CONTROL_STAGE_START = {
     "intel_resume": "collect_intel",
     "p2_resume": "recover_p2",
     "p5": "audit_evidence",
+    "p5_resume": "audit_evidence",
     "p6_resume": "market_mapping",
     "p6": "market_mapping",
     "p8_resume": "market_mapping",
@@ -125,6 +129,9 @@ def _recover_p2_p3_from_checkpoint(ckpt: dict) -> tuple[str, str]:
 def _read_text_checkpoint(path: str, label: str) -> str:
     if not path:
         return ""
+    if not str(path).lower().endswith(".md"):
+        logging.warning("%s checkpoint is not Markdown; ignoring it: %s", label, path)
+        return ""
     try:
         with open(path, "r", encoding=UTF8_FILE_ENCODING) as f:
             data = f.read()
@@ -174,8 +181,121 @@ def _read_fresh_text_checkpoint(
     return _read_text_checkpoint(ckpt.get("files", {}).get(file_key, ""), label)
 
 
+def _recover_p75_checkpoint(ckpt: dict) -> tuple[str, str]:
+    assessments = ckpt.get("stage_assessments", {})
+    p75_assessment = assessments.get("p75", {}) if isinstance(assessments, dict) else {}
+    if (
+        isinstance(p75_assessment, dict)
+        and p75_assessment.get("state") == "valid_empty"
+    ):
+        return "", ""
+    if (
+        isinstance(p75_assessment, dict)
+        and p75_assessment.get("state") == "valid_passthrough"
+    ):
+        raw_text = _read_text_checkpoint(
+            ckpt.get("files", {}).get("p75_raw", ""),
+            "P7.5 raw passthrough",
+        )
+        return raw_text, raw_text
+    audited_text = _read_fresh_text_checkpoint(
+        ckpt,
+        "p75",
+        "P7.5 supplement",
+        upstream_keys=("p6",),
+    )
+    return audited_text, ""
+
+
+def _recover_p5_checkpoint(ckpt: dict, label: str = "P5 audit") -> str:
+    assessments = ckpt.get("stage_assessments", {})
+    p5_assessment = assessments.get("p5", {}) if isinstance(assessments, dict) else {}
+    if isinstance(p5_assessment, dict) and p5_assessment.get("state") == "valid_empty":
+        return ""
+    return _read_text_checkpoint(
+        ckpt.get("files", {}).get("p5", ""),
+        label,
+    )
+
+
 def _context_p6_input_sha256(context: dict[str, Any]) -> str:
     return compute_file_sha256(context.get("ckpt", {}).get("files", {}).get("p6", ""))
+
+
+def _research_stage_needs_p6_hash_refresh(
+    context: dict[str, Any],
+    stage_name: str,
+    current_p6_hash: str,
+) -> bool:
+    """Return whether an old optional-research state belongs to another P6 output."""
+    if not current_p6_hash:
+        return False
+
+    ckpt = context.get("ckpt", {})
+    if not isinstance(ckpt, dict):
+        return False
+    saved_hashes = ckpt.get("p6_input_sha256", {})
+    if not isinstance(saved_hashes, dict):
+        saved_hashes = {}
+    saved_hash = str(saved_hashes.get(stage_name) or "").strip().lower()
+
+    assessments = ckpt.get("stage_assessments", {})
+    if not isinstance(assessments, dict):
+        assessments = {}
+    assessment = assessments.get(stage_name, {})
+    if not isinstance(assessment, dict):
+        assessment = {}
+
+    files = ckpt.get("files", {})
+    if not isinstance(files, dict):
+        files = {}
+    recorded = bool(
+        saved_hash
+        or str(assessment.get("status") or "").strip()
+        or files.get(stage_name)
+        or (stage_name == "p75" and files.get("p75_raw"))
+    )
+    return recorded and saved_hash != current_p6_hash.lower()
+
+
+def _record_research_stage_not_triggered(
+    stage_name: str,
+    p6_hash_metrics: dict[str, str],
+) -> None:
+    update_run_manifest(
+        stage_name,
+        status="skipped_not_triggered",
+        metrics={
+            "data_state": "valid_empty",
+            "skip_reason": "research_plan_not_triggered",
+            **p6_hash_metrics,
+        },
+    )
+
+
+def _refresh_not_triggered_plan_stages(
+    context: dict[str, Any],
+    *,
+    need_run_p7: bool,
+    need_run_p75: bool,
+    search_queries: list[str],
+    p6_input_sha256: str,
+    p6_hash_metrics: dict[str, str],
+) -> None:
+    if (
+        not need_run_p7
+        and not context.get("p7_deep", "").strip()
+        and _research_stage_needs_p6_hash_refresh(context, "p7", p6_input_sha256)
+    ):
+        _record_research_stage_not_triggered("p7", p6_hash_metrics)
+
+    if (
+        (not need_run_p75 or not search_queries)
+        and not context.get("p75_supplement", "").strip()
+        and not context.get("p75_raw_text", "").strip()
+        and _research_stage_needs_p6_hash_refresh(context, "p75", p6_input_sha256)
+    ):
+        _record_research_stage_not_triggered("p75", p6_hash_metrics)
 
 
 def _load_p6_identity_validation(metrics: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -274,7 +394,7 @@ def _build_context(now: datetime, run_ts: str, ckpt: dict, resume_from: str) -> 
         )
         context["report_ts"] = run_ts
 
-    if resume_from in {"p2_resume", "intel_resume"}:
+    if resume_from in {"p2_resume", "intel_resume", "p5_resume"}:
         context["backtrack"] = get_run_config(now)
         p1_path = ckpt.get("files", {}).get("p1", "")
         if p1_path:
@@ -289,7 +409,7 @@ def _build_context(now: datetime, run_ts: str, ckpt: dict, resume_from: str) -> 
             context["evidence_raw"] = format_evidence(context["p1_results"])
         context["p2_data"], context["p3_data"] = _recover_p2_p3_from_checkpoint(ckpt)
 
-    if resume_from == "roi_resume":
+    if resume_from in {"delivery_resume", "roi_resume"}:
         context["p2_data"], context["p3_data"] = _recover_p2_p3_from_checkpoint(ckpt)
         context["p4_data"] = _read_text_checkpoint(ckpt.get("files", {}).get("p4", ""), "P4 market snapshot")
         context["p6_mapping"] = _read_text_checkpoint(ckpt.get("files", {}).get("p6", ""), "P6 mapping")
@@ -299,11 +419,8 @@ def _build_context(now: datetime, run_ts: str, ckpt: dict, resume_from: str) -> 
             "P7 deep research",
             upstream_keys=("p6",),
         )
-        context["p75_supplement"] = _read_fresh_text_checkpoint(
-            ckpt,
-            "p75",
-            "P7.5 supplement",
-            upstream_keys=("p6",),
+        context["p75_supplement"], context["p75_raw_text"] = (
+            _recover_p75_checkpoint(ckpt)
         )
         if context["p7_deep"]:
             context["p7a_audited"] = _read_fresh_text_checkpoint(
@@ -336,6 +453,18 @@ def _build_p1_stats(
     }
 
 
+def _filter_usable_p1_results(
+    p1_results: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    usable_results = [
+        item
+        for item in p1_results
+        if isinstance(item, dict)
+        and has_meaningful_semantic_text(str(item.get("text") or ""))
+    ]
+    return usable_results, len(p1_results) - len(usable_results)
+
+
 def _persist_p1_artifacts(
     p1_results: list[dict[str, Any]],
     evidence_raw: str,
@@ -343,11 +472,17 @@ def _persist_p1_artifacts(
     p1_duration: float,
     p1_stats: dict[str, Any],
 ) -> None:
+    usable_results, rejected_records = _filter_usable_p1_results(p1_results)
+    usable_evidence = str(evidence_raw or "").strip()
+    if not has_meaningful_semantic_text(usable_evidence):
+        usable_evidence = format_evidence(usable_results)
     source_failures = int(p1_stats.get("source_failures", 0) or 0)
     metrics = {
-        "records": len(p1_results),
+        "records": len(usable_results),
+        "raw_records": len(p1_results),
+        "semantic_rejected_records": rejected_records,
         "failed_urls": len(p1_failed_urls),
-        "evidence_chars": len(evidence_raw),
+        "evidence_chars": len(usable_evidence),
         "duration_seconds": round(p1_duration, 1),
         **p1_stats,
     }
@@ -355,13 +490,13 @@ def _persist_p1_artifacts(
         metrics["degrade_reason"] = "; ".join(
             str(item) for item in p1_stats.get("source_failure_details", []) if item
         )[:2000]
-    if not p1_results:
+    if not usable_results or not usable_evidence:
         status = "failed_no_results" if source_failures else "skipped_no_results"
         update_run_manifest("p1", status=status, metrics=metrics)
         return
 
-    p1_json_path = write_json_artifact("P1_RSS原始数据", p1_results)
-    p1_md_path = write_text_artifact("P1_RSS原始数据", evidence_raw)
+    p1_json_path = write_json_artifact("P1_RSS原始数据", usable_results)
+    p1_md_path = write_text_artifact("P1_RSS原始数据", usable_evidence)
     update_run_manifest(
         "p1",
         status="completed_structured_degraded" if source_failures else "completed",
@@ -400,11 +535,21 @@ def _persist_p3_artifacts(p3_data: str, p3_stats: dict[str, Any]) -> None:
         metrics["degrade_reason"] = "; ".join(
             str(item) for item in p3_stats.get("failure_errors", []) if item
         )[:2000]
-    if not p3_data:
+    structured_items = p3_stats.get("structured_items")
+    semantically_empty = not p3_data.strip() or is_no_evidence_text(p3_data)
+    structurally_empty = (
+        structured_items is not None
+        and not isinstance(structured_items, bool)
+        and str(structured_items).strip().lstrip("+-").isdigit()
+        and int(structured_items) <= 0
+    )
+    if semantically_empty or structurally_empty:
         if source_status == "empty":
             status = "skipped_no_results"
         elif source_status.startswith("skipped") or source_status.startswith("failed"):
             status = source_status
+        elif structurally_empty:
+            status = "failed_incomplete_output"
         else:
             status = "failed_empty_output"
         update_run_manifest("p3", status=status, metrics=metrics)
@@ -521,6 +666,11 @@ def _stage_collect_intel(context: dict[str, Any]) -> None:
                     "query_failures": 1,
                 }
 
+    raw_p1_records = len(p1_results)
+    semantic_rejected_records = 0
+    if run_p1:
+        p1_results, semantic_rejected_records = _filter_usable_p1_results(p1_results)
+
     evidence_raw = (
         format_evidence(p1_results) if run_p1 and p1_results else context.get("evidence_raw", "")
     )
@@ -535,6 +685,8 @@ def _stage_collect_intel(context: dict[str, Any]) -> None:
                     p1_source_failure_details.append(f"{source_label}: {failure}")
         p1_stats["source_failures"] = len(p1_source_failure_details)
         p1_stats["source_failure_details"] = p1_source_failure_details
+        p1_stats["raw_records"] = raw_p1_records
+        p1_stats["semantic_rejected_records"] = semantic_rejected_records
     else:
         p1_duration = float(context.get("p1_duration", 0.0) or 0.0)
         p1_stats = dict(context.get("p1_stats") or {})
@@ -596,7 +748,15 @@ def _run_p5_audit(context: dict[str, Any]) -> None:
             )
             context["p5_evidence"] = ""
 
-    if not context["p5_evidence"].strip() and context.get("evidence_raw", "").strip():
+    p5_status = str(
+        load_run_manifest().get("stages", {}).get("p5", {}).get("status", "")
+    ).strip().lower()
+    p5_valid_empty = p5_status in VALID_EMPTY_STATUSES.get("p5", frozenset())
+    if (
+        not context["p5_evidence"].strip()
+        and context.get("evidence_raw", "").strip()
+        and not p5_valid_empty
+    ):
         fallback_text = (
             "## P5 Pro 审计失败兜底\n\n"
             "> Gemini Pro 审计层未返回有效结果。以下内容是未经 P5 Pro 清洗的 P1 原始情报，"
@@ -645,7 +805,7 @@ def _stage_audit_evidence(context: dict[str, Any]) -> None:
 
     intel_resume_stages = set(context.get("intel_resume_stages") or [])
     should_run_p5 = (
-        resume_from in {"none", "p1"}
+        resume_from in {"none", "p1", "p5_resume"}
         or (resume_from == "p2_resume" and not ckpt.get("files", {}).get("p5"))
         or (
             resume_from == "intel_resume"
@@ -657,7 +817,7 @@ def _stage_audit_evidence(context: dict[str, Any]) -> None:
         _fill_missing_p2_p3_from_checkpoint(context, ckpt)
         return
 
-    context["p5_evidence"] = _read_text_checkpoint(ckpt["files"].get("p5", ""), "P5 audit result")
+    context["p5_evidence"] = _recover_p5_checkpoint(ckpt, "P5 audit result")
     _fill_missing_p2_p3_from_checkpoint(context, ckpt)
 
 
@@ -677,7 +837,7 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
         else:
             context["rejected_target_names"] = identity_validation["rejected_target_names"]
             context["p6_mapping"] = _read_text_checkpoint(ckpt["files"].get("p6", ""), "P6 mapping")
-            context["p5_evidence"] = context["p5_evidence"] or _read_text_checkpoint(ckpt["files"].get("p5", ""), "P5 audit")
+            context["p5_evidence"] = context["p5_evidence"] or _recover_p5_checkpoint(ckpt)
             context["p4_data"] = _read_text_checkpoint(ckpt["files"].get("p4", ""), "P4 market snapshot")
             _fill_missing_p2_p3_from_checkpoint(context, ckpt)
             context["p7_deep"] = _read_fresh_text_checkpoint(
@@ -686,11 +846,8 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
                 "P7 deep research",
                 upstream_keys=("p6",),
             )
-            context["p75_supplement"] = _read_fresh_text_checkpoint(
-                ckpt,
-                "p75",
-                "P7.5 supplement",
-                upstream_keys=("p6",),
+            context["p75_supplement"], context["p75_raw_text"] = (
+                _recover_p75_checkpoint(ckpt)
             )
             if context["p7_deep"]:
                 context["p7a_audited"] = _read_fresh_text_checkpoint(
@@ -711,7 +868,7 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
         and ckpt["files"].get("p5")
         and not p1_was_recollected
     ):
-        context["p5_evidence"] = _read_text_checkpoint(ckpt["files"].get("p5", ""), "P5 audit")
+        context["p5_evidence"] = _recover_p5_checkpoint(ckpt)
     _fill_missing_p2_p3_from_checkpoint(context, ckpt)
 
     if ckpt["files"].get("p4"):
@@ -742,6 +899,17 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
         ]
     ).strip()
 
+    if not has_meaningful_semantic_text(combined_evidence):
+        update_run_manifest(
+            "p6",
+            status="failed_missing_input",
+            metrics={
+                "input_chars": len(combined_evidence),
+                "error": "no meaningful P2/P3/P4/P5 evidence",
+            },
+        )
+        raise RuntimeError("P6 mapping blocked: no meaningful upstream evidence")
+
     with log_heartbeat("P6 mapping"):
         try:
             context["p6_mapping"] = generate_report(combined_evidence)
@@ -759,14 +927,18 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
             raise RuntimeError(f"P6 mapping failed: {exc}") from exc
 
     if not context["p6_mapping"].strip():
-        update_run_manifest(
-            "p6",
-            status="failed_empty_output",
-            metrics={
-                "input_chars": len(combined_evidence),
-                "error": "P6 mapping returned empty output",
-            },
-        )
+        p6_status = str(
+            load_run_manifest().get("stages", {}).get("p6", {}).get("status", "")
+        ).strip()
+        if p6_status != "failed_incomplete_output":
+            update_run_manifest(
+                "p6",
+                status="failed_empty_output",
+                metrics={
+                    "input_chars": len(combined_evidence),
+                    "error": "P6 mapping returned empty output",
+                },
+            )
         raise RuntimeError("P6 mapping returned empty output")
 
     p6_path = write_text_artifact("P6_映射", context["p6_mapping"])
@@ -840,10 +1012,26 @@ def _stage_research(context: dict[str, Any]) -> None:
     p6_hash_metrics = {"p6_input_sha256": p6_input_sha256} if p6_input_sha256 else {}
 
     if resume_from in {"p6", "p8_resume", "p9_resume"}:
+        stage_assessments = context.get("ckpt", {}).get("stage_assessments", {})
+        if not isinstance(stage_assessments, dict):
+            stage_assessments = {}
         if context.get("p7_deep", "").strip():
+            need_run_p7 = False
+        elif stage_assessments.get("p7", {}).get("state") == "valid_empty":
             need_run_p7 = False
         if context.get("p75_supplement", "").strip() or not search_queries:
             need_run_p75 = False
+        elif stage_assessments.get("p75", {}).get("state") == "valid_empty":
+            need_run_p75 = False
+
+    _refresh_not_triggered_plan_stages(
+        context,
+        need_run_p7=need_run_p7,
+        need_run_p75=need_run_p75,
+        search_queries=search_queries,
+        p6_input_sha256=p6_input_sha256,
+        p6_hash_metrics=p6_hash_metrics,
+    )
 
     p75_started = None
     if need_run_p7 or need_run_p75:
@@ -863,7 +1051,7 @@ def _stage_research(context: dict[str, Any]) -> None:
                             text = (result.get("text") or "").strip() if result else ""
                             # Why: Gemini prompt 要求搜不到时回 "not found"，
                             #      必须过滤掉这种空结果，否则会被当作有效数据送进审计浪费 token
-                            if text and text.lower().replace(".", "") not in ("not found", "no results", "no relevant results"):
+                            if text and not is_no_evidence_text(text):
                                 supplement_results.append(text)
                         except Exception as exc:
                             supplement_query_failures += 1
@@ -877,12 +1065,19 @@ def _stage_research(context: dict[str, Any]) -> None:
                             p7_result.get("rejected_identity_lines_removed", 0) or 0
                         )
                         p7_status = str(p7_result.get("status") or "").strip()
-                        if not context["p7_deep"].strip() and p7_status.startswith("failed"):
+                        if not context["p7_deep"].strip() and p7_status:
+                            empty_status = (
+                                p7_status
+                                if p7_status == "skipped_no_results" or p7_status.startswith("failed")
+                                else "failed_empty_output"
+                            )
                             update_run_manifest(
                                 "p7",
-                                status=p7_status,
+                                status=empty_status,
                                 metrics={
                                     "output_chars": 0,
+                                    "topics_planned": int(p7_result.get("topics_planned", 0) or 0),
+                                    "topics_completed": int(p7_result.get("topics_completed", 0) or 0),
                                     **p6_hash_metrics,
                                 },
                             )
@@ -915,7 +1110,24 @@ def _stage_research(context: dict[str, Any]) -> None:
                         )
                         with log_heartbeat("P7.5 audit"):
                             audited = gemini_pro_audit(raw_text, audit_type="p7.5", backtrack="")
-                        context["p75_supplement"] = audited or raw_text
+                        p75_audit_status = str(
+                            load_run_manifest()
+                            .get("stages", {})
+                            .get("p75", {})
+                            .get("status", "")
+                        ).strip().lower()
+                        if p75_audit_status in {
+                            "completed_no_results",
+                            "completed_no_valid_evidence",
+                            "skipped_no_results",
+                        }:
+                            context["p75_supplement"] = ""
+                        elif str(audited or "").strip():
+                            context["p75_supplement"] = audited
+                        elif p75_audit_status.startswith("failed"):
+                            context["p75_supplement"] = raw_text
+                        else:
+                            context["p75_supplement"] = ""
                     else:
                         context["p75_supplement"] = ""
                         update_run_manifest(
@@ -963,7 +1175,30 @@ def _stage_research(context: dict[str, Any]) -> None:
             },
         )
 
-    if not context.get("p7a_audited") and (
+    if (
+        not context.get("p7_deep", "").strip()
+        and _research_stage_needs_p6_hash_refresh(context, "p7a", p6_input_sha256)
+    ):
+        _record_research_stage_not_triggered("p7a", p6_hash_metrics)
+
+    stage_assessments = context.get("ckpt", {}).get("stage_assessments", {})
+    if not isinstance(stage_assessments, dict):
+        stage_assessments = {}
+    p7a_checkpoint_state = (
+        str(stage_assessments.get("p7a", {}).get("state") or "")
+        if resume_from in {"p6", "p8_resume", "p9_resume"}
+        else ""
+    )
+    p7a_reusable_without_audit = p7a_checkpoint_state in {
+        "valid_empty",
+        "valid_passthrough",
+    }
+    if (
+        p7a_checkpoint_state == "valid_passthrough"
+        and not context.get("p7a_audited")
+    ):
+        context["p7a_audited"] = context.get("p7_deep", "")
+    if not p7a_reusable_without_audit and not context.get("p7a_audited") and (
         context.get("p7_deep", "").strip() and len(context["p7_deep"].strip()) > 200
     ):
         with log_heartbeat("P7a audit"):
@@ -985,8 +1220,19 @@ def _stage_research(context: dict[str, Any]) -> None:
                     },
                 )
                 context["p7a_audited"] = context.get("p7_deep", "")
-    elif not context.get("p7a_audited"):
+    elif not p7a_reusable_without_audit and not context.get("p7a_audited"):
         context["p7a_audited"] = context.get("p7_deep", "")
+        if context["p7a_audited"].strip():
+            update_run_manifest(
+                "p7a",
+                status="skipped_short_input",
+                metrics={
+                    "input_chars": len(context["p7a_audited"]),
+                    "passthrough_chars": len(context["p7a_audited"]),
+                    "data_state": "valid_passthrough",
+                    **p6_hash_metrics,
+                },
+            )
 
     context["search_queries"] = search_queries[:5]
 
@@ -995,14 +1241,36 @@ def _stage_technical(context: dict[str, Any]) -> None:
     try:
         current_stocks = extract_stocks_from_report(context.get("p6_mapping", ""))
         if context["resume_from"] == "p9_resume" and context.get("price_data", "").strip():
-            stale_p8 = is_older_than_any(context.get("ckpt", {}).get("files", {}), "p8", ("p6",))
-            stale_no_stock_p8 = "未从 P6 映射中提取到 A 股标的" in context.get("price_data", "")
-            if not (stale_p8 or (current_stocks and stale_no_stock_p8)):
-                logging.info("reusing P8 technical data from checkpoint")
+            ckpt = context.get("ckpt", {})
+            stored_assessment = ckpt.get("p8_assessment", {})
+            if isinstance(stored_assessment, dict) and stored_assessment.get("reusable") is False:
+                assessment = dict(stored_assessment)
+            else:
+                assessment_metrics = ckpt.get("p8_metrics", {})
+                if not isinstance(assessment_metrics, dict) or not assessment_metrics:
+                    assessment_metrics = {
+                        "stocks_requested": stored_assessment.get("stocks_requested"),
+                        "stocks_with_data": stored_assessment.get("stocks_with_data"),
+                    }
+                assessment = assess_p8_checkpoint(
+                    ckpt.get("files", {}).get("p8", ""),
+                    markdown_text=context.get("price_data", ""),
+                    stage_status=str(ckpt.get("p8_status") or stored_assessment.get("status") or ""),
+                    stage_metrics=assessment_metrics,
+                    current_stock_count=len(current_stocks),
+                    stale=is_older_than_any(ckpt.get("files", {}), "p8", ("p6",)),
+                    upstream_valid=bool(context.get("p6_mapping", "").strip()),
+                )
+            ckpt["p8_assessment"] = assessment
+            if assessment.get("reusable"):
+                logging.info(
+                    "reusing P8 technical data from checkpoint (%s)",
+                    assessment.get("state", "unknown"),
+                )
                 return
             logging.warning(
-                "[P8] checkpoint is stale or no-stock while current P6 exposes %s stocks; rerunning technical layer",
-                len(current_stocks),
+                "[P8] checkpoint is not reusable (%s); rerunning technical layer",
+                assessment.get("reason", "unknown"),
             )
 
         with log_heartbeat("P8 technical"):
@@ -1029,6 +1297,8 @@ def _stage_technical(context: dict[str, Any]) -> None:
             metrics={
                 "fallback_reason": str(exc),
                 "price_data_chars": len(fallback_text),
+                "data_state": "invalid",
+                "degrade_reason": "p8_exception_fallback",
             },
         )
 
@@ -1124,12 +1394,20 @@ def _stage_roi(context: dict[str, Any]) -> None:
         except (TypeError, ValueError):
             return default
 
+    p75_status = str(
+        manifest_snapshot.get("stages", {}).get("p75", {}).get("status", "")
+    ).strip().lower()
+    p75_valid_empty = p75_status in VALID_EMPTY_STATUSES.get("p75", frozenset())
+    p75_text = context.get("p75_supplement", "")
+    if not p75_text and not p75_valid_empty:
+        p75_text = context.get("p75_raw_text", "")
+
     roi_payload = build_layer_roi_report(
         p1_results=p1_results,
         p3_raw_results=context.get("p3_stats", {}).get("raw_results") if isinstance(context.get("p3_stats"), dict) else None,
         p3_text=context.get("p3_data", ""),
         p4_text=context.get("p4_data", ""),
-        p75_text=context.get("p75_supplement", "") or context.get("p75_raw_text", ""),
+        p75_text=p75_text,
         p75_queries=context.get("search_queries", []),
         p6_mapping=context.get("p6_mapping", ""),
         final_report=context.get("final_report", ""),
@@ -1157,21 +1435,42 @@ def _stage_roi(context: dict[str, Any]) -> None:
                 "query_count": len(context.get("search_queries", [])),
                 "raw_chars": len(context.get("p75_raw_text", "") or ""),
                 "audited_chars": len(context.get("p75_supplement", "") or ""),
+                "valid_empty": p75_valid_empty,
             },
         },
     )
 
     roi_json_path = write_json_artifact("Layer_ROI", roi_payload)
     roi_md_path = write_text_artifact("Layer_ROI", render_layer_roi_markdown(roi_payload))
+    roi_layers = roi_payload.get("layers", {})
+    if not isinstance(roi_layers, dict):
+        roi_layers = {}
+
+    def roi_metric_int(payload: Any, key: str) -> int:
+        if not isinstance(payload, dict):
+            return 0
+        try:
+            return max(int(payload.get(key, 0)), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    layer_units = [roi_metric_int(payload, "units") for payload in roi_layers.values()]
     update_run_manifest(
         "roi",
         status="completed",
         files={"json": roi_json_path, "md": roi_md_path},
-        metrics={"layers_evaluated": len(roi_payload.get("layers", {}))},
+        metrics={
+            "layers_evaluated": len(roi_layers),
+            "layers_with_units": sum(units > 0 for units in layer_units),
+            "empty_layers": sum(units == 0 for units in layer_units),
+            "total_units": sum(layer_units),
+            "total_unique_units": sum(roi_metric_int(payload, "unique_units") for payload in roi_layers.values()),
+            "total_adopted_units": sum(roi_metric_int(payload, "adopted_units") for payload in roi_layers.values()),
+        },
     )
 
     manifest_after_roi = load_run_manifest()
-    for stage_name, payload in roi_payload.get("layers", {}).items():
+    for stage_name, payload in roi_layers.items():
         stage_payload = manifest_after_roi.get("stages", {}).get(stage_name, {})
         if not isinstance(stage_payload, dict) or not str(stage_payload.get("status") or "").strip():
             continue

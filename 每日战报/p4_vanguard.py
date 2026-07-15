@@ -63,7 +63,9 @@ def _fetch_vanguard_prices_inline() -> str:
         lines.append(f'产业链核心标的客观行情（A股基准日: {prev_day_str}，显示自该日以来全球核心标的区间总涨跌）：')
         lines.append('分类规则：超级巨头(万亿级)区间≥3%触发催化/≤-5%警惕 | 中型标的区间≥5%触发催化/≤-8%警惕\n')
 
-        def _fetch_single(name: str, ticker: str) -> str:
+        ticker_outcomes = {'usable': 0, 'no_data': 0, 'failed': 0}
+
+        def _fetch_single(name: str, ticker: str) -> tuple[str, str]:
             time.sleep(0.3)
             if name in SUPER_GIANTS:
                 tier = '超级巨头'
@@ -83,14 +85,14 @@ def _fetch_vanguard_prices_inline() -> str:
                     )
 
                     if len(hist) == 0:
-                        return f'- {name}({ticker}) [{tier}]: 暂无最新交易数据'
+                        return 'no_data', f'- {name}({ticker}) [{tier}]: 暂无最新交易数据'
 
                     hist.index = hist.index.tz_localize(None).normalize()
                     today = pd.to_datetime('today').normalize()
                     completed_hist = hist[hist.index < today]
 
                     if len(completed_hist) < 1:
-                        return f'- {name}({ticker}) [{tier}]: 今日尚无完整收盘数据'
+                        return 'no_data', f'- {name}({ticker}) [{tier}]: 今日尚无完整收盘数据'
 
                     baseline_date = pd.to_datetime(prev_day_str) - pd.Timedelta(days=1)
                     past_hist = completed_hist[completed_hist.index <= baseline_date]
@@ -105,9 +107,9 @@ def _fetch_vanguard_prices_inline() -> str:
                     if curr_close > 0 and prev_close > 0:
                         pct_change = (curr_close - prev_close) / prev_close * 100
                         signal = classify_vanguard_signal(name, pct_change)
-                        return f'- [{signal}] {name}({ticker}) [{tier}]: 收盘价 {curr_close:.2f}, 区间涨跌 {pct_change:+.2f}%'
+                        return 'usable', f'- [{signal}] {name}({ticker}) [{tier}]: 收盘价 {curr_close:.2f}, 区间涨跌 {pct_change:+.2f}%'
 
-                    return f'- [📈 正常] {name}({ticker}) [{tier}]: 收盘价 {curr_close:.2f} (无足够历史对比)'
+                    return 'no_data', f'- [📈 正常] {name}({ticker}) [{tier}]: 收盘价 {curr_close:.2f} (无足够历史对比)'
 
                 except Exception as e:
                     if attempt < max_retries - 1:
@@ -116,7 +118,7 @@ def _fetch_vanguard_prices_inline() -> str:
 
                     tb_str = traceback.format_exc()
                     logging.error(f'❌ [yfinance] 获取 {ticker} 失败: {type(e).__name__} - {e}\n{tb_str}')
-                    return f'- {name}({ticker}) [{tier}]: 获取股价失败'
+                    return 'failed', f'- {name}({ticker}) [{tier}]: 获取股价失败'
 
         # Why: 80+ 标的只开 2 线程太慢，提升到 6 线程（与亚洲版一致）
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
@@ -124,10 +126,12 @@ def _fetch_vanguard_prices_inline() -> str:
 
             for fut in concurrent.futures.as_completed(futures.values()):
                 try:
-                    result = fut.result()
+                    outcome, result = fut.result()
+                    ticker_outcomes[outcome] += 1
                     if result:
                         lines.append(result)
                 except Exception:
+                    ticker_outcomes['failed'] += 1
                     for name, candidate in futures.items():
                         if candidate == fut:
                             lines.append(f'- {name}({VANGUARD_TICKERS[name]}): 获取失败')
@@ -144,12 +148,35 @@ def _fetch_vanguard_prices_inline() -> str:
             logging.warning(f'⚠️ [yfinance] 行情落盘失败: {e}')
             fname = ''
 
+        usable_tickers = ticker_outcomes['usable']
+        has_partial_degradation = bool(
+            ticker_outcomes['no_data'] or ticker_outcomes['failed']
+        )
+        if usable_tickers == 0:
+            manifest_status = 'failed_no_usable_data'
+            data_state = 'degraded_empty'
+            degrade_reason = 'no_usable_ticker_data'
+        elif has_partial_degradation:
+            manifest_status = 'completed_structured_degraded'
+            data_state = 'degraded'
+            degrade_reason = 'partial_ticker_data'
+        else:
+            manifest_status = 'completed'
+            data_state = 'valid'
+            degrade_reason = ''
+
         update_run_manifest(
             'p4',
-            status='completed',
+            status=manifest_status,
             files={'md': fname} if fname else None,
             metrics={
                 'tickers': len(VANGUARD_TICKERS),
+                'usable_tickers': usable_tickers,
+                'no_data_tickers': ticker_outcomes['no_data'],
+                'failed_tickers': ticker_outcomes['failed'],
+                'data_state': data_state,
+                'structured_degraded': has_partial_degradation,
+                'degrade_reason': degrade_reason,
                 'report_chars': len(report),
                 'duration_seconds': round(time.time() - start_time, 1),
             },

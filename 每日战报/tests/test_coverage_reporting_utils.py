@@ -6,9 +6,6 @@ import socket
 import struct
 from contextlib import contextmanager
 from datetime import datetime
-from pathlib import Path
-from types import SimpleNamespace
-
 import pytest
 
 
@@ -524,5 +521,11 @@ def test_p8_technical_no_input_no_vipdoc_and_mixed_records(monkeypatch):
         elasticity_map={"600000": "normal", "000001": "normal"},
     )
     assert result
-    assert persisted[-1][2]["status"] == "completed"
+    assert persisted[-1][2]["status"] == "completed_structured_degraded"
     assert persisted[-1][2]["metrics"]["stocks_with_data"] == 0
+    assert persisted[-1][2]["metrics"]["data_state"] == "degraded_empty"
+    assert persisted[-1][2]["metrics"]["structured_degraded"] is True
+    assert (
+        persisted[-1][2]["metrics"]["degrade_reason"]
+        == "requested_stocks_but_no_usable_local_kline"
+    )

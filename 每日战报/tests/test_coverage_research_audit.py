@@ -837,7 +837,7 @@ def test_gemini_audit_success_rendering_branches(
     assert manifests[-1][1]["status"] == "completed"
 
 
-def test_gemini_audit_success_empty_sections(monkeypatch, audit_artifacts):
+def test_gemini_audit_rejects_empty_sections(monkeypatch, audit_artifacts):
     manifests, _, text_writes = audit_artifacts
     monkeypatch.setattr(
         audit_engine,
@@ -859,9 +859,11 @@ def test_gemini_audit_success_empty_sections(monkeypatch, audit_artifacts):
         lambda *args, **kwargs: _audit_success_data(),
     )
     result = audit_engine.gemini_pro_audit("raw")
-    assert result.count("无") >= 2 or result
+    assert result == ""
     assert text_writes
-    assert manifests[-1][1]["status"] == "completed"
+    assert text_writes[-1][0].endswith("_RAW_SEMANTIC_INVALID")
+    assert manifests[-1][1]["status"] == "failed_semantic_output"
+    assert manifests[-1][1]["metrics"]["semantic_error"] == "empty_audit_payload"
 
 
 def test_gemini_audit_json_retry_then_success(monkeypatch, audit_artifacts):
@@ -1154,5 +1156,7 @@ def test_p7a_degraded_empty_json_and_markdown_only_with_successful_artifacts(
         ),
     )
     result = audit_engine.p7a_deep_research_audit(raw)
-    assert result == valid_json_only
-    assert manifests[-1][1]["status"] == "completed"
+    assert result == raw
+    assert manifests[-1][1]["status"] == "failed_semantic_output"
+    assert manifests[-1][1]["metrics"]["semantic_error"] == "empty_markdown_output"
+    assert set(manifests[-1][1]["files"]) == {"json"}

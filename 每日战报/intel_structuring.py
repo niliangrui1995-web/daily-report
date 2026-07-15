@@ -6,6 +6,8 @@ import re
 from datetime import datetime
 from typing import Any
 
+from semantic_output import is_no_evidence_text
+
 _P2_FIELD_ALIASES = {
     "信源": "source",
     "核心内容": "claim",
@@ -77,7 +79,7 @@ def parse_p2_structured_items(raw_text: str) -> list[dict[str, Any]]:
                 fields[normalized_key] = value.strip()
 
         claim = fields.get("claim", "").strip()
-        if not claim:
+        if not claim or is_no_evidence_text(claim):
             continue
 
         confidence_score = _confidence_to_score(fields.get("confidence", ""), default=0.62)
@@ -107,16 +109,24 @@ def normalize_p3_structured_items(raw_results: dict[str, Any] | None) -> list[di
                 continue
             title = str(item.get("title", "")).strip()
             summary = str(item.get("summary", "")).strip()
-            if not title and not summary:
+            explicit_claim = str(item.get("claim", "")).strip()
+            meaningful_title = title if title and not is_no_evidence_text(title) else ""
+            meaningful_summary = summary if summary and not is_no_evidence_text(summary) else ""
+            meaningful_claim = (
+                explicit_claim
+                if explicit_claim and not is_no_evidence_text(explicit_claim)
+                else ""
+            )
+            if not any((meaningful_title, meaningful_summary, meaningful_claim)):
                 continue
             score = _confidence_to_score(item.get("confidence"), default=meta["confidence"])
-            claim = summary or title
+            claim = meaningful_claim or meaningful_summary or meaningful_title
             items.append(
                 {
                     "bucket": bucket,
                     "bucket_label": meta["label"],
                     "track": str(item.get("track", "")).strip() or "P3情报",
-                    "title": title or claim[:48],
+                    "title": meaningful_title or claim[:48],
                     "claim": claim,
                     "source": str(item.get("source_name", "")).strip() or meta["label"],
                     "source_url": str(item.get("source_url", "")).strip(),

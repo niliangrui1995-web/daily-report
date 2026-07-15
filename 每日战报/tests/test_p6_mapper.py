@@ -57,7 +57,10 @@ def test_baiwei_tdx_code_postprocess_replays_historical_p6_corrections(
             "events": [
                 {
                     "track_name": "HBM与先进存储",
-                    "event_summary": f"{run_day} 历史日志复现：佰维存储被模型错配为 300667。",
+                    "event_summary": (
+                        f"{run_day} 历史日志复现：佰维存储被模型错配为 300667。"
+                        + "存储价格、供需、订单和产能证据已逐项交叉验证。" * 50
+                    ),
                     "targets": [
                         {
                             "name": "佰维存储",

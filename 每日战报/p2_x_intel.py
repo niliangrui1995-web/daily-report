@@ -28,9 +28,10 @@ import os
 from datetime import datetime
 import re
 
-from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
-from intel_structuring import parse_p2_structured_items, render_p2_structured_markdown
-from utils import parse_backtrack_hours
+from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
+from intel_structuring import parse_p2_structured_items, render_p2_structured_markdown
+from semantic_output import is_no_evidence_text
+from utils import parse_backtrack_hours
 from settings import require_prompt, GROK_API_KEY
 from industry_dict import OLIGARCH_DICT, SUPER_GIANTS, STRATEGIC_GIANTS
 
@@ -133,11 +134,32 @@ def _sleep_with_budget(wait: float, start_time: float, max_total_seconds: int | 
     return True
 
 
-def _filter_x_leak_blocks(content: str, seen_tweet_ids: set[str]) -> str:
-    filtered_blocks: list[str] = []
-    for match in _X_LEAK_BLOCK_PATTERN.finditer(content or ''):
-        block = match.group(0).strip()
-        block_valid = True
+def _normalized_x_leak_block_text(block: str) -> str:
+    block_text = re.sub(r'</?x_leaks>', ' ', block, flags=re.IGNORECASE)
+    block_text = re.sub(r'<[^>]+>', ' ', block_text)
+    return re.sub(r'\s+', ' ', block_text).strip()
+
+
+def _is_explicit_no_results_response(content: str) -> bool:
+    block_texts = [
+        _normalized_x_leak_block_text(match.group(0))
+        for match in _X_LEAK_BLOCK_PATTERN.finditer(content or '')
+    ]
+    nonempty_blocks = [text for text in block_texts if text]
+    return bool(nonempty_blocks) and all(
+        is_no_evidence_text(text) for text in nonempty_blocks
+    )
+
+
+def _filter_x_leak_blocks(content: str, seen_tweet_ids: set[str]) -> str:
+    filtered_blocks: list[str] = []
+    for match in _X_LEAK_BLOCK_PATTERN.finditer(content or ''):
+        block = match.group(0).strip()
+        block_text = _normalized_x_leak_block_text(block)
+        if not block_text or is_no_evidence_text(block_text):
+            logging.info('🔄   -> 剔除语义空的 X 情报块')
+            continue
+        block_valid = True
         for tweet_id in _X_STATUS_ID_PATTERN.findall(block):
             if tweet_id in seen_tweet_ids:
                 block_valid = False
@@ -226,6 +248,8 @@ def collect_from_x(  # noqa: C901 - chunk, retry, and independent failover budge
     fallback_start_time = None
     attempted_chunks = 0
     successful_chunks = 0
+    provider_successful_chunks = 0
+    semantic_empty_chunks = 0
     fallback_chunks = 0
     fallback_only = False
     stop_reason = ''
@@ -467,14 +491,18 @@ def collect_from_x(  # noqa: C901 - chunk, retry, and independent failover budge
                             if c.get('type') == 'output_text':
                                 content += c.get('text', '')
 
-            if not content:
-                raise ValueError('XAI API返回空内容')
-
-            chunk_final = _filter_x_leak_blocks(content, seen_tweet_ids)
-            if chunk_final.strip():
-                all_filtered_leaks.append(chunk_final)
-                successful_chunks += 1
-                logging.info(f'✅   -> 本批次获取有效爆料，长度: {len(chunk_final)}')
+            if not content:
+                raise ValueError('XAI API返回空内容')
+
+            provider_successful_chunks += 1
+            chunk_final = _filter_x_leak_blocks(content, seen_tweet_ids)
+            if chunk_final.strip():
+                all_filtered_leaks.append(chunk_final)
+                successful_chunks += 1
+                logging.info(f'✅   -> 本批次获取有效爆料，长度: {len(chunk_final)}')
+            elif _is_explicit_no_results_response(content):
+                semantic_empty_chunks += 1
+                logging.info('ℹ️   -> 本批次接口成功，明确返回无相关 X 情报')
 
         except Exception as e:
             wait = 3
@@ -490,6 +518,8 @@ def collect_from_x(  # noqa: C901 - chunk, retry, and independent failover budge
     stats['duration_seconds'] = round(elapsed, 1)
     stats['attempted_chunks'] = attempted_chunks
     stats['successful_chunks'] = successful_chunks
+    stats['provider_successful_chunks'] = provider_successful_chunks
+    stats['semantic_empty_chunks'] = semantic_empty_chunks
     stats['total_chunks'] = len(chunks)
     stats['max_total_seconds'] = max_total_seconds
     stats['primary_budget_seconds'] = max_total_seconds
@@ -498,11 +528,21 @@ def collect_from_x(  # noqa: C901 - chunk, retry, and independent failover budge
 
     if not content.strip() or '<x_leaks>' not in content:
         logging.warning('⚠️ [P2] 所有批次均未获取到有效情报（全部作废）。')
-        stats['status'] = (
-            'failed_timeout'
-            if stop_reason in {'budget_exhausted', 'fallback_budget_exhausted'}
-            else 'failed_empty'
+        completed_no_results = bool(
+            not stop_reason
+            and attempted_chunks == len(chunks)
+            and provider_successful_chunks == attempted_chunks
+            and semantic_empty_chunks == attempted_chunks
         )
+        if completed_no_results:
+            stats['status'] = 'completed_no_results'
+            stats['data_state'] = 'valid_empty'
+        else:
+            stats['status'] = (
+                'failed_timeout'
+                if stop_reason in {'budget_exhausted', 'fallback_budget_exhausted'}
+                else 'failed_empty'
+            )
         if stop_reason:
             stats['stop_reason'] = stop_reason
         update_run_manifest('p2', status=stats['status'], metrics=stats)

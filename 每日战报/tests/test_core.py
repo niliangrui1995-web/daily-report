@@ -433,6 +433,22 @@ class TestStockExtraction:
         codes = [code for _, code in stocks]
         assert codes.count("688256") == 1
 
+    def test_p6_target_names_with_letters_and_suffixes_share_checkpoint_parser(self):
+        from p6_target_parser import extract_p6_targets
+        from p8_technical import extract_stocks_from_report
+
+        report = """
+        ### 赛道: mixed names
+        - 万科A（000002） | 高弹性 | reason
+        - 京东方A（000725） | 高弹性 | reason
+        - 寒武纪-U（688256） | 高弹性 | reason
+        - 海光信息（688041） | 高弹性 | reason
+        - TCL中环（002129） | 高弹性 | reason
+        """
+
+        assert extract_stocks_from_report(report) == extract_p6_targets(report)
+        assert len(extract_stocks_from_report(report)) == 5
+
 
 class TestP8FastPath:
     """测试 P8 简版技术画像仍保留 P9 表格所需字段"""
@@ -1196,7 +1212,10 @@ class TestCheckpoint:
         """仅有 P1 文件时应定向补跑缺失的 P2/P3。"""
         monkeypatch.setattr('checkpoint.get_today_output_dir', lambda: str(tmp_path))
         monkeypatch.setattr('artifact_store.get_today_output_dir', lambda: str(tmp_path))
-        (tmp_path / 'P1_RSS原始数据_202604091000.json').write_text('{}', encoding='utf-8')
+        (tmp_path / 'P1_RSS原始数据_202604091000.json').write_text(
+            '[{"text":"usable RSS evidence"}]',
+            encoding='utf-8',
+        )
         from checkpoint import detect_checkpoint
         ckpt = detect_checkpoint()
         assert ckpt['stage'] == 'intel_resume'
@@ -1223,7 +1242,7 @@ class TestCheckpoint:
         os.utime(p8_path, (2000, 2000))
         from checkpoint import detect_checkpoint
         ckpt = detect_checkpoint()
-        assert ckpt['stage'] == 'p9_resume'
+        assert ckpt['stage'] == 'none'
 
     def test_p8_detected_as_p9_resume(self, tmp_path, monkeypatch):
         """有 P8 文件时应进入 p9_resume，避免重复重跑技术面"""
@@ -1232,7 +1251,7 @@ class TestCheckpoint:
         (tmp_path / 'P8_技术面_202604091130.md').write_text('p8 data', encoding='utf-8')
         from checkpoint import detect_checkpoint
         ckpt = detect_checkpoint()
-        assert ckpt['stage'] == 'p9_resume'
+        assert ckpt['stage'] == 'none'
 
 
 # =====================================================================

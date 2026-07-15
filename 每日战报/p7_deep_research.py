@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timedelta
 
 from artifact_store import extract_timestamp_from_name
+from semantic_output import is_no_evidence_text
 from settings import OUTPUT_DIR
 from tdx_stock_universe import (
     filter_rejected_stock_lines,
@@ -917,6 +918,14 @@ def iterative_deep_search(
             break
 
         result_text = result["text"].strip()
+        if not result_text:
+            logging.warning(f"[P7] search returned whitespace-only output for '{topic}' round {round_index + 1}")
+            stop_reason = "empty_first_round" if round_index == 0 else "search_empty"
+            break
+        if is_no_evidence_text(result_text):
+            logging.info(f"[P7] search found no evidence for '{topic}' round {round_index + 1}")
+            stop_reason = "no_evidence_first_round" if round_index == 0 else "no_further_evidence"
+            break
         structured = result.get("structured") if isinstance(result, dict) else None
         analysis_lines = _structured_claim_lines(structured, result_text)
         analysis_text = "\n".join(analysis_lines) if analysis_lines else result_text
@@ -963,10 +972,11 @@ def iterative_deep_search(
             break
 
     if not round_sections:
+        status = "skipped_no_results" if stop_reason == "no_evidence_first_round" else "failed_empty_output"
         return {
             "topic": topic,
             "text": "",
-            "status": "failed_empty_output",
+            "status": status,
             "stop_reason": stop_reason,
             "rounds_run": 0,
             "successful_rounds": 0,
@@ -1061,8 +1071,15 @@ def run_deep_research(plan: dict[str, object]) -> dict[str, object]:
                     all_sections.append(filtered_text)
 
     combined = "\n\n".join(all_sections).strip()
+    topic_statuses = [str(item.get("status") or "") for item in topic_results]
+    if combined:
+        aggregate_status = "completed"
+    elif topic_statuses and all(status == "skipped_no_results" for status in topic_statuses):
+        aggregate_status = "skipped_no_results"
+    else:
+        aggregate_status = "failed_empty_output"
     return {
-        "status": "completed" if combined else "failed_empty_output",
+        "status": aggregate_status,
         "text": combined,
         "topics_planned": len(topics),
         "topics_completed": sum(1 for item in topic_results if item.get("text")),

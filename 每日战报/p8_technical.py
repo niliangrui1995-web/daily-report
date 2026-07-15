@@ -58,7 +58,11 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
             markdown,
             {},
             status='skipped_no_stocks',
-            metrics={'stocks_requested': 0, 'stocks_with_data': 0},
+            metrics={
+                'stocks_requested': 0,
+                'stocks_with_data': 0,
+                'data_state': 'valid_empty',
+            },
         )
     vipdoc = _find_tdx_vipdoc()
     if not vipdoc:
@@ -71,7 +75,12 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
             markdown,
             {},
             status='skipped_no_vipdoc',
-            metrics={'stocks_requested': len(stocks), 'stocks_with_data': 0},
+            metrics={
+                'stocks_requested': len(stocks),
+                'stocks_with_data': 0,
+                'data_state': 'degraded_empty',
+                'degrade_reason': 'tdx_vipdoc_unavailable',
+            },
         )
 
     market_index_lines = ["## 同期大盘参考\n\n"]
@@ -359,9 +368,18 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
     # P8 JSON 数据已落盘至独立文件。
     # 鉴于 P9 只需要读基本盘信息，这里只返回 Markdown，避免将 JSON 原样再发一遍浪费数千 Token
     stocks_with_data = sum(1 for item in p8_json_db.values() if not item.get('error'))
+    has_usable_data = stocks_with_data > 0
     return _persist_p8_outputs(
         pure_md_str,
         p8_json_db,
-        status='completed',
-        metrics={'stocks_requested': len(stocks), 'stocks_with_data': stocks_with_data},
+        status='completed' if has_usable_data else 'completed_structured_degraded',
+        metrics={
+            'stocks_requested': len(stocks),
+            'stocks_with_data': stocks_with_data,
+            'data_state': 'valid' if has_usable_data else 'degraded_empty',
+            'structured_degraded': not has_usable_data,
+            'degrade_reason': (
+                '' if has_usable_data else 'requested_stocks_but_no_usable_local_kline'
+            ),
+        },
     )

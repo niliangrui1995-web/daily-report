@@ -142,7 +142,7 @@ def test_settings_load_prompt_reads_once_then_uses_cache(monkeypatch):
     assert settings_module.load_prompt("covered-prompt.txt", required=True) == "prompt body"
     assert len(opened_paths) == 1
     assert opened_paths[0][1:] == ("r", "utf-8")
-    assert opened_paths[0][0].endswith("prompts\\covered-prompt.txt")
+    assert Path(opened_paths[0][0]).parts[-2:] == ("prompts", "covered-prompt.txt")
 
 
 @pytest.mark.parametrize(
@@ -210,7 +210,7 @@ def test_settings_audit_fallback_disabled_then_cached(monkeypatch):
     assert first is second
     assert len(captured) == 1
     assert captured[0]["base_url"] == "https://backup.example.test"
-    assert captured[0]["api_key"] == "backup-key"
+    assert captured[0]["api_key"] == "backup-key"  # pragma: allowlist secret
     assert captured[0]["max_retries"] == 2
 
 

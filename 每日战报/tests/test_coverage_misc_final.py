@@ -131,7 +131,7 @@ def test_email_fallback_preserves_authentication_failure(monkeypatch):
         p9_email.send_report_via_email(
             "report",
             sender_email="sender@example.com",
-            sender_password="secret",
+            sender_password="secret",  # pragma: allowlist secret
             receiver_email="receiver@example.com",
         )
 

@@ -529,10 +529,10 @@ def test_valid_empty_research_keeps_newer_terminal_artifacts(monkeypatch, tmp_pa
 def test_valid_empty_intel_keeps_newer_terminal_artifacts(monkeypatch, tmp_path):
     manifest = _base_manifest(tmp_path)
     manifest["stages"]["p1"].update(
-        {"status": "skipped_no_results", "updated_at": "2026-07-15T10:00:00"}
+        {"status": "skipped_no_results", "updated_at": "2000-01-01T00:00:00"}
     )
     manifest["stages"]["p3"].update(
-        {"status": "completed_no_results", "updated_at": "2026-07-15T10:00:01"}
+        {"status": "completed_no_results", "updated_at": "2000-01-01T00:00:01"}
     )
     _add_valid_p8(tmp_path, manifest)
     _add_terminal_artifacts(tmp_path, manifest)

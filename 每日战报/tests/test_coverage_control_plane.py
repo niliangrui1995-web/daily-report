@@ -13,6 +13,7 @@ import pytest
 import pipeline_runtime
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-specific PID probe")
 def test_pipeline_lock_windows_pid_probe_and_import_failure(monkeypatch):
     import pipeline_lock
 

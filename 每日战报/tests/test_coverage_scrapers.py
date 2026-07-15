@@ -239,7 +239,7 @@ def test_dns_resolution_rejects_invalid_or_private_results(monkeypatch):
     [
         ("ftp://example.com/file", False),
         ("https:///missing-host", False),
-        ("https://user:pass@example.com/article", False),
+        ("https://user:pass@example.com/article", False),  # pragma: allowlist secret
         ("https://localhost/article", False),
         ("http://127.0.0.1/private", False),
         ("https://8.8.8.8/article", True),

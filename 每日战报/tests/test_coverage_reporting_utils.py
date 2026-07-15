@@ -212,7 +212,7 @@ def test_send_message_uses_source_address_and_optional_remote_ip(monkeypatch):
     p9_email._send_message(
         msg,
         sender_email="sender@example.com",
-        sender_password="secret",
+        sender_password="secret",  # pragma: allowlist secret
         receiver_email="one@example.com, two@example.com",
         source_ip="10.0.0.2",
         remote_ip="1.2.3.4",
@@ -220,7 +220,7 @@ def test_send_message_uses_source_address_and_optional_remote_ip(monkeypatch):
     p9_email._send_message(
         msg,
         sender_email="sender@example.com",
-        sender_password="secret",
+        sender_password="secret",  # pragma: allowlist secret
         receiver_email="one@example.com",
     )
 

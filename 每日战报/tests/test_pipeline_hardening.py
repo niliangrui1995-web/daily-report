@@ -1319,6 +1319,7 @@ class TestPreflightChecks:
         monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_API_KEY", "backup-secret")
         monkeypatch.setattr(pipeline_cli, "EMAIL_ADDRESS", "sender@example.com")
         monkeypatch.setattr(pipeline_cli, "EMAIL_PASSWORD", "smtp-secret")
+        monkeypatch.setattr(pipeline_cli, "RECEIVER_EMAIL", "receiver@example.com")
         monkeypatch.setattr(pipeline_cli, "_probe_local_model_endpoint", lambda _url, _key: (True, "authenticated status=200"))
         monkeypatch.setattr(pipeline_cli, "INSECURE_TLS_ALLOWLIST", ("self-signed.local",))
         monkeypatch.setattr(
@@ -1361,6 +1362,7 @@ class TestPreflightChecks:
         monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_API_KEY", "backup-secret")
         monkeypatch.setattr(pipeline_cli, "EMAIL_ADDRESS", "sender@example.com")
         monkeypatch.setattr(pipeline_cli, "EMAIL_PASSWORD", "smtp-secret")
+        monkeypatch.setattr(pipeline_cli, "RECEIVER_EMAIL", "receiver@example.com")
         monkeypatch.setattr(pipeline_cli, "_probe_local_model_endpoint", lambda _url, _key: (True, "authenticated status=200"))
         monkeypatch.setattr(pipeline_cli, "GROK_API_KEY", "optional")
         monkeypatch.setattr(pipeline_cli, "INSECURE_TLS_ALLOWLIST", ())

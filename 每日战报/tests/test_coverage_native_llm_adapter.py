@@ -1051,7 +1051,7 @@ def test_fallback_can_use_an_independent_endpoint_and_provider(monkeypatch):
         fallback_total_timeout_seconds=900,
         fallback_model="claude-opus-4-6-thinking",
         fallback_base_url="https://backup.example.test",
-        fallback_api_key="backup-key",
+        fallback_api_key="backup-key",  # pragma: allowlist secret
         fallback_request_timeout_seconds=900,
     )
 
@@ -1062,7 +1062,7 @@ def test_fallback_can_use_an_independent_endpoint_and_provider(monkeypatch):
     assert captured == {
         "model": "claude-opus-4-6-thinking",
         "base_url": "https://backup.example.test",
-        "api_key": "backup-key",
+        "api_key": "backup-key",  # pragma: allowlist secret
         "provider": "anthropic",
     }
     assert provenance["fallback_provider"] == "anthropic"

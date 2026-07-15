@@ -239,7 +239,7 @@ def test_send_report_email_primary_and_fallback_outcomes(monkeypatch):
     p9_email.send_report_via_email(
         "content",
         sender_email="sender@example.com",
-        sender_password="secret",
+        sender_password="secret",  # pragma: allowlist secret
         receiver_email="receiver@example.com",
     )
     assert len(calls) == 1
@@ -252,7 +252,7 @@ def test_send_report_email_primary_and_fallback_outcomes(monkeypatch):
         p9_email.send_report_via_email(
             "content",
             sender_email="sender@example.com",
-            sender_password="secret",
+            sender_password="secret",  # pragma: allowlist secret
             receiver_email="receiver@example.com",
         )
 
@@ -269,7 +269,7 @@ def test_send_report_email_primary_and_fallback_outcomes(monkeypatch):
     p9_email.send_report_via_email(
         "content",
         sender_email="sender@example.com",
-        sender_password="secret",
+        sender_password="secret",  # pragma: allowlist secret
         receiver_email="receiver@example.com",
     )
     assert attempts[-1]["remote_ip"] == "1.1.1.1"
@@ -282,7 +282,7 @@ def test_send_report_email_primary_and_fallback_outcomes(monkeypatch):
         p9_email.send_report_via_email(
             "content",
             sender_email="sender@example.com",
-            sender_password="secret",
+            sender_password="secret",  # pragma: allowlist secret
             receiver_email="receiver@example.com",
         )
 
@@ -291,7 +291,7 @@ def test_send_report_email_primary_and_fallback_outcomes(monkeypatch):
         p9_email.send_report_via_email(
             "content",
             sender_email="sender@example.com",
-            sender_password="secret",
+            sender_password="secret",  # pragma: allowlist secret
             receiver_email="receiver@example.com",
         )
 

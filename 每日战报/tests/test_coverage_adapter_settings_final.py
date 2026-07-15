@@ -293,7 +293,7 @@ def test_external_fallback_handles_invalid_timeout_and_empty_response(monkeypatc
         timeout=37,
         fallback_model="claude-opus-4-6-thinking",
         fallback_base_url="https://backup.example.test",
-        fallback_api_key="backup-key",
+        fallback_api_key="backup-key",  # pragma: allowlist secret
         fallback_request_timeout_seconds="not-a-number",
     )
     constructed: list[dict[str, Any]] = []
@@ -328,7 +328,7 @@ def test_external_fallback_handles_invalid_timeout_and_empty_response(monkeypatc
         {
             "model": "claude-opus-4-6-thinking",
             "base_url": "https://backup.example.test",
-            "api_key": "backup-key",
+            "api_key": "backup-key",  # pragma: allowlist secret
             "max_retries": 1,
             "timeout": 37.0,
         }

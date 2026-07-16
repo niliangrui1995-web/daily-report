@@ -927,6 +927,9 @@ def test_opus_models_have_independent_900_second_budgets_with_stage_cleanup_marg
     assert settings.opus_adapter.timeout == 900
     assert settings.opus_adapter.extra_kwargs["total_timeout_seconds"] == 900
     assert settings.opus_adapter.extra_kwargs["fallback_total_timeout_seconds"] == 900
+    assert settings.opus_adapter.base_url.rstrip("/") == settings.PRO_OPUS_BASE_URL.rstrip("/")
+    assert "fallback_base_url" not in settings.opus_adapter.extra_kwargs
+    assert "fallback_api_key" not in settings.opus_adapter.extra_kwargs
     combined_model_budget = (
         settings.OPUS_TOTAL_TIMEOUT_SECONDS
         + settings.OPUS_FALLBACK_TOTAL_TIMEOUT_SECONDS

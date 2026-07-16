@@ -909,6 +909,7 @@ def test_first_primary_timeout_switches_to_backup_without_primary_retry(monkeypa
     import requests
 
     models = []
+    urls = []
     sleeps = []
 
     class SuccessResponse:
@@ -919,6 +920,7 @@ def test_first_primary_timeout_switches_to_backup_without_primary_retry(monkeypa
             return {"status": "completed", "model": "backup-served", "output_text": "backup answer"}
 
     def post(_url, **kwargs):
+        urls.append(_url)
         model = kwargs["json"]["model"]
         models.append(model)
         if model == "gpt-5.6-sol":
@@ -941,6 +943,10 @@ def test_first_primary_timeout_switches_to_backup_without_primary_retry(monkeypa
 
     assert result.content == "backup answer"
     assert models == ["gpt-5.6-sol", "claude-opus-4-6-thinking"]
+    assert urls == [
+        "http://127.0.0.1:8317/v1/responses",
+        "http://127.0.0.1:8317/v1/responses",
+    ]
     assert sleeps == []
     assert result.response_metadata["model_provenance"]["fallback_reason_category"] == "timeout"
 

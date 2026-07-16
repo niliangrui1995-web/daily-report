@@ -44,8 +44,6 @@ from settings import (
     RECEIVER_EMAIL,
     GROK_API_KEY,
     INSECURE_TLS_ALLOWLIST,
-    OPUS_FALLBACK_API_KEY,
-    OPUS_FALLBACK_BASE_URL,
     PRO_OPUS_API_KEY,
     PRO_OPUS_BASE_URL,
     SEARCH_API_KEY_POOL,
@@ -515,22 +513,13 @@ def _collect_preflight(
         )
         endpoint_ok, endpoint_detail = _probe_local_model_endpoint(PRO_OPUS_BASE_URL, PRO_OPUS_API_KEY)
         add_check("model_endpoint", endpoint_ok, endpoint_detail)
-        fallback_endpoint_ok, _, fallback_endpoint_error = validate_model_base_url(
-            OPUS_FALLBACK_BASE_URL
-        )
-        fallback_is_independent = bool(
-            fallback_endpoint_ok
-            and OPUS_FALLBACK_API_KEY
-            and OPUS_FALLBACK_BASE_URL.rstrip('/') != PRO_OPUS_BASE_URL.rstrip('/')
-        )
-        fallback_host = (urlparse(OPUS_FALLBACK_BASE_URL).hostname or "").strip().lower()
+        fallback_host = (urlparse(PRO_OPUS_BASE_URL).hostname or "").strip().lower()
         fallback_detail = (
-            f"independent endpoint configured host={fallback_host}"
-            if fallback_is_independent
-            else fallback_endpoint_error
-            or "independent fallback endpoint or API key is missing"
+            f"same endpoint model failover host={fallback_host}"
+            if endpoint_ok
+            else f"shared model endpoint unavailable: {endpoint_detail}"
         )
-        add_check("opus_fallback", fallback_is_independent, fallback_detail)
+        add_check("opus_fallback", endpoint_ok, fallback_detail)
 
     if full_preflight or delivery_only:
         delivery_requires_email = True

@@ -32,8 +32,6 @@ def _successful_preflight(pipeline_cli, monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(pipeline_cli, "ANTIGRAVITY_API_KEY", "secret")
     monkeypatch.setattr(pipeline_cli, "PRO_OPUS_BASE_URL", "http://127.0.0.1:8317/v1")
     monkeypatch.setattr(pipeline_cli, "PRO_OPUS_API_KEY", "secret")
-    monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_BASE_URL", "https://backup.example.test")
-    monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_API_KEY", "backup-secret")
     monkeypatch.setattr(pipeline_cli, "EMAIL_ADDRESS", "sender@example.com")
     monkeypatch.setattr(pipeline_cli, "EMAIL_PASSWORD", "smtp-secret")
     monkeypatch.setattr(pipeline_cli, "RECEIVER_EMAIL", "receiver@example.com")
@@ -666,19 +664,22 @@ def test_preflight_fails_when_local_model_endpoint_is_unreachable(monkeypatch, t
     }
 
 
-def test_preflight_requires_independent_opus_fallback(monkeypatch, tmp_path):
+def test_preflight_reports_same_endpoint_opus_fallback(monkeypatch, tmp_path):
     import pipeline_cli
 
     _successful_preflight(pipeline_cli, monkeypatch, tmp_path)
-    monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_BASE_URL", pipeline_cli.PRO_OPUS_BASE_URL)
-    monkeypatch.setattr(pipeline_cli, "OPUS_FALLBACK_API_KEY", "backup-secret")
     monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: None)
 
     result = pipeline_cli._collect_preflight(strict=True)
     fallback_check = next(item for item in result["checks"] if item["name"] == "opus_fallback")
 
-    assert result["summary"]["exit_code"] == pipeline_cli.EXIT_CHECK_FAILED
-    assert fallback_check["ok"] is False
+    assert result["summary"]["exit_code"] == pipeline_cli.EXIT_OK
+    assert fallback_check == {
+        "name": "opus_fallback",
+        "ok": True,
+        "detail": "same endpoint model failover host=127.0.0.1",
+        "severity": "error",
+    }
 
 
 @pytest.mark.parametrize(

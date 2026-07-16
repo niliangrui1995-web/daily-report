@@ -91,14 +91,6 @@ PRO_OPUS_BASE_URL = os.environ.get('PRO_OPUS_BASE_URL', ANTIGRAVITY_BASE_URL)
 PRO_OPUS_API_KEY = os.environ.get('PRO_OPUS_API_KEY', ANTIGRAVITY_API_KEY)
 AUDIT_FALLBACK_BASE_URL = os.environ.get('AUDIT_FALLBACK_BASE_URL', '').strip()
 AUDIT_FALLBACK_API_KEY = os.environ.get('AUDIT_FALLBACK_API_KEY', '').strip()
-OPUS_FALLBACK_BASE_URL = os.environ.get(
-    'OPUS_FALLBACK_BASE_URL',
-    AUDIT_FALLBACK_BASE_URL,
-).strip()
-OPUS_FALLBACK_API_KEY = os.environ.get(
-    'OPUS_FALLBACK_API_KEY',
-    AUDIT_FALLBACK_API_KEY,
-).strip()
 
 GEMINI_SEARCH_DIRECT_URL = 'https://generativelanguage.googleapis.com'
 GEMINI_PRO_API_KEY = os.environ.get('GEMINI_PRO_API_KEY', '').strip()
@@ -255,12 +247,6 @@ def _get_opus_adapter():
             total_timeout_seconds=OPUS_TOTAL_TIMEOUT_SECONDS,
             fallback_total_timeout_seconds=OPUS_FALLBACK_TOTAL_TIMEOUT_SECONDS,
             fallback_model=OPUS_FALLBACK_MODEL,
-            fallback_base_url=(
-                _normalize_anthropic_base_url(OPUS_FALLBACK_BASE_URL)
-                if OPUS_FALLBACK_BASE_URL
-                else ''
-            ),
-            fallback_api_key=OPUS_FALLBACK_API_KEY,
             fallback_request_timeout_seconds=OPUS_MODEL_TIMEOUT_SECONDS,
             failover_categories=OPUS_IMMEDIATE_FAILOVER_CATEGORIES,
         )

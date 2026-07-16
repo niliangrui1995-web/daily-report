@@ -88,8 +88,7 @@ notepad .\每日战报\.env
 | `TDX_ROOT` | 本地通达信数据根，默认 `D:\HT`；需包含 `T0002\hq_cache` 和 `vipdoc` |
 | `ANTIGRAVITY_BASE_URL` | OpenAI 兼容模型服务地址；回环地址可用 HTTP，远端地址必须用 HTTPS；默认 `http://127.0.0.1:8045` |
 | `ANTIGRAVITY_API_KEY` | Pro/GPT-5.6 Sol/Agent 兼容模型鉴权 |
-| `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 覆盖 P6/P9 GPT-5.6 Sol Max 模型服务；未配置时沿用 Antigravity 配置 |
-| `OPUS_FALLBACK_BASE_URL` / `OPUS_FALLBACK_API_KEY` | P6/P9 的独立 Claude 备胎接口；未单独配置时复用审计备用接口，仍为空时退回同一模型网关切模 |
+| `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 覆盖 P6/P9 GPT-5.6 Sol Max 模型服务；主备模型固定复用该 Responses 接口，未配置时沿用 Antigravity 配置 |
 | `AUDIT_FALLBACK_BASE_URL` / `AUDIT_FALLBACK_API_KEY` | P5/P7.5/P7a 审计备用 Anthropic 接口；主接口失败后使用相同 `AUDIT_MODEL` |
 | `GEMINI_SEARCH_API_KEYS` | Gemini 搜索 key 池，逗号分隔 |
 | `GEMINI_SEARCH_MODEL` | Gemini 搜索模型，默认 `gemini-2.5-flash` |
@@ -307,7 +306,7 @@ P4 ─────────┘    硬门禁          软门禁          软�
 | P6 | `gpt-5.6-sol` 900s | `claude-opus-4-6-thinking` 900s | 认证、风控、权限、超时、服务端错误或 HTTP 200 空正文立即切备；JSON/完整性失败后的第二轮直接使用备胎 |
 | P9 | `gpt-5.6-sol` 900s | `claude-opus-4-6-thinking` 900s | 与 P6 相同，主备各自拥有完整 900s；无效报告修复轮不再重复消耗主模型 |
 
-P2 和 P5 只有在对应备用接口及密钥已配置时才能切备。P2 已成功的分批会保留；后续分批失败时记录降级，不丢弃前面的结果。P5 的 900s 控制阶段可容纳两轮 JSON 生成/修复所需的主备调用。P6/P9 优先使用独立 `OPUS_FALLBACK_*` 接口；若未单独配置，则复用 `AUDIT_FALLBACK_*`，最后才降级为同网关切换模型。首轮最坏主备共 1800s，语义修复轮只使用 900s 备胎，3900s 控制阶段仍为落盘、P4 和进程收尾保留余量。429 限流按剩余预算做有限退避，不会无限重试挤占备胎时间。
+P2 和 P5 只有在对应备用接口及密钥已配置时才能切备。P2 已成功的分批会保留；后续分批失败时记录降级，不丢弃前面的结果。P5 的 900s 控制阶段可容纳两轮 JSON 生成/修复所需的主备调用。P6/P9 的主模型 `gpt-5.6-sol` 与备胎模型 `claude-opus-4-6-thinking` 固定复用 `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY`，并继续使用 Responses API；切备只更换模型，不会改用 `AUDIT_FALLBACK_*`。首轮最坏主备共 1800s，语义修复轮只使用 900s 备胎，3900s 控制阶段仍为落盘、P4 和进程收尾保留余量。429 限流按剩余预算做有限退避，不会无限重试挤占备胎时间。
 
 ### 当天断点续跑
 
@@ -367,7 +366,7 @@ P9 写 Markdown 前先记录 `report_save_in_progress`，原子保存后立即�
 - 输出根目录、当日目录和日志目录
 - `prompts/` 目录和关键 prompt 文件
 - `ANTIGRAVITY_API_KEY`
-- P6/P9 主模型端点连通性与独立 `OPUS_FALLBACK_*` 备胎配置
+- P6/P9 主备模型共用的 `PRO_OPUS_BASE_URL` 端点连通性
 - `GROK_API_KEY`
 - Gemini 搜索 key 池数量
 - 关键依赖可导入状态

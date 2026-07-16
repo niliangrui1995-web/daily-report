@@ -1,8 +1,8 @@
-﻿# VCP Hunter 北美 AI 产业链情报战报系统
+# VCP Hunter 北美 AI 产业链情报战报系统
 
 > 按 A 股交易日运行的多阶段情报流水线：采集北美 AI 产业链信息，审计证据，映射 A 股受益方向，生成战报并邮件分发。
 
-Last verified: 2026-07-15
+Last verified: 2026-07-16
 
 ---
 
@@ -88,15 +88,18 @@ notepad .\每日战报\.env
 | `TDX_ROOT` | 本地通达信数据根，默认 `D:\HT`；需包含 `T0002\hq_cache` 和 `vipdoc` |
 | `ANTIGRAVITY_BASE_URL` | OpenAI 兼容模型服务地址；回环地址可用 HTTP，远端地址必须用 HTTPS；默认 `http://127.0.0.1:8045` |
 | `ANTIGRAVITY_API_KEY` | Pro/GPT-5.6 Sol/Agent 兼容模型鉴权 |
-| `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 覆盖 P6/P9 GPT-5.6 Sol Max 模型服务；主备模型固定复用该 Responses 接口，未配置时沿用 Antigravity 配置 |
-| `AUDIT_FALLBACK_BASE_URL` / `AUDIT_FALLBACK_API_KEY` | P5/P7.5/P7a 审计备用 Anthropic 接口；主接口失败后使用相同 `AUDIT_MODEL` |
+| `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` | 本地模型服务：P5/P7a/P7.5 主审计走 Chat Completions，P6/P9 主备模型固定复用 Responses 接口；未配置时沿用 Antigravity 配置 |
+| `AUDIT_FALLBACK_BASE_URL` / `AUDIT_FALLBACK_API_KEY` | P5/P7.5/P7a 的 Claude 专用备用接口；当前最终请求为 `https://cldapi.com/v1/messages`，不得与 Grok 备用密钥混用 |
 | `GEMINI_SEARCH_API_KEYS` | Gemini 搜索 key 池，逗号分隔 |
 | `GEMINI_SEARCH_MODEL` | Gemini 搜索模型，默认 `gemini-2.5-flash` |
 | `AUDIT_MODEL` | P5/P7a/P7.5 审计模型，默认 `claude-sonnet-4-6`；兼容旧变量 `GEMINI_PRO_MODEL` |
 | `GEMINI_PRO_API_KEY` | Gemini 审计模型专用 key；仅当 `AUDIT_MODEL` 使用 Gemini 3.5 时生效 |
 | `TAVILY_API_KEY` | Tavily 备用搜索 |
 | `GROK_API_KEY` | P2 X/Grok 情报采集 |
+| `GROK_BASE_URL` | P2 Grok 主接口根地址，默认 `https://api.x.ai`，最终请求路径为 `/v1/responses` |
 | `GROK_MODEL` | P2 Grok 模型，默认 `grok-4.3` |
+| `GROK_FALLBACK_BASE_URL` / `GROK_FALLBACK_API_KEY` | P2 Grok 专用备用接口和密钥；当前最终请求为 `https://cldapi.com/v1/responses`，不得与 Claude 审计备用密钥混用 |
+| `GROK_FALLBACK_MODEL` | P2 Grok 备用模型，默认 `grok-4.5` |
 | `GROK_REASONING_EFFORT` | P2 Grok 推理强度，默认 `none` 降低推理 token 成本 |
 | `GROK_MAX_OUTPUT_TOKENS` | P2 Grok 单批输出上限，默认 `4096` |
 | `GROK_NATIVE_REASONING_EFFORT` | 通用 Grok adapter 推理强度覆盖，默认沿用 `GROK_REASONING_EFFORT` |
@@ -296,6 +299,36 @@ P4 ─────────┘    硬门禁          软门禁          软�
 | `roi` | Layer ROI 贡献评估或独立恢复 | 180s |
 
 阶段由 `pipeline_runtime.py` 在可终止子进程中执行。控制阶段超时写入 `failed_timeout`，异常写入 `failed_exception`；软门禁失败后继续，硬门禁失败后停止。
+
+### 各环节模型与接口总览
+
+以下内容按 2026-07-16 的当前代码和本机非敏感配置核对。表中 URL 是最终请求路径，不包含任何密钥值。
+
+| 环节 | 是否调用模型 | 主链路 | 备用/降级链路 | 鉴权变量 |
+| --- | --- | --- | --- | --- |
+| P1 RSS/Web 采集 | 否 | RSS 与网页抓取 | 单个来源失败时保留其他成功来源 | 按公开数据源访问，无统一模型密钥 |
+| P2 X/Grok 情报 | 是 | `grok-4.3` → `https://api.x.ai/v1/responses` | `grok-4.5` → `https://cldapi.com/v1/responses` | 主：`GROK_API_KEY`；备：`GROK_FALLBACK_API_KEY` |
+| P3 机动搜索 | 是 | `gemini-2.5-flash` + Google Search → `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent` | Tavily 搜索 API → `https://api.tavily.com/search`；Tavily 是搜索降级通道，不是指定的备用 LLM | 主：`GEMINI_SEARCH_API_KEYS`；备：`TAVILY_API_KEY` |
+| P4 海外行情 | 否 | `yfinance` 行情数据 | 数据缺失时由阶段状态触发后续恢复 | 无模型密钥 |
+| P5 证据审计 | 是 | `claude-sonnet-4-6` → `http://127.0.0.1:8317/v1/chat/completions` | 同模型 → `https://cldapi.com/v1/messages` | 主：`PRO_OPUS_API_KEY`；备：`AUDIT_FALLBACK_API_KEY` |
+| P6 A 股映射 | 是 | `gpt-5.6-sol` → `http://127.0.0.1:8317/v1/responses` | `claude-opus-4-6-thinking` → 同一个 `/v1/responses` | 主备共用 `PRO_OPUS_API_KEY` |
+| P7 深度研究 | 是 | 与 P3 相同的 `gemini-2.5-flash` 搜索链路 | 与 P3 相同的 Tavily 搜索降级通道 | `GEMINI_SEARCH_API_KEYS` / `TAVILY_API_KEY` |
+| P7a 深研审计 | 条件调用 | P7 正文超过 200 字时，与 P5 使用相同 Claude 主链路 | 与 P5 使用相同 Claude 备用链路；审计失败时透传原始 P7 | `PRO_OPUS_API_KEY` / `AUDIT_FALLBACK_API_KEY` |
+| P7.5 补充搜索 | 条件调用 | 与 P3 相同的 Gemini 搜索链路 | 与 P3 相同的 Tavily 搜索降级通道 | `GEMINI_SEARCH_API_KEYS` / `TAVILY_API_KEY` |
+| P7.5 补充审计 | 条件调用 | 搜索产生有效正文后，与 P5 使用相同 Claude 主链路 | 与 P5 使用相同 Claude 备用链路 | `PRO_OPUS_API_KEY` / `AUDIT_FALLBACK_API_KEY` |
+| P8 技术面 | 否 | 从 `TDX_ROOT=D:\HT` 读取本地通达信数据并计算指标 | 无可用 K 线时记录结构化降级 | `TDX_ROOT`，无模型密钥 |
+| P9 战报生成 | 是 | `gpt-5.6-sol` → `http://127.0.0.1:8317/v1/responses` | `claude-opus-4-6-thinking` → 同一个 `/v1/responses` | 主备共用 `PRO_OPUS_API_KEY` |
+| 邮件分发 | 否 | SMTP TLS 登录并发送已保存报告 | 失败后进入 `delivery_resume` | `EMAIL_ADDRESS` / `EMAIL_PASSWORD` / `RECEIVER_EMAIL` |
+| Layer ROI | 否 | 本地规则计算贡献与分层统计 | 缺失时进入 `roi_resume` | 无模型密钥 |
+
+密钥边界必须保持如下：
+
+- `GROK_FALLBACK_API_KEY` 只用于 P2 的 Grok 备用调用。
+- `AUDIT_FALLBACK_API_KEY` 只用于 P5、P7a、P7.5 的 Claude 备用审计。
+- `PRO_OPUS_API_KEY` 用于本地 `8317` 模型服务；P6/P9 切换到 Claude 备模时仍复用该密钥和 `/v1/responses`，不会切到 cldapi。
+- `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` 未配置时才沿用 `ANTIGRAVITY_BASE_URL` / `ANTIGRAVITY_API_KEY`。
+- Tavily 只作为 Gemini 搜索失败后的降级通道；P3 缺少 Gemini 搜索密钥池时会直接跳过，不能只靠 `TAVILY_API_KEY` 单独启动。
+- README 只记录变量名，不记录密钥值；实际密钥保存在被 Git 忽略的 `.env` 或外部秘密管理系统中。
 
 ### 主模型、备胎与时间预算
 

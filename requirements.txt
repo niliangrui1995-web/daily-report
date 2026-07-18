@@ -2,9 +2,9 @@
 #    uv export --locked --no-dev --no-hashes --no-emit-project --output-file requirements.txt
 annotated-types==0.7.0
     # via pydantic
-anthropic==0.116.0
+anthropic==0.117.0
     # via vcp-hunter-daily-report
-anyio==4.14.1
+anyio==4.14.2
     # via
     #   anthropic
     #   google-genai
@@ -50,9 +50,9 @@ docstring-parser==0.18.0
     # via anthropic
 feedparser==6.0.12
     # via vcp-hunter-daily-report
-google-auth==2.55.2
+google-auth==2.56.0
     # via google-genai
-google-genai==2.11.0
+google-genai==2.12.1
     # via vcp-hunter-daily-report
 h11==0.16.0
     # via httpcore
@@ -86,7 +86,7 @@ numpy==2.5.1
     # via
     #   pandas
     #   yfinance
-openai==2.45.0
+openai==2.46.0
     # via vcp-hunter-daily-report
 orjson==3.11.9
     # via scrapling
@@ -94,9 +94,9 @@ pandas==3.0.3
     # via
     #   vcp-hunter-daily-report
     #   yfinance
-peewee==4.1.2
+peewee==4.2.6
     # via yfinance
-platformdirs==4.10.0
+platformdirs==4.10.1
     # via yfinance
 protobuf==7.35.1
     # via yfinance
@@ -112,7 +112,7 @@ pydantic==2.13.4
     #   google-genai
     #   openai
     #   vcp-hunter-daily-report
-pydantic-core==2.46.4
+pydantic-core==2.47.0
     # via pydantic
 pygments==2.20.0
     # via rich
@@ -132,7 +132,7 @@ requests==2.34.2
     #   yfinance
 rich==15.0.0
     # via curl-cffi
-scrapling==0.4.10
+scrapling==0.4.11
     # via vcp-hunter-daily-report
 setuptools==83.0.0
     # via vcp-hunter-daily-report
@@ -151,7 +151,7 @@ tenacity==9.1.4
     # via google-genai
 tld==0.13.2
     # via scrapling
-tqdm==4.68.4
+tqdm==4.69.0
     # via openai
 typing-extensions==4.16.0
     # via
@@ -165,7 +165,7 @@ typing-extensions==4.16.0
     #   typing-inspection
 typing-inspection==0.4.2
     # via pydantic
-tzdata==2026.2 ; sys_platform == 'emscripten' or sys_platform == 'win32'
+tzdata==2026.3 ; sys_platform == 'emscripten' or sys_platform == 'win32'
     # via pandas
 urllib3==2.7.0
     # via requests
@@ -173,7 +173,7 @@ w3lib==2.4.1
     # via scrapling
 webencodings==0.5.1
     # via bleach
-websockets==16.0
+websockets==16.1.1
     # via
     #   google-genai
     #   yfinance

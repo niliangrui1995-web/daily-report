@@ -26,6 +26,7 @@ from p8_extractors import (
     extract_stock_tracks,
     extract_stocks_from_report,
     find_tdx_vipdoc as _find_tdx_vipdoc,
+    load_tdx_capital_snapshot as _load_tdx_capital_snapshot,
     read_day_file_simple,
     resolve_tdx_market_and_path as _resolve_tdx_market_and_path,
 )
@@ -46,6 +47,113 @@ __all__ = [
     'extract_stock_elasticity',
     'p8_search_stock_prices',
 ]
+
+
+def _positive_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _market_cap_tier(float_cap_yi):
+    if float_cap_yi is None:
+        return None
+    if float_cap_yi < 50:
+        return '🔥高弹'
+    if float_cap_yi <= 300:
+        return '⚡中弹'
+    return '🚂低弹中军'
+
+
+def _build_capital_profile(capital, latest_close, records):
+    capital = capital if isinstance(capital, dict) else {}
+    total_shares = _positive_number(capital.get('total_shares'))
+    float_shares = _positive_number(capital.get('float_shares'))
+    latest_close = _positive_number(latest_close)
+    total_cap_yi = (
+        round(total_shares * latest_close / 100_000_000, 1)
+        if total_shares and latest_close
+        else None
+    )
+    float_cap_yi = (
+        round(float_shares * latest_close / 100_000_000, 1)
+        if float_shares and latest_close
+        else None
+    )
+
+    turnover_values = []
+    if float_shares:
+        for record in records[-10:]:
+            volume = _positive_number(record.get('vol', record.get('volume')))
+            if volume is not None:
+                turnover_values.append(volume / float_shares * 100)
+    turnover_latest = round(turnover_values[-1], 2) if turnover_values else None
+    turnover_avg = round(sum(turnover_values) / len(turnover_values), 2) if turnover_values else None
+    turnover_anomaly = (
+        round(turnover_latest / turnover_avg, 2)
+        if turnover_latest is not None and turnover_avg
+        else None
+    )
+    if turnover_anomaly is None:
+        turnover_desc = '未提供'
+    elif turnover_anomaly >= 1.5:
+        turnover_desc = '明显放大'
+    elif turnover_anomaly <= 0.7:
+        turnover_desc = '明显收缩'
+    else:
+        turnover_desc = '正常'
+
+    return {
+        'total_shares': total_shares,
+        'float_shares': float_shares,
+        'total_cap_yi': total_cap_yi,
+        'liutong_cap_yi': float_cap_yi,
+        'market_cap_tier': _market_cap_tier(float_cap_yi),
+        'turnover_latest_pct': turnover_latest,
+        'turnover_10d_avg': turnover_avg,
+        'turnover_anomaly': turnover_anomaly,
+        'turnover_anom_desc': turnover_desc,
+        'capital_updated_at': str(capital.get('updated_at') or ''),
+        'capital_source': str(capital.get('source') or ''),
+    }
+
+
+def _capital_markdown(profile):
+    if profile['liutong_cap_yi'] is None:
+        return '- 市值：未提供（本地流通股本数据缺失）'
+    total_text = (
+        f"{profile['total_cap_yi']:.1f} 亿元"
+        if profile['total_cap_yi'] is not None
+        else '未提供'
+    )
+    updated_text = f" | 股本日期 {profile['capital_updated_at']}" if profile['capital_updated_at'] else ''
+    return (
+        f"- 市值：总市值 {total_text} | 流通市值 {profile['liutong_cap_yi']:.1f} 亿元"
+        f"（{profile['market_cap_tier']}）{updated_text}"
+    )
+
+
+def _turnover_markdown(profile):
+    if profile['turnover_10d_avg'] is None:
+        return '换手：未提供（本地流通股本数据缺失）'
+    return (
+        f"换手：最新 {profile['turnover_latest_pct']:.2f}% | "
+        f"10日均值 {profile['turnover_10d_avg']:.2f}%（{profile['turnover_anom_desc']}）"
+    )
+
+
+def _capital_finance_data(profile):
+    return {
+        'total_cap_yi': profile['total_cap_yi'],
+        'liutong_cap_yi': profile['liutong_cap_yi'],
+        'total_shares': profile['total_shares'],
+        'float_shares': profile['float_shares'],
+        'capital_updated_at': profile['capital_updated_at'],
+        'source': profile['capital_source'],
+        'jinglirun_yi': None,
+    }
 
 def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
     if not stocks:
@@ -83,6 +191,10 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
             },
         )
 
+    capital_snapshot = _load_tdx_capital_snapshot(
+        vipdoc,
+        [code for _name, code in stocks],
+    )
     market_index_lines = ["## 同期大盘参考\n\n"]
     _index_returns = {}
     _index_list = [('上证指数', 'sh', 'sh999999'), ('创业板指', 'sz', 'sz399006')]
@@ -138,11 +250,17 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
                 low_250d = min(closes)
                 high_250d = max(closes)
                 pct_250d = (r['close'] - low_250d) / (high_250d - low_250d) * 100 if high_250d > low_250d else 50
+                capital_profile = _build_capital_profile(capital_snapshot.get(code), r['close'], records)
+                cap_text = (
+                    f" | {capital_profile['market_cap_tier']}（流通市值 {capital_profile['liutong_cap_yi']:.1f} 亿元）"
+                    if capital_profile['liutong_cap_yi'] is not None
+                    else ' | 市值档位未提供'
+                )
                 low_elasticity_names.append(
                     f"- 【{track_label}】{name}({code}) | 收盘 {r['close']:.2f}元 | "
                     f"20日{chg_1m:+.1f}% | 60日{chg_3m:+.1f}% | 250日分位{int(pct_250d)}% | "
                     f"RS{rs_20d:+.1f}%/{rs_60d:+.1f}% | ATR{atr_pct:.1f}% | "
-                    f"周线{weekly['trend']} | 布林宽{boll_width:.1f}%"
+                    f"周线{weekly['trend']} | 布林宽{boll_width:.1f}%{cap_text}"
                 )
                 p8_json_db[code] = {
                     'name': name,
@@ -159,12 +277,20 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
                     'atr_pct': round(atr_pct, 1),
                     'boll_width_pct': round(boll_width, 1),
                     'weekly_trend': weekly['trend'],
+                    'market_cap_tier': capital_profile['market_cap_tier'],
                     'price_data': {
                         'latest_close': round(r['close'], 2),
                         'chg_1m_pct': round(chg_1m, 1),
                         'chg_3m_pct': round(chg_3m, 1),
                         'percentile_250d': round(pct_250d, 1),
                     },
+                    'tech_indicators': {
+                        'atr_pct': round(atr_pct, 1),
+                        'turnover_latest_pct': capital_profile['turnover_latest_pct'],
+                        'turnover_10d_avg': capital_profile['turnover_10d_avg'],
+                        'turnover_anomaly': capital_profile['turnover_anomaly'],
+                    },
+                    'finance_data': _capital_finance_data(capital_profile),
                 }
             else:
                 low_elasticity_names.append(f"- 【{track_label}】{name}({code}) | 本地 K 线缺失，跳过技术画像")
@@ -198,6 +324,7 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
         n_rec = len(records)
         latest_r = records[-1]
         latest_c = closes[-1]
+        capital_profile = _build_capital_profile(capital_snapshot.get(code), latest_c, records)
 
         # 涨跌幅, 分位
         low_250d, high_250d = min(closes), max(closes)
@@ -287,8 +414,9 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
 - 收盘 {latest_c:.2f} 元（{latest_r['date'][4:6]}-{latest_r['date'][6:8]}）
 - 涨跌：近20日 {chg_1m:+.1f}% | 近60日 {chg_3m:+.1f}% | 250日分位 {int(pct_250d)}%（{pos_desc}）
 - 距60日前前高 {dist_to_60d_high:+.1f}%（回撤 {abs(dist_to_60d_high):.1f}%）| 突破：{breakouts}
+- {_capital_markdown(capital_profile)[2:]}
 - 均线：5日{ma5_pct:+.1f}%，10日{ma10_pct:+.1f}%，20日{ma20_pct:+.1f}%，60日{ma60_pct:+.1f}% | 密集度 {ma_spread:.1f}%
-- 量能：{vol_desc}（量比 {vr:.2f}，5日/60日 {vs:.2f}）| 换手：未提供
+- 量能：{vol_desc}（量比 {vr:.2f}，5日/60日 {vs:.2f}）| {_turnover_markdown(capital_profile)}
 - 波动：布林宽 {boll_w:.1f}%{b_desc} | ATR {atr:.1f}% 压缩比 {ac:.2f}（{c_desc}）
 - 动量：MACD {macd_stat}({macd_val:.3f}) | RSI {rsi_val}（{rsi_desc}）| KDJ J={kdj_j}（{kdj_desc}）| 阳线 {int(yang_ratio)}%
 - ⚡ RS：20日超额 {rs_20:+.1f}% 60日超额 {rs_60:+.1f}%（{rs_desc}）
@@ -302,6 +430,7 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
             "name": name,
             "market": market,
             "date": latest_r['date'],
+            "market_cap_tier": capital_profile['market_cap_tier'],
             "price_data": {
                 "latest_close": latest_c,
                 "chg_1m_pct": round(chg_1m, 1),
@@ -315,9 +444,11 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
             "tech_indicators": {
                 "vol_ratio_5d_20d": round(vr, 2),
                 "vol_shrink_5d_60d": round(vs, 2),
-                "turnover_10d_avg": None,
-                "turnover_anomaly": None,
+                "turnover_latest_pct": capital_profile['turnover_latest_pct'],
+                "turnover_10d_avg": capital_profile['turnover_10d_avg'],
+                "turnover_anomaly": capital_profile['turnover_anomaly'],
                 "boll_width_pct": round(boll_w, 1),
+                "atr_pct": round(atr, 1),
                 "atr_compress_ratio": round(ac, 2),
                 "ma_spread_pct": round(ma_spread, 1),
                 "macd_bar": round(macd_val, 3),
@@ -325,16 +456,14 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
                 "kdj_j": kdj_j,
                 "yang_ratio_20d": yang_ratio
             },
-            "finance_data": {
-                "total_cap_yi": None, "liutong_cap_yi": None, "jinglirun_yi": None
-            },
+            "finance_data": _capital_finance_data(capital_profile),
             "tags": {
                 "vol_desc": vol_desc,
                 "pos_desc": pos_desc,
                 "breakouts": [] if breakouts == "无" else [breakouts],
                 "rsi_desc": rsi_desc,
                 "macd_status": macd_stat,
-                "turnover_anom_desc": "未提供"
+                "turnover_anom_desc": capital_profile['turnover_anom_desc']
             },
             "relative_strength": {
                 "rs_excess_20d": round(rs_20, 1),
@@ -376,6 +505,11 @@ def p8_search_stock_prices(stocks=None, track_map=None, elasticity_map=None):
         metrics={
             'stocks_requested': len(stocks),
             'stocks_with_data': stocks_with_data,
+            'capital_records': sum(
+                1
+                for _name, code in stocks
+                if _positive_number((capital_snapshot.get(code) or {}).get('float_shares'))
+            ),
             'data_state': 'valid' if has_usable_data else 'degraded_empty',
             'structured_degraded': not has_usable_data,
             'degrade_reason': (

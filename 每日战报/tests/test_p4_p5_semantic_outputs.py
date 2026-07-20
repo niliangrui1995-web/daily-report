@@ -183,6 +183,7 @@ def audit_harness(monkeypatch):
         "update_run_manifest",
         lambda stage, **kwargs: manifests.append((stage, kwargs)),
     )
+    monkeypatch.setattr(audit_engine.time, "sleep", lambda _seconds: None)
     return payload, manifests, json_writes, text_writes
 
 

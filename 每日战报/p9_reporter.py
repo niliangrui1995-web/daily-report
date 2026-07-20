@@ -578,6 +578,8 @@ def _load_p8_price_db() -> dict[str, Any]:
 
 def _extract_p8_fields(item: dict[str, Any]) -> dict[str, str]:
     price_data = item.get("price_data") if isinstance(item.get("price_data"), dict) else {}
+    finance_data = item.get("finance_data") if isinstance(item.get("finance_data"), dict) else {}
+    tech_indicators = item.get("tech_indicators") if isinstance(item.get("tech_indicators"), dict) else {}
     tags = item.get("tags") if isinstance(item.get("tags"), dict) else {}
     rs = item.get("relative_strength") if isinstance(item.get("relative_strength"), dict) else {}
     weekly = item.get("weekly_level") if isinstance(item.get("weekly_level"), dict) else {}
@@ -593,6 +595,22 @@ def _extract_p8_fields(item: dict[str, Any]) -> dict[str, str]:
         fields["chg_3m"] = chg_3m
     if percentile:
         fields["percentile_250d"] = percentile
+
+    float_cap_yi = _coerce_float(finance_data.get("liutong_cap_yi"))
+    market_cap_tier = item.get("market_cap_tier")
+    if not market_cap_tier and float_cap_yi is not None:
+        if float_cap_yi < 50:
+            market_cap_tier = "🔥高弹"
+        elif float_cap_yi <= 300:
+            market_cap_tier = "⚡中弹"
+        else:
+            market_cap_tier = "🚂低弹中军"
+    if market_cap_tier and float_cap_yi is not None:
+        elasticity = f"{market_cap_tier}（流通市值{float_cap_yi:.1f}亿元）"
+        atr_pct = _coerce_float(tech_indicators.get("atr_pct", item.get("atr_pct")))
+        if atr_pct is not None:
+            elasticity += f"；ATR {atr_pct:.1f}%"
+        fields["elasticity"] = elasticity
 
     vol_desc = tags.get("vol_desc")
     if vol_desc:
@@ -635,7 +653,7 @@ def _backfill_sniper_tables_from_p8(data: dict[str, Any], p8_db: dict[str, Any] 
             fields = _extract_p8_fields(item)
             changed = False
             for key, value in fields.items():
-                if key in {"price", "chg_3m", "percentile_250d"} or _is_missing_field(row.get(key)):
+                if key in {"price", "chg_3m", "percentile_250d", "elasticity"} or _is_missing_field(row.get(key)):
                     if row.get(key) != value:
                         row[key] = value
                         changed = True

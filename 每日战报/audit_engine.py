@@ -30,15 +30,25 @@ from tdx_stock_universe import (
 )
 from utils import extract_json_from_llm_response
 
-AUDIT_JSON_RETRY_LIMIT = 1
+AUDIT_RETRY_LIMIT = 1
 AUDIT_OUTPUT_LIMITS = """
 
 STRICT OUTPUT LIMITS FOR MACHINE PARSING:
 - Return raw JSON only. Do not wrap it in ```json fences.
 - Keep high_trust to at most 80 items and medium_trust to at most 80 items.
 - Keep deleted to at most 30 representative items; summary.deleted may still count all removed items.
+- Set summary.passed to exactly len(high_trust) + len(medium_trust) after finalizing both arrays.
+- Do not include omitted or unlisted passed items in summary.passed.
 - If content is too long, prefer fewer items over invalid or truncated JSON.
 """
+AUDIT_SEMANTIC_RETRY_REASONS = frozenset(
+    {
+        'passed_count_mismatch',
+        'deleted_count_mismatch',
+        'deleted_count_without_items',
+        'deleted_items_without_count',
+    }
+)
 
 
 class _AuditSemanticError(ValueError):
@@ -144,7 +154,13 @@ def _invoke_audit_with_fallback(prompt: str, layer_name: str, *, min_content_cha
         'audit_primary_error': primary_error[:500],
     }
 
-def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24h', _retry_count: int = 0) -> str:
+def gemini_pro_audit(
+    raw_data: str,
+    audit_type: str = 'p5',
+    backtrack: str = '24h',
+    _retry_count: int = 0,
+    _retry_reason: str = '',
+) -> str:
     layer_name = 'P5' if audit_type == 'p5' else 'P7.5'
     stage_key = 'p5' if audit_type == 'p5' else 'p75'
     file_prefix = 'P7.5_补充审计' if layer_name == 'P7.5' else 'P5_审计'
@@ -206,6 +222,12 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
         vanguard_list=vanguard_list,
         raw_data=raw_data
     ) + AUDIT_OUTPUT_LIMITS
+    if _retry_reason:
+        prompt += (
+            '\nRETRY CORRECTION REQUIRED:\n'
+            f'- The previous response failed validation with: {_retry_reason}.\n'
+            '- Recalculate every summary count from the final arrays before returning JSON.\n'
+        )
 
     t0 = time.time()
     try:
@@ -326,15 +348,36 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
         return '' if audit_state['no_results'] else clean_text
 
     except _AuditSemanticError as e:
+        should_retry = (
+            _retry_count < AUDIT_RETRY_LIMIT
+            and e.reason in AUDIT_SEMANTIC_RETRY_REASONS
+        )
         raw_path = ''
         try:
+            raw_prefix = (
+                f'{file_prefix}_RAW_SEMANTIC_INVALID_{_retry_count + 1}'
+                if should_retry
+                else f'{file_prefix}_RAW_SEMANTIC_INVALID'
+            )
             raw_path = write_text_artifact(
-                f'{file_prefix}_RAW_SEMANTIC_INVALID',
+                raw_prefix,
                 raw_content,
             )
         except Exception as write_exc:
             logging.warning(f'[{layer_name} audit] failed to save semantically invalid raw output: {write_exc}')
         logging.error(f'❌ [{layer_name} 审计] 结构化输出语义校验失败: {e.reason}')
+        if should_retry:
+            logging.warning(
+                f'[{layer_name} audit] semantic validation failed; retrying once with count correction'
+            )
+            time.sleep(5)
+            return gemini_pro_audit(
+                raw_data,
+                audit_type=audit_type,
+                backtrack=backtrack,
+                _retry_count=_retry_count + 1,
+                _retry_reason=e.reason,
+            )
         update_run_manifest(
             stage_key,
             status='failed_semantic_output',
@@ -358,10 +401,16 @@ def gemini_pro_audit(raw_data: str, audit_type: str = 'p5', backtrack: str = '24
         except Exception as write_exc:
             logging.warning(f'[{layer_name} audit] failed to save invalid raw output: {write_exc}')
         logging.error(f'❌ [{layer_name} 审计] JSON解析失败: {e}\n大模型幻觉原文: {raw_content[:200]}')
-        if _retry_count < AUDIT_JSON_RETRY_LIMIT:
+        if _retry_count < AUDIT_RETRY_LIMIT:
             logging.warning(f'[{layer_name} audit] JSON parse failed; retrying once with stricter output limits')
             time.sleep(5)
-            return gemini_pro_audit(raw_data, audit_type=audit_type, backtrack=backtrack, _retry_count=_retry_count + 1)
+            return gemini_pro_audit(
+                raw_data,
+                audit_type=audit_type,
+                backtrack=backtrack,
+                _retry_count=_retry_count + 1,
+                _retry_reason='json_parse_failed',
+            )
         update_run_manifest(
             stage_key,
             status='fallback_raw_llm',

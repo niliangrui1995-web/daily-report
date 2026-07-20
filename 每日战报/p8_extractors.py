@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import struct
@@ -125,3 +126,90 @@ def read_day_file_simple(filepath):
     except Exception as e:
         logging.error(f"[P8] 读取本地 K 线数据失败 ({filepath}): {e}")
         return []
+
+
+def load_tdx_capital_snapshot(vipdoc: str, codes):
+    """从通达信 base.dbf 读取指定股票的总股本与流通 A 股股本。"""
+    requested_codes = {
+        str(code).strip()
+        for code in (codes or [])
+        if re.fullmatch(r'\d{6}', str(code).strip())
+    }
+    if not requested_codes:
+        return {}
+
+    base_dbf = os.path.join(
+        os.path.dirname(os.path.normpath(vipdoc)),
+        'T0002',
+        'hq_cache',
+        'base.dbf',
+    )
+    try:
+        with open(base_dbf, 'rb') as f:
+            data = f.read()
+        if len(data) < 33:
+            raise ValueError('DBF header is incomplete')
+
+        record_count = struct.unpack_from('<I', data, 4)[0]
+        header_length = struct.unpack_from('<H', data, 8)[0]
+        record_length = struct.unpack_from('<H', data, 10)[0]
+        if header_length < 33 or record_length < 2 or header_length > len(data):
+            raise ValueError('DBF header lengths are invalid')
+
+        fields = {}
+        field_offset = 1
+        descriptor_offset = 32
+        while descriptor_offset + 32 <= header_length:
+            if data[descriptor_offset] == 0x0D:
+                break
+            descriptor = data[descriptor_offset:descriptor_offset + 32]
+            name = descriptor[:11].split(b'\x00', 1)[0].decode('ascii', errors='ignore').strip().upper()
+            length = descriptor[16]
+            if name and length:
+                fields[name] = (field_offset, length)
+            field_offset += length
+            descriptor_offset += 32
+
+        if 'GPDM' not in fields or 'LTAG' not in fields:
+            raise ValueError('DBF is missing GPDM or LTAG fields')
+
+        def read_field(row, field_name):
+            field = fields.get(field_name)
+            if not field:
+                return ''
+            offset, length = field
+            return row[offset:offset + length].decode('ascii', errors='ignore').strip()
+
+        def parse_shares(row, field_name):
+            raw_value = read_field(row, field_name)
+            if not raw_value:
+                return None
+            value = float(raw_value) * 10_000.0
+            return value if value > 0 and math.isfinite(value) else None
+
+        snapshot = {}
+        available_records = max(0, (len(data) - header_length) // record_length)
+        for index in range(min(record_count, available_records)):
+            start = header_length + index * record_length
+            row = data[start:start + record_length]
+            if not row or row[0] == 0x2A:
+                continue
+            code = read_field(row, 'GPDM')
+            if code not in requested_codes:
+                continue
+            total_shares = parse_shares(row, 'ZGB')
+            float_shares = parse_shares(row, 'LTAG')
+            if total_shares is None and float_shares is None:
+                continue
+            snapshot[code] = {
+                'total_shares': total_shares,
+                'float_shares': float_shares,
+                'updated_at': read_field(row, 'GXRQ'),
+                'source': 'tdx_base_dbf',
+            }
+            if len(snapshot) == len(requested_codes):
+                break
+        return snapshot
+    except (OSError, IndexError, struct.error, TypeError, ValueError) as exc:
+        logging.warning('[P8] 读取本地股本数据失败 (%s): %s', base_dbf, exc)
+        return {}

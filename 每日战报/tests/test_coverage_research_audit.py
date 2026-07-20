@@ -896,6 +896,45 @@ def test_gemini_audit_json_retry_then_success(monkeypatch, audit_artifacts):
     assert manifests[-1][1]["metrics"]["retry_count"] == 1
 
 
+def test_gemini_audit_semantic_count_retry_then_success(monkeypatch, audit_artifacts):
+    manifests, _, text_writes = audit_artifacts
+    monkeypatch.setattr(
+        audit_engine,
+        "require_prompt",
+        lambda _name: "{layer_name}|{header_text}|{time_section}|{task_two}|{task_three}|{vanguard_list}|{raw_data}",
+    )
+    invokes = []
+    monkeypatch.setattr(
+        audit_engine,
+        "_invoke_audit_with_fallback",
+        lambda *args, **kwargs: invokes.append(args) or (
+            SimpleNamespace(content="model-json"),
+            _Adapter(),
+            {"audit_fallback_used": False},
+        ),
+    )
+    parser = Mock(
+        side_effect=[
+            _audit_success_data(high=["verified high"], medium=["verified medium"])
+            | {"summary": {"passed": 1, "deleted": 0}},
+            _audit_success_data(high=["verified high"], medium=["verified medium"]),
+        ]
+    )
+    monkeypatch.setattr(audit_engine, "extract_json_from_llm_response", parser)
+    sleeps = []
+    monkeypatch.setattr(audit_engine.time, "sleep", sleeps.append)
+
+    result = audit_engine.gemini_pro_audit("raw")
+
+    assert "verified high" in result and "verified medium" in result
+    assert len(invokes) == 2
+    assert "summary.passed" in invokes[0][0]
+    assert "passed_count_mismatch" in invokes[1][0]
+    assert sleeps == [5]
+    assert any("RAW_SEMANTIC_INVALID_1" in prefix for prefix, _ in text_writes)
+    assert manifests[-1][1]["metrics"]["retry_count"] == 1
+
+
 def test_gemini_audit_json_retry_exhausted_and_raw_write_failure(monkeypatch, audit_artifacts):
     manifests, _, _ = audit_artifacts
     monkeypatch.setattr(

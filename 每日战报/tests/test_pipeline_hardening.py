@@ -839,8 +839,11 @@ class TestReportStage:
         monkeypatch.setattr(p9_reporter.opus_adapter, "invoke", fake_invoke)
         monkeypatch.setattr(
             p9_reporter,
-            "_parse_report_payload",
-            lambda raw: {"core_signals": [], "today_advice": [], "risk_warning": []},
+            "_parse_report_payload_with_schema_validation",
+            lambda raw: (
+                {"core_signals": [], "today_advice": [], "risk_warning": []},
+                {"status": "valid", "revalidated": True},
+            ),
         )
         monkeypatch.setattr(p9_reporter, "_apply_evidence_guardrails", lambda data: (data, {}))
         monkeypatch.setattr(p9_reporter, "build_report_markdown", lambda data, today_str: "# report")

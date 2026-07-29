@@ -117,6 +117,105 @@ def test_parse_report_payload_rejects_incomplete_repaired_json():
         p9_reporter._parse_report_payload(raw)
 
 
+def test_p9_drops_only_target_missing_catalyst_and_records_schema_repair(monkeypatch):
+    import p9_reporter
+
+    payload = {
+        "x_intel_snipe": [],
+        "p3_machine_intel": [],
+        "core_signals": [],
+        "sniper_tables": [
+            {
+                "track_name": "高频覆铜板",
+                "targets": [
+                    {
+                        "name": "生益科技",
+                        "price": "125.99",
+                        "chg_3m": "+61.5%",
+                        "percentile_250d": "59%",
+                        "volume": "正常",
+                        "elasticity": "中军",
+                        "rs_strength": "60日强势",
+                        "weekly_level": "周线上行",
+                        "catalyst": "高频覆铜板需求增长",
+                        "risk": "波动风险",
+                    },
+                    {
+                        "name": "南亚新材",
+                        "price": "239.80",
+                        "chg_3m": "+37.0%",
+                        "percentile_250d": "53%",
+                        "volume": "正常",
+                        "elasticity": "中军",
+                        "rs_strength": "60日强势",
+                        "weekly_level": "周线上行",
+                        "risk": "极端波动",
+                    },
+                ],
+            }
+        ],
+        "fund_pathway": [],
+        "today_advice": [],
+        "risk_warning": [],
+    }
+    original = copy.deepcopy(payload)
+    captured: dict[str, object] = {"updates": [], "invocations": 0}
+
+    monkeypatch.setattr(
+        p9_reporter,
+        "require_prompt",
+        lambda _name: "{today_str}{p5_evidence}{p7_section}{p6_mapping}{p75_section}{price_data}{p2_section}{p3_section}{yfinance_section}",
+    )
+
+    def fake_invoke(_prompt, _config=None):
+        captured["invocations"] += 1
+        return SimpleNamespace(content=json.dumps(payload, ensure_ascii=False), thinking_content="")
+
+    monkeypatch.setattr(p9_reporter.opus_adapter, "invoke", fake_invoke)
+    monkeypatch.setattr(p9_reporter, "load_tdx_stock_code_map", lambda: {"生益科技": "600183"})
+    monkeypatch.setattr(p9_reporter, "_load_p8_price_db", lambda: {})
+    monkeypatch.setattr(p9_reporter, "write_text_artifact", lambda *_args, **_kwargs: "raw.md")
+    monkeypatch.setattr(
+        p9_reporter,
+        "write_json_artifact",
+        lambda _prefix, data, **_kwargs: captured.setdefault("json_payload", copy.deepcopy(data)) or "report.json",
+    )
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: captured["updates"].append((args, kwargs)),
+    )
+
+    report, _ = p9_reporter.p9_risk_analysis(
+        p5_evidence="P5 audited evidence",
+        p7_deep="P7 audited research",
+        p75_supplement="P7.5 audited supplement",
+        p6_mapping="P6 mapping",
+        price_data="P8 technical data " * 5,
+    )
+
+    assert payload == original
+    assert captured["invocations"] == 1
+    assert "生益科技" in report
+    assert "南亚新材" not in report
+    assert [row["name"] for row in captured["json_payload"]["sniper_tables"][0]["targets"]] == [
+        "生益科技"
+    ]
+    json_ready = captured["updates"][-1][1]
+    assert json_ready["status"] == "json_ready"
+    assert json_ready["metrics"]["schema_validation"] == {
+        "status": "repaired",
+        "repair_kind": "drop_invalid_target",
+        "paths": ["$.sniper_tables[0].targets[1].catalyst"],
+        "dropped_targets": 1,
+        "dropped_empty_tables": 0,
+        "revalidated": True,
+    }
+    assert json_ready["metrics"]["model_generation"]["status"] == "completed"
+    assert json_ready["metrics"]["delivery"]["mode"] == "model_generated"
+    assert json_ready["metrics"]["structured_degraded"] is True
+
+
 def test_backfill_soft_intel_sections_replaces_false_missing_placeholders():
     import p9_reporter
 
@@ -514,6 +613,168 @@ def test_p9_risk_analysis_blocks_raw_delivery_on_invalid_json(monkeypatch):
     assert captured["manifest_updates"][-1][1]["status"] == "failed_parse"
     assert captured["invoke_configs"][0] is None
     assert captured["invoke_configs"][1]["force_fallback"] is True
+
+
+def test_p9_two_model_network_failure_delivers_validated_checkpoint_fallback(monkeypatch):
+    import artifact_store
+    import checkpoint
+    import p9_reporter
+
+    run_ts = "20260728083002"
+    provenance = {
+        "requested_model": "gpt-5.6-sol",
+        "attempted_models": ["gpt-5.6-sol", "claude-opus-4-6-thinking"],
+        "fallback_used": True,
+        "fallback_model": "claude-opus-4-6-thinking",
+        "fallback_reason_category": "network_error",
+        "fallback_reason": "primary network unavailable",
+        "effective_model": "",
+        "final_error_category": "empty_response",
+        "final_error": "fallback provider returned no output text",
+    }
+    stage_assessments = {
+        stage: {"state": "valid", "reusable": True, "reason": "fixture_valid"}
+        for stage in ("p1", "p2", "p3", "p4", "p5", "p6", "p7", "p7a", "p75")
+    }
+    checkpoint_snapshot = {
+        "run_timestamp": run_ts,
+        "stage_assessments": stage_assessments,
+        "p8_assessment": {"state": "valid", "reusable": True, "reason": "fixture_valid"},
+    }
+    updates = []
+
+    monkeypatch.setattr(p9_reporter, "get_run_timestamp", lambda: run_ts)
+    monkeypatch.setattr(
+        p9_reporter,
+        "require_prompt",
+        lambda _name: "{today_str}{p5_evidence}{p7_section}{p6_mapping}{p75_section}{price_data}{p2_section}{p3_section}{yfinance_section}",
+    )
+    monkeypatch.setattr(
+        p9_reporter.opus_adapter,
+        "invoke",
+        lambda _prompt: SimpleNamespace(content="   ", thinking_content=""),
+    )
+    monkeypatch.setattr(p9_reporter, "get_model_provenance", lambda *_args: provenance)
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+
+    report, report_ts = p9_reporter.p9_risk_analysis(
+        p5_evidence="# P5 审计\n通过：8条 / 删除：1条",
+        p7_deep="# P7a 深研审计\nInP 供应约束已核验",
+        p75_supplement="# P7.5 补充审计\n暂无新增硬证据",
+        p6_mapping="# P6 映射\n### 赛道: 光芯片\n- 生益科技",
+        price_data="# P8 技术面\n生益科技收盘价 100.00",
+        p2_x_intel_data="# P2 X 情报\n软线索待核验",
+        p3_intel_data="# P3 机动情报\n边缘线索待核验",
+        p4_yfinance="# P4 核心行情\n生益科技收盘价 100.00",
+        checkpoint_snapshot=checkpoint_snapshot,
+    )
+
+    assert report_ts == run_ts
+    assert report.startswith("# VCP Hunter P9 战报（降级生成）")
+    assert "【降级生成】" in report
+    assert "不新增模型归纳、标的筛选、资金路径或操作建议" in report
+    assert "## 一、核心信号" in report
+    assert "## ⚠️ 风险提示" in report
+    assert checkpoint._report_markdown_is_complete(report) is True
+    fallback_ready = updates[-1][1]
+    assert fallback_ready["status"] == "local_fallback_ready"
+    assert fallback_ready["metrics"]["schema_validation"]["status"] == "not_run"
+    assert fallback_ready["metrics"]["model_generation"]["status"] == "failed"
+    assert fallback_ready["metrics"]["delivery"]["mode"] == "local_checkpoint_fallback"
+    assert fallback_ready["metrics"]["structured_degraded"] is True
+    assert fallback_ready["metrics"]["error"] == ""
+
+    persisted_metrics = copy.deepcopy(fallback_ready["metrics"])
+    delivery_updates = []
+    monkeypatch.setattr(
+        p9_reporter,
+        "_load_persisted_report_outcome_metrics",
+        lambda: persisted_metrics,
+    )
+    monkeypatch.setattr(p9_reporter, "EMAIL_ADDRESS", "")
+    monkeypatch.setattr(p9_reporter, "EMAIL_PASSWORD", "")
+    monkeypatch.setattr(p9_reporter, "RECEIVER_EMAIL", "")
+    monkeypatch.setattr(p9_reporter, "write_text_artifact", lambda *_args, **_kwargs: "fallback.md")
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: delivery_updates.append((args, kwargs)),
+    )
+
+    delivery = p9_reporter.send_report_email(report, report_ts)
+
+    assert delivery["ok"] is True
+    assert delivery["status"] == "completed_no_email"
+    delivered_metrics = delivery_updates[-1][1]["metrics"]
+    assert delivered_metrics["schema_validation"]["status"] == "not_run"
+    assert delivered_metrics["model_generation"]["status"] == "failed"
+    assert delivered_metrics["delivery"]["status"] == "completed_no_email"
+    assert delivered_metrics["delivery"]["mode"] == "local_checkpoint_fallback"
+    assert delivered_metrics["structured_degraded"] is True
+    assert artifact_store.classify_stage_status("completed_no_email", delivered_metrics) == "degraded"
+
+
+def test_p9_local_fallback_is_blocked_when_checkpoint_snapshot_is_invalid(monkeypatch):
+    import p9_reporter
+
+    run_ts = "20260728083002"
+    provenance = {
+        "requested_model": "gpt-5.6-sol",
+        "attempted_models": ["gpt-5.6-sol", "claude-opus-4-6-thinking"],
+        "fallback_used": True,
+        "fallback_reason_category": "network_error",
+        "final_error_category": "network_error",
+        "final_error": "network unavailable",
+    }
+    stage_assessments = {
+        stage: {"state": "valid", "reusable": True, "reason": "fixture_valid"}
+        for stage in ("p1", "p2", "p3", "p4", "p5", "p6", "p7", "p7a", "p75")
+    }
+    stage_assessments["p7a"] = {
+        "state": "invalid",
+        "reusable": False,
+        "reason": "stale_p6_input_hash",
+    }
+    updates = []
+
+    monkeypatch.setattr(p9_reporter, "get_run_timestamp", lambda: run_ts)
+    monkeypatch.setattr(
+        p9_reporter,
+        "require_prompt",
+        lambda _name: "{today_str}{p5_evidence}{p7_section}{p6_mapping}{p75_section}{price_data}{p2_section}{p3_section}{yfinance_section}",
+    )
+    monkeypatch.setattr(
+        p9_reporter.opus_adapter,
+        "invoke",
+        lambda _prompt: SimpleNamespace(content="", thinking_content=""),
+    )
+    monkeypatch.setattr(p9_reporter, "get_model_provenance", lambda *_args: provenance)
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+
+    report, _ = p9_reporter.p9_risk_analysis(
+        "P5 evidence",
+        "P7 evidence",
+        "P7.5 evidence",
+        p6_mapping="P6 mapping",
+        price_data="P8 technical data " * 5,
+        checkpoint_snapshot={
+            "run_timestamp": run_ts,
+            "stage_assessments": stage_assessments,
+            "p8_assessment": {"state": "valid", "reusable": True, "reason": "fixture_valid"},
+        },
+    )
+
+    assert report == ""
+    assert updates[-1][1]["status"] == "failed_empty_output"
+    assert updates[-1][1]["metrics"]["delivery"]["checkpoint_validation"] == "failed"
 
 
 def test_p9_blocks_rejected_identity_in_inputs_output_and_records_fallback_model(monkeypatch):

@@ -1732,6 +1732,47 @@ def test_report_rejects_missing_p6_before_calling_p9(monkeypatch):
     assert calls == []
 
 
+def test_report_p9_resume_keeps_initial_stage_assessments_and_refreshes_p8(monkeypatch):
+    captured = {}
+    checkpoint_snapshot = {
+        "run_timestamp": "20260728083002",
+        "stage_assessments": {"p7a": {"state": "valid", "reusable": True}},
+        "p8_assessment": {"state": "invalid", "reusable": False},
+    }
+    refreshed_p8 = {"state": "valid", "reusable": True}
+    monkeypatch.setattr(
+        orchestrator,
+        "detect_checkpoint",
+        lambda: {
+            "stage_assessments": {"p7a": {"state": "stale", "reusable": False}},
+            "p8_assessment": refreshed_p8,
+        },
+    )
+
+    def fake_p9(**kwargs):
+        captured["snapshot"] = kwargs["checkpoint_snapshot"]
+        return "# fallback report", "20260728083002"
+
+    monkeypatch.setattr(orchestrator, "p9_risk_analysis", fake_p9)
+    monkeypatch.setattr(
+        orchestrator,
+        "send_report_email",
+        lambda *_args, **_kwargs: {"ok": True, "status": "completed_no_email"},
+    )
+
+    orchestrator._stage_report(
+        {
+            "resume_from": "p9_resume",
+            "ckpt": checkpoint_snapshot,
+            "p6_mapping": "mapping",
+        }
+    )
+
+    assert captured["snapshot"] is not checkpoint_snapshot
+    assert captured["snapshot"]["stage_assessments"] is checkpoint_snapshot["stage_assessments"]
+    assert captured["snapshot"]["p8_assessment"] is refreshed_p8
+
+
 def test_delivery_resume_validates_mode_report_and_delivery(monkeypatch):
     calls = []
     context = {"resume_from": "none"}

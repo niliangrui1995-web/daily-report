@@ -192,3 +192,57 @@ def build_report_markdown(data: dict, today_str: str) -> str:
         lines.append("暂无明显风险。\n")
 
     return "\n".join(lines).strip()
+
+
+def build_degraded_checkpoint_report(
+    sections: dict[str, str],
+    today_str: str,
+    checkpoint_labels: list[str],
+) -> str:
+    """Render a deterministic, non-synthetic report from validated checkpoints."""
+
+    lines = [
+        f"# VCP Hunter P9 战报（降级生成） | {today_str}\n",
+        "> 【降级生成】P9 主模型与备用模型均未返回可用结果；本报告由已完成且有效的 "
+        "P1–P8 checkpoint 在本地直接渲染。\n",
+        "> 降级边界：未使用无效 P9 原始输出，不新增模型归纳、标的筛选、资金路径或操作建议。\n",
+        f"> 已验证 checkpoint：{'、'.join(checkpoint_labels)}\n",
+    ]
+
+    def append_checkpoint(title: str, key: str) -> None:
+        content = str(sections.get(key) or "").strip()
+        if not content:
+            return
+        lines.append(f"### {title}\n")
+        lines.append("\n".join(f"> {line}" if line else ">" for line in content.splitlines()))
+        lines.append("")
+
+    lines.append("## 一、核心信号\n")
+    lines.append("P9 未进行二次归纳；以下保留 P5 审计结果与 P7a 已审计深研 checkpoint。\n")
+    append_checkpoint("P5 审计结果（承接 P1）", "p5")
+    append_checkpoint("P7a 已审计深研", "p7a")
+
+    lines.append("---\n")
+    lines.append("## 二、标的狙击表\n")
+    lines.append("P9 未重新筛选标的；以下保留 P6 映射与 P8 技术面 checkpoint，不能视为新增推荐。\n")
+    append_checkpoint("P6 市场映射", "p6")
+    append_checkpoint("P8 技术面", "p8")
+
+    lines.append("---\n")
+    lines.append("## 三、资金路径推演\n")
+    lines.append("P9 未生成新的资金路径；以下仅保留 P7.5 补充审计 checkpoint。\n")
+    append_checkpoint("P7.5 补充审计", "p75")
+
+    lines.append("---\n")
+    lines.append("## 四、今日操作建议\n")
+    lines.append("降级模式不生成新的买卖建议；以下 P4 行情 checkpoint 仅供核对市场状态。\n")
+    append_checkpoint("P4 核心行情", "p4")
+
+    lines.append("---\n")
+    lines.append("## ⚠️ 风险提示\n")
+    lines.append("**模型生成风险：** P9 主模型与备用模型均失败，本报告没有完成常规 P9 综合判断。\n")
+    lines.append("**使用边界：** P2/P3 属于软情报层，必须结合 P5–P8 的硬证据继续核验。\n")
+    append_checkpoint("P2 X 平台情报", "p2")
+    append_checkpoint("P3 机动情报", "p3")
+
+    return "\n".join(lines).strip()

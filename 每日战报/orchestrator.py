@@ -1303,6 +1303,32 @@ def _stage_technical(context: dict[str, Any]) -> None:
         )
 
 
+def _resolve_p9_checkpoint_snapshot(context: dict[str, Any]) -> dict[str, Any] | None:
+    initial_checkpoint = context.get("ckpt", {})
+    if (
+        context.get("resume_from") == "p9_resume"
+        and isinstance(initial_checkpoint, dict)
+        and initial_checkpoint.get("stage_assessments")
+        and initial_checkpoint.get("p8_assessment")
+    ):
+        try:
+            current_checkpoint = detect_checkpoint()
+        except Exception as exc:
+            logging.error("[P9] failed to refresh the P8 checkpoint assessment: %s", exc)
+            return initial_checkpoint
+        current_p8_assessment = current_checkpoint.get("p8_assessment", {})
+        if isinstance(current_p8_assessment, dict) and current_p8_assessment:
+            checkpoint_snapshot = dict(initial_checkpoint)
+            checkpoint_snapshot["p8_assessment"] = current_p8_assessment
+            return checkpoint_snapshot
+        return initial_checkpoint
+    try:
+        return detect_checkpoint()
+    except Exception as exc:
+        logging.error("[P9] failed to prepare checkpoint validation snapshot: %s", exc)
+        return None
+
+
 def _stage_report(context: dict[str, Any]) -> None:
     if not str(context.get("p6_mapping", "")).strip():
         raise RuntimeError("P6 mapping is missing; P9 report generation is blocked")
@@ -1319,6 +1345,7 @@ def _stage_report(context: dict[str, Any]) -> None:
                 p3_intel_data=context.get("p3_data", ""),
                 p4_yfinance=context.get("p4_data", ""),
                 rejected_target_names=context.get("rejected_target_names", []),
+                checkpoint_snapshot=_resolve_p9_checkpoint_snapshot(context),
             )
         except Exception as exc:
             logging.error("[P9] report generation failed: %s", exc)

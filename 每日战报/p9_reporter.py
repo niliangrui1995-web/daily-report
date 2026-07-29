@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import re
@@ -15,7 +16,7 @@ from artifact_store import (
     write_text_artifact,
 )
 from p9_email import send_report_via_email
-from p9_rendering import build_report_markdown
+from p9_rendering import build_degraded_checkpoint_report, build_report_markdown
 from semantic_output import is_no_evidence_text
 from settings import EMAIL_ADDRESS, EMAIL_PASSWORD, OPUS_MODEL, RECEIVER_EMAIL, opus_adapter, require_prompt
 from native_llm_adapter import get_model_provenance
@@ -36,6 +37,26 @@ _HARD_EVIDENCE_LAYERS = {"P4", "P5", "P6", "P7", "P7A", "P8"}
 _SOFT_EVIDENCE_LAYERS = {"P2", "P3", "P7.5"}
 _PRIORITY_RANKS = {"★": 1.0, "★☆☆": 1.5, "★★": 2.0, "★★☆": 2.5, "★★★": 3.0}
 P9_JSON_RETRY_LIMIT = 1
+_P9_LOCAL_FALLBACK_FAILURE_CATEGORIES = {
+    "empty_response",
+    "incomplete_response",
+    "network_error",
+    "server_error",
+    "timeout",
+    "timeout_budget_exhausted",
+}
+_P9_LOCAL_FALLBACK_CHECKPOINTS = (
+    ("p1", "P1"),
+    ("p2", "P2"),
+    ("p3", "P3"),
+    ("p4", "P4"),
+    ("p5", "P5"),
+    ("p6", "P6"),
+    ("p7", "P7"),
+    ("p7a", "P7a"),
+    ("p75", "P7.5"),
+    ("p8", "P8"),
+)
 P9_OUTPUT_LIMITS = """
 JSON output hard limits:
 - Return raw JSON only. Do not wrap it in Markdown fences.
@@ -135,6 +156,11 @@ _P9_REPORT_OUTCOME_METRIC_KEYS = (
     "nonempty_sections_count",
     "semantic_placeholder_items_removed",
     "semantic_empty_sniper_tables_removed",
+    "schema_validation",
+    "model_generation",
+    "delivery",
+    "structured_degraded",
+    "degrade_reason",
 )
 
 
@@ -274,20 +300,168 @@ def _load_persisted_report_outcome_metrics() -> dict[str, Any]:
     }
 
 
-def _parse_report_payload(raw_content: str) -> dict[str, Any]:
+def _model_generation_metrics(
+    model_provenance: dict[str, Any],
+    *,
+    status: str,
+) -> dict[str, Any]:
+    attempted_models = [str(model) for model in model_provenance.get("attempted_models", []) if str(model).strip()]
+    if status != "failed":
+        return {
+            "status": status,
+            "effective_model": str(model_provenance.get("effective_model") or ""),
+        }
+    return {
+        "status": "failed",
+        "attempted_models": attempted_models,
+        "failure_kind": str(model_provenance.get("final_error_category") or "empty_response"),
+        "failure_message": str(model_provenance.get("final_error") or "")[:2000],
+    }
+
+
+def _is_two_model_transient_empty_failure(model_provenance: dict[str, Any]) -> bool:
+    attempted_models = {
+        str(model).strip()
+        for model in model_provenance.get("attempted_models", [])
+        if str(model).strip()
+    }
+    primary_failure = str(model_provenance.get("fallback_reason_category") or "")
+    final_failure = str(model_provenance.get("final_error_category") or "empty_response")
+    return bool(
+        model_provenance.get("fallback_used")
+        and len(attempted_models) >= 2
+        and primary_failure in _P9_LOCAL_FALLBACK_FAILURE_CATEGORIES
+        and final_failure in _P9_LOCAL_FALLBACK_FAILURE_CATEGORIES
+    )
+
+
+def _validated_p9_fallback_checkpoints(
+    checkpoint: dict[str, Any] | None,
+    run_ts: str,
+) -> list[str]:
+    if not isinstance(checkpoint, dict) or str(checkpoint.get("run_timestamp") or "") != run_ts:
+        return []
+    assessments = checkpoint.get("stage_assessments", {})
+    validated = []
+    for stage_name, label in _P9_LOCAL_FALLBACK_CHECKPOINTS:
+        assessment = (
+            checkpoint.get("p8_assessment", {})
+            if stage_name == "p8"
+            else assessments.get(stage_name, {})
+        )
+        if not isinstance(assessment, dict) or not assessment.get("reusable"):
+            return []
+        validated.append(label)
+    return validated
+
+
+def _format_report_validation_error(exc: ValidationError) -> str:
+    return "; ".join(
+        f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+        for error in exc.errors(include_url=False)[:8]
+    )
+
+
+def _repair_missing_sniper_catalyst_targets(
+    data: Any,
+    errors: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Drop only target rows whose sole schema error is a missing catalyst."""
+
+    repair_positions: dict[int, set[int]] = {}
+    repair_paths: list[str] = []
+    for error in errors:
+        loc = tuple(error.get("loc") or ())
+        if (
+            error.get("type") != "missing"
+            or len(loc) != 5
+            or loc[0] != "sniper_tables"
+            or not isinstance(loc[1], int)
+            or loc[2] != "targets"
+            or not isinstance(loc[3], int)
+            or loc[4] != "catalyst"
+        ):
+            return None, {}
+        table_index = loc[1]
+        target_index = loc[3]
+        repair_positions.setdefault(table_index, set()).add(target_index)
+        repair_paths.append(
+            f"$.sniper_tables[{table_index}].targets[{target_index}].catalyst"
+        )
+
+    if not repair_positions or not isinstance(data, dict):
+        return None, {}
+
+    repaired = copy.deepcopy(data)
+    tables = repaired.get("sniper_tables")
+    if not isinstance(tables, list):
+        return None, {}
+
+    for table_index, target_indexes in repair_positions.items():
+        if table_index < 0 or table_index >= len(tables):
+            return None, {}
+        table = tables[table_index]
+        targets = table.get("targets") if isinstance(table, dict) else None
+        if not isinstance(targets, list):
+            return None, {}
+        for target_index in target_indexes:
+            if target_index < 0 or target_index >= len(targets):
+                return None, {}
+            target = targets[target_index]
+            if not isinstance(target, dict) or "catalyst" in target:
+                return None, {}
+        for target_index in sorted(target_indexes, reverse=True):
+            del targets[target_index]
+
+    tables_before = len(tables)
+    repaired["sniper_tables"] = [
+        table
+        for table in tables
+        if isinstance(table, dict) and table.get("targets")
+    ]
+    return repaired, {
+        "status": "repaired",
+        "repair_kind": "drop_invalid_target",
+        "paths": repair_paths,
+        "dropped_targets": sum(len(indexes) for indexes in repair_positions.values()),
+        "dropped_empty_tables": tables_before - len(repaired["sniper_tables"]),
+        "revalidated": False,
+    }
+
+
+def _parse_report_payload_with_schema_validation(
+    raw_content: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         data = extract_json_from_llm_response(raw_content, expect_type="dict")
     except json.JSONDecodeError:
         data = extract_json_from_llm_response(raw_content, expect_type="dict", allow_partial=True)
 
     try:
-        return _P9ReportPayload.model_validate(data).model_dump(exclude_none=True)
+        validated = _P9ReportPayload.model_validate(data).model_dump(exclude_none=True)
+        return validated, {
+            "status": "valid",
+            "revalidated": True,
+        }
     except ValidationError as exc:
-        detail = "; ".join(
-            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
-            for error in exc.errors(include_url=False)[:8]
+        repaired, schema_validation = _repair_missing_sniper_catalyst_targets(
+            data,
+            exc.errors(include_url=False),
         )
+        if repaired is not None:
+            try:
+                validated = _P9ReportPayload.model_validate(repaired).model_dump(exclude_none=True)
+                schema_validation["revalidated"] = True
+                return validated, schema_validation
+            except ValidationError as repaired_exc:
+                exc = repaired_exc
+        detail = _format_report_validation_error(exc)
         raise json.JSONDecodeError(f"invalid P9 report payload: {detail}", raw_content[:200], 0) from exc
+
+
+def _parse_report_payload(raw_content: str) -> dict[str, Any]:
+    data, _ = _parse_report_payload_with_schema_validation(raw_content)
+    return data
 
 
 def _section_or_fallback(value: str | None, fallback: str) -> str:
@@ -811,6 +985,7 @@ def p9_risk_analysis(
     p3_intel_data="",
     p4_yfinance="",
     rejected_target_names: list[str] | None = None,
+    checkpoint_snapshot: dict[str, Any] | None = None,
     _retry_count: int = 0,
 ):
     """
@@ -945,20 +1120,97 @@ def p9_risk_analysis(
 
     if not raw_content.strip():
         logging.error("[P9] model returned empty output")
+        model_generation = _model_generation_metrics(model_provenance, status="failed")
+        validated_checkpoints: list[str] = []
+        if _is_two_model_transient_empty_failure(model_provenance):
+            validated_checkpoints = _validated_p9_fallback_checkpoints(checkpoint_snapshot, run_ts)
+            if validated_checkpoints:
+                result = normalize_common_text_mojibake(
+                    build_degraded_checkpoint_report(
+                        {
+                            "p2": p2_x_intel_data,
+                            "p3": p3_intel_data,
+                            "p4": p4_yfinance,
+                            "p5": p5_evidence,
+                            "p6": p6_mapping,
+                            "p7a": p7_deep,
+                            "p75": p75_supplement,
+                            "p8": price_data,
+                        },
+                        today_str,
+                        validated_checkpoints,
+                    )
+                )
+                if result.strip():
+                    logging.warning(
+                        "[P9] both models failed; rendered a degraded report from validated P1-P8 checkpoints"
+                    )
+                    update_run_manifest(
+                        "p9",
+                        status="local_fallback_ready",
+                        files={"thinking": out_fn} if out_fn else None,
+                        metrics={
+                            "error": "",
+                            "price_data_chars": len(price_data or ""),
+                            "input_rejected_identity_lines_removed": input_identity_lines_removed,
+                            "model_provenance": model_provenance,
+                            "schema_validation": {"status": "not_run"},
+                            "model_generation": model_generation,
+                            "delivery": {
+                                "status": "ready_degraded",
+                                "mode": "local_checkpoint_fallback",
+                                "source_checkpoints": validated_checkpoints,
+                            },
+                            "structured_degraded": True,
+                            "degrade_reason": "p9_models_failed_local_checkpoint_fallback",
+                            "report_outcome": "",
+                            "actionable_items_count": 0,
+                            "markdown_chars": len(result),
+                        },
+                    )
+                    return result, run_ts
         update_run_manifest(
             "p9",
             status="failed_empty_output",
             files={"thinking": out_fn} if out_fn else None,
             metrics={
+                "error": model_generation.get("failure_message") or "model returned empty output",
                 "price_data_chars": len(price_data or ""),
                 "input_rejected_identity_lines_removed": input_identity_lines_removed,
                 "model_provenance": model_provenance,
+                "schema_validation": {"status": "not_run"},
+                "model_generation": model_generation,
+                "delivery": {
+                    "status": "not_generated",
+                    "mode": "none",
+                    "checkpoint_validation": "failed" if checkpoint_snapshot else "not_provided",
+                },
             },
         )
         return "", run_ts
 
+    schema_validation = {"status": "not_run"}
+    model_generation = _model_generation_metrics(model_provenance, status="completed")
     try:
-        data = normalize_common_mojibake_artifacts(_parse_report_payload(raw_content))
+        parsed_data, schema_validation = _parse_report_payload_with_schema_validation(raw_content)
+        data = normalize_common_mojibake_artifacts(parsed_data)
+        generation_tracking_metrics = {
+            "schema_validation": schema_validation,
+            "model_generation": model_generation,
+            "delivery": {
+                "status": "pending",
+                "mode": "model_generated",
+            },
+        }
+        if schema_validation.get("status") == "repaired":
+            logging.warning("[P9] repaired model schema output: %s", schema_validation)
+            generation_tracking_metrics.update(
+                {
+                    "error": "",
+                    "structured_degraded": True,
+                    "degrade_reason": "p9_schema_repair_drop_invalid_target",
+                }
+            )
         data, guardrail_metrics = _apply_evidence_guardrails(data)
         if any(guardrail_metrics.values()):
             logging.info("[P9] applied evidence guardrails: %s", guardrail_metrics)
@@ -985,6 +1237,19 @@ def p9_risk_analysis(
         report_outcome_metrics = _report_outcome_metrics(data)
         result = normalize_common_text_mojibake(build_report_markdown(data, today_str))
         logging.info("[P9] rendered markdown report (%s chars)", len(result))
+        ready_metrics = {
+            "markdown_chars": len(result),
+            "raw_output_chars": len(raw_content),
+            "model_provenance": model_provenance,
+            **generation_tracking_metrics,
+            **guardrail_metrics,
+            **identity_metrics,
+            **code_metrics,
+            **soft_intel_metrics,
+            **p8_backfill_metrics,
+            **semantic_metrics,
+            **report_outcome_metrics,
+        }
 
         try:
             json_fname = write_json_artifact("战报", data)
@@ -995,18 +1260,7 @@ def p9_risk_analysis(
                 "p9",
                 status="json_ready",
                 files=manifest_files,
-                metrics={
-                    "markdown_chars": len(result),
-                    "raw_output_chars": len(raw_content),
-                    "model_provenance": model_provenance,
-                    **guardrail_metrics,
-                    **identity_metrics,
-                    **code_metrics,
-                    **soft_intel_metrics,
-                    **p8_backfill_metrics,
-                    **semantic_metrics,
-                    **report_outcome_metrics,
-                },
+                metrics=ready_metrics,
             )
         except Exception as exc:
             logging.error("[P9] failed to save report JSON: %s", exc)
@@ -1014,18 +1268,7 @@ def p9_risk_analysis(
                 "p9",
                 status="json_ready",
                 files={"thinking": out_fn} if out_fn else None,
-                metrics={
-                    "markdown_chars": len(result),
-                    "raw_output_chars": len(raw_content),
-                    "model_provenance": model_provenance,
-                    **guardrail_metrics,
-                    **identity_metrics,
-                    **code_metrics,
-                    **soft_intel_metrics,
-                    **p8_backfill_metrics,
-                    **semantic_metrics,
-                    **report_outcome_metrics,
-                },
+                metrics=ready_metrics,
             )
 
         return result, run_ts
@@ -1056,6 +1299,12 @@ def p9_risk_analysis(
                     "retry_count": _retry_count,
                     "input_rejected_identity_lines_removed": input_identity_lines_removed,
                     "model_provenance": model_provenance,
+                    "schema_validation": {"status": "invalid", "error": str(exc)},
+                    "model_generation": model_generation,
+                    "delivery": {
+                        "status": "not_generated",
+                        "mode": "none",
+                    },
                 },
             )
             return p9_risk_analysis(
@@ -1068,6 +1317,7 @@ def p9_risk_analysis(
                 p3_intel_data=p3_intel_data,
                 p4_yfinance=p4_yfinance,
                 rejected_target_names=rejected_names,
+                checkpoint_snapshot=checkpoint_snapshot,
                 _retry_count=_retry_count + 1,
             )
         update_run_manifest(
@@ -1080,6 +1330,12 @@ def p9_risk_analysis(
                 "retry_count": _retry_count,
                 "input_rejected_identity_lines_removed": input_identity_lines_removed,
                 "model_provenance": model_provenance,
+                "schema_validation": {"status": "invalid", "error": str(exc)},
+                "model_generation": model_generation,
+                "delivery": {
+                    "status": "not_generated",
+                    "mode": "none",
+                },
             },
         )
         return "", run_ts
@@ -1107,13 +1363,26 @@ def send_report_email(
     email_configured = credentials_available if email_required is not False else False
     report_outcome_metrics = _load_persisted_report_outcome_metrics()
 
-    def delivery_metrics(**metrics: Any) -> dict[str, Any]:
-        return {**report_outcome_metrics, **metrics}
+    def delivery_metrics(*, delivery_status: str = "", **metrics: Any) -> dict[str, Any]:
+        persisted_delivery = report_outcome_metrics.get("delivery")
+        merged = {**report_outcome_metrics, **metrics}
+        if isinstance(persisted_delivery, dict) and persisted_delivery:
+            delivery = dict(persisted_delivery)
+            if delivery_status:
+                delivery["status"] = delivery_status
+            if "email_sent" in metrics:
+                delivery["email_sent"] = bool(metrics["email_sent"])
+            merged["delivery"] = delivery
+        return merged
 
     update_run_manifest(
         "p9",
         status="report_save_in_progress",
-        metrics=delivery_metrics(email_configured=email_configured, email_sent=False),
+        metrics=delivery_metrics(
+            delivery_status="saving",
+            email_configured=email_configured,
+            email_sent=False,
+        ),
     )
     try:
         fname = write_text_artifact("战报", content, timestamp=file_ts)
@@ -1121,14 +1390,22 @@ def send_report_email(
     except Exception as exc:
         logging.error("[P9] failed to save report markdown: %s", exc)
         status = "failed_md_write"
-        update_run_manifest("p9", status=status, metrics=delivery_metrics(error=str(exc)))
+        update_run_manifest(
+            "p9",
+            status=status,
+            metrics=delivery_metrics(delivery_status=status, error=str(exc)),
+        )
         return {"ok": False, "status": status, "report_path": "", "email_sent": False}
 
     update_run_manifest(
         "p9",
         status="report_saved_pending_delivery",
         files={"md": fname},
-        metrics=delivery_metrics(email_configured=email_configured, email_sent=False),
+        metrics=delivery_metrics(
+            delivery_status="saved_pending_delivery",
+            email_configured=email_configured,
+            email_sent=False,
+        ),
     )
 
     if email_required is True and not credentials_available:
@@ -1138,7 +1415,11 @@ def send_report_email(
             "p9",
             status=status,
             files={"md": fname},
-            metrics=delivery_metrics(email_configured=True, email_sent=False),
+            metrics=delivery_metrics(
+                delivery_status=status,
+                email_configured=True,
+                email_sent=False,
+            ),
         )
         return {"ok": False, "status": status, "report_path": fname, "email_sent": False}
 
@@ -1149,7 +1430,11 @@ def send_report_email(
             "p9",
             status=status,
             files={"md": fname},
-            metrics=delivery_metrics(email_configured=False, email_sent=False),
+            metrics=delivery_metrics(
+                delivery_status=status,
+                email_configured=False,
+                email_sent=False,
+            ),
         )
         return {"ok": True, "status": status, "report_path": fname, "email_sent": False}
 
@@ -1169,7 +1454,11 @@ def send_report_email(
             "p9",
             status=status,
             files={"md": fname},
-            metrics=delivery_metrics(email_configured=True, email_sent=True),
+            metrics=delivery_metrics(
+                delivery_status=status,
+                email_configured=True,
+                email_sent=True,
+            ),
         )
         return {"ok": True, "status": status, "report_path": fname, "email_sent": True}
     except Exception as exc:
@@ -1179,6 +1468,11 @@ def send_report_email(
             "p9",
             status=status,
             files={"md": fname},
-            metrics=delivery_metrics(email_configured=True, email_sent=False, error=str(exc)),
+            metrics=delivery_metrics(
+                delivery_status=status,
+                email_configured=True,
+                email_sent=False,
+                error=str(exc),
+            ),
         )
         return {"ok": False, "status": status, "report_path": fname, "email_sent": False}

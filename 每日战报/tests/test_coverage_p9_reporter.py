@@ -408,10 +408,26 @@ def test_send_report_email_covers_empty_write_configured_and_delivery_outcomes(m
     monkeypatch.setattr(p9_reporter, "get_run_timestamp", lambda: "20260714090000")
     monkeypatch.setattr(
         p9_reporter,
+        "_load_persisted_report_outcome_metrics",
+        lambda: {
+            "schema_validation": {"status": "not_run"},
+            "model_generation": {"status": "failed"},
+            "delivery": {"status": "ready_degraded", "mode": "local_checkpoint_fallback"},
+        },
+    )
+    monkeypatch.setattr(
+        p9_reporter,
         "write_text_artifact",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
     )
     assert p9_reporter.send_report_email("report")["status"] == "failed_md_write"
+    failed_write_metrics = updates[-1][1]["metrics"]
+    assert failed_write_metrics["schema_validation"]["status"] == "not_run"
+    assert failed_write_metrics["model_generation"]["status"] == "failed"
+    assert failed_write_metrics["delivery"] == {
+        "status": "failed_md_write",
+        "mode": "local_checkpoint_fallback",
+    }
 
     monkeypatch.setattr(p9_reporter, "write_text_artifact", lambda *_args, **_kwargs: "report.md")
     monkeypatch.setattr(p9_reporter, "EMAIL_ADDRESS", "")

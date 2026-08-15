@@ -135,6 +135,7 @@ OPUS_IMMEDIATE_FAILOVER_CATEGORIES = (
     'auth_unavailable',
     'risk_control',
     'permission_denied',
+    'model_not_found',
     'timeout',
     'server_error',
 )

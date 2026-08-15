@@ -786,8 +786,8 @@ def test_p9_blocks_rejected_identity_in_inputs_output_and_records_fallback_model
         "effective_model": "claude-opus-4-6-thinking",
         "attempted_models": ["gpt-5.6-sol", "claude-opus-4-6-thinking"],
         "fallback_used": True,
-        "fallback_reason_category": "rate_limit",
-        "fallback_reason": "429 Too Many Requests",
+        "fallback_reason_category": "model_not_found",
+        "fallback_reason": "model_not_found invalid_request_error unknown provider for model gpt-5.6-sol",
     }
     payload = {
         "x_intel_snipe": [],
@@ -896,6 +896,7 @@ def test_p9_blocks_rejected_identity_in_inputs_output_and_records_fallback_model
     metrics_provenance = metrics["model_provenance"]
     assert metrics_provenance["requested_model"] == provenance["requested_model"]
     assert metrics_provenance["effective_model"] == provenance["effective_model"]
+    assert metrics_provenance["fallback_reason_category"] == provenance["fallback_reason_category"]
     assert metrics_provenance["fallback_reason"] == provenance["fallback_reason"]
     assert metrics["rejected_identity_items_removed"] >= 3
 

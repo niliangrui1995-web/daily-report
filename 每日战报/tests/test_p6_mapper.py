@@ -410,8 +410,8 @@ def test_p6_records_effective_fallback_model_in_manifest_and_reasoning(monkeypat
         "effective_model": "claude-opus-4-6-thinking",
         "attempted_models": ["gpt-5.6-sol", "claude-opus-4-6-thinking"],
         "fallback_used": True,
-        "fallback_reason_category": "rate_limit",
-        "fallback_reason": "429 Too Many Requests",
+        "fallback_reason_category": "model_not_found",
+        "fallback_reason": "model_not_found invalid_request_error unknown provider for model gpt-5.6-sol",
     }
     monkeypatch.setattr(
         p6_mapper.opus_adapter,
@@ -447,4 +447,5 @@ def test_p6_records_effective_fallback_model_in_manifest_and_reasoning(monkeypat
     metrics_provenance = manifest_updates[-1][1]["metrics"]["model_provenance"]
     assert metrics_provenance["requested_model"] == provenance["requested_model"]
     assert metrics_provenance["effective_model"] == provenance["effective_model"]
+    assert metrics_provenance["fallback_reason_category"] == provenance["fallback_reason_category"]
     assert metrics_provenance["fallback_reason"] == provenance["fallback_reason"]

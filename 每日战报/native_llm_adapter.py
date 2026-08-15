@@ -71,6 +71,13 @@ _INPUT_TOO_LARGE_MARKERS = (
     'content too large',
 )
 
+_MODEL_NOT_FOUND_MARKERS = (
+    'model_not_found',
+    'model not found',
+    'model does not exist',
+    'unknown provider for model',
+)
+
 
 def validate_model_base_url(base_url: str) -> tuple[bool, bool, str]:
     try:
@@ -104,6 +111,8 @@ def _classify_provider_error(error: Exception) -> Dict[str, Any]:
         return {'category': 'permission_denied', 'retryable': False}
     if _contains_any(err_lower, _INPUT_TOO_LARGE_MARKERS):
         return {'category': 'input_too_large', 'retryable': False}
+    if _contains_any(err_lower, _MODEL_NOT_FOUND_MARKERS):
+        return {'category': 'model_not_found', 'retryable': False}
     if 'auth_unavailable' in err_lower or 'no auth available' in err_lower:
         return {'category': 'auth_unavailable', 'retryable': True}
     if '401' in err_lower or '403' in err_lower or 'balance' in err_lower:
@@ -564,6 +573,7 @@ class NativeLLMAdapter(RunnableSerializable):
                     'incomplete_response',
                     'empty_response',
                     'semantic_validation_failed',
+                    'model_not_found',
                     'unknown_error',
                 ) or
                 any(kw in err_msg_lower for kw in ('balance', 'quota', 'credit', 'insufficient', '401', '403', '429', 'limit', 'exceeded'))
@@ -876,6 +886,11 @@ class NativeLLMAdapter(RunnableSerializable):
             return False
         if error_info['category'] == 'input_too_large':
             logger.error(f"📏 [{provider_label}] 请求过长或上下文超限，停止重试: {error}")
+            return False
+        if not error_info['retryable']:
+            logger.error(
+                f"🚫 [{provider_label}] 不可重试错误(category={error_info['category']})，停止重试: {error}"
+            )
             return False
         if error_info['category'] == 'auth_unavailable':
             logger.warning(

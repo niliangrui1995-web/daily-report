@@ -35,6 +35,7 @@ D:\vcp_hunter\每日战报\
 ├── pyproject.toml                # 直接依赖、测试和静态检查配置
 ├── uv.lock                       # 跨机器可复现的完整依赖锁
 ├── .venv\                        # 本地虚拟环境
+├── docs\                         # 非运行时的历史设计资料
 ├── 每日战报\                     # Python 流水线源码
 │   ├── pipeline_cli.py            # 控制面：run/resume/status/doctor/preflight/clean/prune
 │   ├── scheduled_launcher.py      # 交易日门禁后再启动 pipeline_cli.py run
@@ -46,6 +47,13 @@ D:\vcp_hunter\每日战报\
 │   └── tests\                     # 离线回归与控制面测试
 └── 每日热点输出\                 # 每日运行产物
 ```
+
+### 设计资料
+
+以下资料用于理解历史设计背景，不是当前运行契约：
+
+- [VCP Hunter 架构全地图与源码解析](docs/VCP_Hunter_架构全地图与源码解析.md)
+- [VCP Hunter 实盘时序工作流模拟](docs/VCP_Hunter_实盘时序工作流模拟.md)
 
 ---
 

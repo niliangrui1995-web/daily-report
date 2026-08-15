@@ -951,6 +951,77 @@ def test_first_primary_timeout_switches_to_backup_without_primary_retry(monkeypa
     assert result.response_metadata["model_provenance"]["fallback_reason_category"] == "timeout"
 
 
+def test_model_not_found_immediately_falls_back_without_primary_retry(monkeypatch):
+    import requests
+
+    models = []
+    sleeps = []
+
+    class ModelNotFoundResponse:
+        status_code = 400
+        text = (
+            '{"error":{"code":"model_not_found","type":"invalid_request_error",'
+            '"message":"unknown provider for model gpt-5.6-sol"}}'
+        )
+
+        def raise_for_status(self):
+            error = requests.HTTPError("400 Client Error: Bad Request")
+            error.response = self
+            raise error
+
+        def json(self):
+            return {
+                "error": {
+                    "code": "model_not_found",
+                    "type": "invalid_request_error",
+                    "message": "unknown provider for model gpt-5.6-sol",
+                }
+            }
+
+    class SuccessResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "status": "completed",
+                "model": "claude-opus-4-6-thinking",
+                "output_text": "backup answer",
+            }
+
+    def post(_url, **kwargs):
+        model = kwargs["json"]["model"]
+        models.append(model)
+        if model == "gpt-5.6-sol":
+            return ModelNotFoundResponse()
+        return SuccessResponse()
+
+    monkeypatch.setattr(requests, "post", post)
+    monkeypatch.setattr(adapter_module.time, "sleep", sleeps.append)
+    adapter = make_adapter(
+        "gpt-5.6-sol",
+        timeout=900,
+        max_retries=5,
+        use_responses_api=True,
+        total_timeout_seconds=900,
+        fallback_total_timeout_seconds=900,
+    )
+
+    result = adapter.invoke("question")
+
+    provenance = result.response_metadata["model_provenance"]
+    assert result.content == "backup answer"
+    assert models == ["gpt-5.6-sol", "claude-opus-4-6-thinking"]
+    assert sleeps == []
+    assert provenance["requested_model"] == "gpt-5.6-sol"
+    assert provenance["attempted_models"] == ["gpt-5.6-sol", "claude-opus-4-6-thinking"]
+    assert provenance["fallback_used"] is True
+    assert provenance["fallback_model"] == "claude-opus-4-6-thinking"
+    assert provenance["effective_model"] == "claude-opus-4-6-thinking"
+    assert provenance["fallback_reason_category"] == "model_not_found"
+    assert "model_not_found" in provenance["fallback_reason"]
+
+
 def test_completed_empty_primary_response_switches_to_backup(monkeypatch):
     import requests
 

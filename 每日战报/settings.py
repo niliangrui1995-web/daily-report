@@ -120,8 +120,14 @@ AUDIT_IMMEDIATE_FAILOVER_CATEGORIES = (
     'timeout',
     'server_error',
 )
-OPUS_MODEL = 'gpt-5.6-sol'
-OPUS_FALLBACK_MODEL = 'claude-opus-4-6-thinking'
+OPUS_MODEL = (
+    os.environ.get('OPUS_MODEL', 'claude-opus-4-6-thinking').strip()
+    or 'claude-opus-4-6-thinking'
+)
+OPUS_FALLBACK_MODEL = (
+    os.environ.get('OPUS_FALLBACK_MODEL', 'claude-sonnet-4-6').strip()
+    or 'claude-sonnet-4-6'
+)
 OPUS_REASONING_EFFORT = 'max'
 OPUS_REASONING_SUMMARY = 'auto'
 OPUS_USE_RESPONSES_API = True

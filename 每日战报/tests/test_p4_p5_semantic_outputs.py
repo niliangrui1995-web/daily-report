@@ -41,7 +41,7 @@ class _InlinePool:
         return _InlineFuture(fn, args)
 
 
-def _run_p4(monkeypatch, frames):
+def _run_p4(monkeypatch, frames, *, tickers=None):
     today = pd.to_datetime("today").normalize()
     manifests = []
 
@@ -51,6 +51,8 @@ def _run_p4(monkeypatch, frames):
 
         def history(self, **_kwargs):
             value = frames[self.ticker]
+            if callable(value):
+                value = value(**_kwargs)
             if isinstance(value, BaseException):
                 raise value
             return value.copy()
@@ -59,7 +61,7 @@ def _run_p4(monkeypatch, frames):
     monkeypatch.setattr(
         p4_vanguard,
         "VANGUARD_TICKERS",
-        {name: name for name in frames},
+        tickers or {name: name for name in frames},
     )
     monkeypatch.setattr(p4_vanguard, "SUPER_GIANTS", set())
     monkeypatch.setattr(p4_vanguard, "STRATEGIC_GIANTS", set())
@@ -137,6 +139,198 @@ def test_p4_zero_usable_data_is_failed_but_keeps_diagnostic_artifact(monkeypatch
     assert payload["metrics"]["usable_tickers"] == 0
     assert payload["metrics"]["no_data_tickers"] == 1
     assert payload["metrics"]["failed_tickers"] == 1
+
+
+def test_p4_uses_hourly_close_when_latest_daily_history_row_is_nan(monkeypatch):
+    today = pd.to_datetime("today").normalize()
+    daily_with_unpriced_tail = pd.DataFrame(
+        {"Close": [100.0, float("nan")]},
+        index=pd.DatetimeIndex(
+            [
+                today - pd.Timedelta(days=3),
+                today - pd.Timedelta(days=1),
+            ]
+        ),
+    )
+    hourly_with_completed_tail = pd.DataFrame(
+        {"Close": [100.0, 110.0, 999.0]},
+        index=pd.DatetimeIndex(
+            [
+                today - pd.Timedelta(days=3) + pd.Timedelta(hours=17),
+                today - pd.Timedelta(days=1) + pd.Timedelta(hours=17),
+                today + pd.Timedelta(hours=17),
+            ]
+        ),
+    )
+    daily_request = {
+        "period": "1mo",
+        "timeout": p4_vanguard.P4_REQUEST_TIMEOUT_SECONDS,
+        "raise_errors": True,
+    }
+    hourly_request = {
+        "period": "5d",
+        "interval": "1h",
+        "timeout": p4_vanguard.P4_REQUEST_TIMEOUT_SECONDS,
+        "raise_errors": True,
+    }
+    calls = []
+
+    def history(**kwargs):
+        calls.append(kwargs)
+        if kwargs == daily_request:
+            return daily_with_unpriced_tail
+        if kwargs == hourly_request:
+            return hourly_with_completed_tail
+        raise AssertionError(f"unexpected request: {kwargs}")
+
+    report, (_stage, payload) = _run_p4(
+        monkeypatch,
+        {"Affected": history},
+    )
+
+    assert "Affected(Affected) [中型标的]: 收盘价 110.00, 区间涨跌 +10.00%" in report
+    assert "收盘价 nan" not in report
+    assert calls == [daily_request, hourly_request]
+    assert payload["status"] == "completed"
+    assert payload["metrics"]["usable_tickers"] == 1
+    assert payload["metrics"]["no_data_tickers"] == 0
+
+
+def test_p4_marks_all_nan_completed_history_as_missing_and_not_comparable(monkeypatch):
+    today = pd.to_datetime("today").normalize()
+    all_nan_history = pd.DataFrame(
+        {"Close": [float("nan"), float("nan")]},
+        index=pd.DatetimeIndex(
+            [today - pd.Timedelta(days=3), today - pd.Timedelta(days=1)]
+        ),
+    )
+    daily_request = {
+        "period": "1mo",
+        "timeout": p4_vanguard.P4_REQUEST_TIMEOUT_SECONDS,
+        "raise_errors": True,
+    }
+    hourly_request = {
+        "period": "5d",
+        "interval": "1h",
+        "timeout": p4_vanguard.P4_REQUEST_TIMEOUT_SECONDS,
+        "raise_errors": True,
+    }
+    calls = []
+
+    def history(**kwargs):
+        calls.append(kwargs)
+        if kwargs == daily_request:
+            return all_nan_history
+        if kwargs == hourly_request:
+            return pd.DataFrame({"Close": []}, index=pd.DatetimeIndex([]))
+        raise AssertionError(f"unexpected request: {kwargs}")
+
+    report, (_stage, payload) = _run_p4(
+        monkeypatch,
+        {"Missing": history},
+    )
+
+    assert "Missing(Missing) [中型标的]: 数据缺失/不可比较（最近已完成交易日收盘价缺失）" in report
+    assert "[📈 正常]" not in report
+    assert calls == [daily_request, hourly_request]
+    assert payload["status"] == "failed_no_usable_data"
+    assert payload["metrics"]["usable_tickers"] == 0
+    assert payload["metrics"]["no_data_tickers"] == 1
+
+
+def test_p4_recovers_the_nine_verified_european_tickers_from_unpriced_tails(monkeypatch):
+    from industry_dict import VANGUARD_TICKERS
+
+    expected_tickers = {
+        "Siemens EDA": "SIE.DE",
+        "Soitec": "SOI.PA",
+        "IQE": "IQE.L",
+        "PVA TePla": "TPE.DE",
+        "Besi": "BESI.AS",
+        "Mycronic": "MYCR.ST",
+        "Schneider": "SU.PA",
+        "Technoprobe": "TPRO.MI",
+        "Prysmian": "PRY.MI",
+    }
+    assert {name: VANGUARD_TICKERS[name] for name in expected_tickers} == expected_tickers
+
+    today = pd.to_datetime("today").normalize()
+    daily_with_unpriced_tail = pd.DataFrame(
+        {"Close": [100.0, float("nan")]},
+        index=pd.DatetimeIndex(
+            [
+                today - pd.Timedelta(days=3),
+                today - pd.Timedelta(days=1),
+            ]
+        ),
+    )
+    hourly_with_completed_tail = pd.DataFrame(
+        {"Close": [100.0, 110.0]},
+        index=pd.DatetimeIndex(
+            [
+                today - pd.Timedelta(days=3) + pd.Timedelta(hours=17),
+                today - pd.Timedelta(days=1) + pd.Timedelta(hours=17),
+            ]
+        ),
+    )
+
+    def history(**kwargs):
+        if kwargs["period"] == "1mo":
+            return daily_with_unpriced_tail
+        if kwargs["period"] == "5d" and kwargs["interval"] == "1h":
+            return hourly_with_completed_tail
+        raise AssertionError(f"unexpected request: {kwargs}")
+
+    frames = {
+        ticker: history
+        for ticker in expected_tickers.values()
+    }
+
+    report, (_stage, payload) = _run_p4(
+        monkeypatch,
+        frames,
+        tickers=expected_tickers,
+    )
+
+    for name, ticker in expected_tickers.items():
+        assert f"{name}({ticker}) [中型标的]: 收盘价 110.00, 区间涨跌 +10.00%" in report
+    assert "收盘价 nan" not in report
+    assert payload["status"] == "completed"
+    assert payload["metrics"]["tickers"] == 9
+    assert payload["metrics"]["usable_tickers"] == 9
+    assert payload["metrics"]["no_data_tickers"] == 0
+
+
+def test_p4_keeps_priced_daily_history_on_single_request(monkeypatch):
+    today = pd.to_datetime("today").normalize()
+    daily_history = pd.DataFrame(
+        {"Close": [100.0, 110.0]},
+        index=pd.DatetimeIndex(
+            [today - pd.Timedelta(days=3), today - pd.Timedelta(days=1)]
+        ),
+    )
+    daily_request = {
+        "period": "1mo",
+        "timeout": p4_vanguard.P4_REQUEST_TIMEOUT_SECONDS,
+        "raise_errors": True,
+    }
+    calls = []
+
+    def history(**kwargs):
+        calls.append(kwargs)
+        if kwargs == daily_request:
+            return daily_history
+        raise AssertionError("hourly fallback must not run for a priced daily tail")
+
+    report, (_stage, payload) = _run_p4(
+        monkeypatch,
+        {"Normal": history},
+    )
+
+    assert "Normal(Normal) [中型标的]: 收盘价 110.00, 区间涨跌 +10.00%" in report
+    assert calls == [daily_request]
+    assert payload["status"] == "completed"
+    assert payload["metrics"]["usable_tickers"] == 1
 
 
 @pytest.fixture

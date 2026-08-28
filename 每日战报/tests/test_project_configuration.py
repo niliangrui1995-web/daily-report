@@ -162,7 +162,7 @@ def test_scheduled_task_migration_is_guarded_and_reversible() -> None:
     assert "--expect-tdx-readonly" in script
     assert "--probe-smtp-login" in script
     assert "--probe-external-auth" in script
-    assert "--probe-model 'gpt-5.6-sol'" in script
+    assert "--probe-model 'claude-opus-4-6-thinking'" in script
     assert "Start-MaintenanceLock" in script
     assert "HolderPid" in script
     assert "Wait-TaskTcpListener" in script

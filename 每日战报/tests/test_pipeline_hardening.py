@@ -1432,7 +1432,12 @@ class TestModelEndpointPolicy:
 
             @staticmethod
             def json():
-                return {"data": [{"id": "gpt-test"}]}
+                return {
+                    "data": [
+                        {"id": "claude-opus-4-6-thinking"},
+                        {"id": "claude-sonnet-4-6"},
+                    ]
+                }
 
         class FakeSession:
             trust_env = True
@@ -1450,7 +1455,11 @@ class TestModelEndpointPolicy:
         assert pipeline_cli._probe_local_model_endpoint(
             "http://127.0.0.1:8317/v1",
             "configured-key",
-        ) == (True, "authenticated status=200 models=1 host=127.0.0.1")
+        ) == (
+            True,
+            "authenticated status=200 models=2 host=127.0.0.1; "
+            "P6/P9 primary=claude-opus-4-6-thinking fallback=claude-sonnet-4-6",
+        )
 
     def test_probe_rejects_external_plain_http_without_network_call(self):
         import pipeline_cli

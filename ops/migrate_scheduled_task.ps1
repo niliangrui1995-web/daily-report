@@ -775,7 +775,7 @@ function Register-And-RunCanary(
     }
     $command = @"
 `$env:PRO_OPUS_BASE_URL = 'http://127.0.0.1:$ProxyPort/v1'
-& '$ServicePython' '$CanaryScript' --project-root '$ProjectRoot' --expect-base-prefix '$MachinePython' --expected-user '$AccountName' --result-path '$ResultPath' --tdx-root '$TdxRoot' --probe-model 'gpt-5.6-sol' --probe-external-auth --probe-smtp-login --allow-maintenance-lock --expect-tdx-readonly
+& '$ServicePython' '$CanaryScript' --project-root '$ProjectRoot' --expect-base-prefix '$MachinePython' --expected-user '$AccountName' --result-path '$ResultPath' --tdx-root '$TdxRoot' --probe-model 'claude-opus-4-6-thinking' --probe-external-auth --probe-smtp-login --allow-maintenance-lock --expect-tdx-readonly
 exit `$LASTEXITCODE
 "@
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))

@@ -1069,16 +1069,20 @@ def test_completed_empty_primary_response_switches_to_backup(monkeypatch):
 
 def test_forced_semantic_fallback_skips_primary_model(monkeypatch):
     calls = []
+    primary_model = "claude-opus-4-6-thinking"
+    fallback_model = "claude-sonnet-4-6"
     adapter = make_adapter(
-        "gpt-5.6-sol",
+        primary_model,
+        base_url=f"{BASE_URL}/v1",
         max_retries=1,
         total_timeout_seconds=900,
         fallback_total_timeout_seconds=900,
+        fallback_model=fallback_model,
     )
 
     def fake_call(self, _system_prompt, _user_prompt, _deadline):
         calls.append(self.model)
-        if self.model == "gpt-5.6-sol":
+        if self.model == primary_model:
             pytest.fail("semantic retry must not call the primary model again")
         return "backup response", "backup thinking"
 
@@ -1094,9 +1098,48 @@ def test_forced_semantic_fallback_skips_primary_model(monkeypatch):
 
     provenance = result.response_metadata["model_provenance"]
     assert result.content == "backup response"
-    assert calls == ["claude-opus-4-6-thinking"]
-    assert provenance["attempted_models"] == ["claude-opus-4-6-thinking"]
+    assert calls == [fallback_model]
+    assert provenance["requested_model"] == primary_model
+    assert provenance["attempted_models"] == [fallback_model]
+    assert provenance["fallback_model"] == fallback_model
     assert provenance["fallback_reason_category"] == "semantic_validation_failed"
+
+
+def test_configured_claude_primary_keeps_distinct_backup_on_runtime_failure(monkeypatch):
+    primary_model = "claude-opus-4-6-thinking"
+    fallback_model = "claude-sonnet-4-6"
+    calls = []
+
+    def fake_call(self, _system_prompt, _user_prompt, _deadline):
+        calls.append(self.model)
+        if self.model == primary_model:
+            self._set_last_error("timeout", "primary request timed out")
+            return "", ""
+        self.last_response_model = fallback_model
+        return "backup response", ""
+
+    monkeypatch.setattr(NativeLLMAdapter, "_call_openai_compat", fake_call)
+    adapter = make_adapter(
+        primary_model,
+        base_url=f"{BASE_URL}/v1",
+        max_retries=1,
+        fallback_model=fallback_model,
+        total_timeout_seconds=900,
+        fallback_total_timeout_seconds=900,
+    )
+
+    result = adapter.invoke("prompt")
+
+    provenance = result.response_metadata["model_provenance"]
+    assert result.content == "backup response"
+    assert calls == [primary_model, fallback_model]
+    assert provenance["requested_model"] == primary_model
+    assert provenance["attempted_models"] == [primary_model, fallback_model]
+    assert provenance["fallback_used"] is True
+    assert provenance["fallback_model"] == fallback_model
+    assert provenance["fallback_reason_category"] == "timeout"
+    assert provenance["effective_model"] == fallback_model
+    assert provenance["fallback_endpoint_independent"] is False
 
 
 def test_fallback_can_use_an_independent_endpoint_and_provider(monkeypatch):

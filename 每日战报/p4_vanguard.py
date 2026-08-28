@@ -94,15 +94,61 @@ def _fetch_vanguard_prices_inline() -> str:
                     if len(completed_hist) < 1:
                         return 'no_data', f'- {name}({ticker}) [{tier}]: 今日尚无完整收盘数据'
 
+                    close_values = pd.to_numeric(completed_hist['Close'], errors='coerce')
+                    if pd.isna(close_values.iloc[-1]):
+                        tail_date = completed_hist.index[-1]
+                        try:
+                            hourly_hist = t.history(
+                                period='5d',
+                                interval='1h',
+                                timeout=P4_REQUEST_TIMEOUT_SECONDS,
+                                raise_errors=True,
+                            )
+                            hourly_hist.index = hourly_hist.index.tz_localize(None).normalize()
+                            hourly_close = pd.to_numeric(hourly_hist['Close'], errors='coerce')
+                            hourly_tail = hourly_close[
+                                (hourly_hist.index == tail_date) & hourly_close.notna()
+                            ]
+                        except Exception as fallback_error:
+                            logging.warning(
+                                '[yfinance] %s(%s) 日线末条收盘价缺失，1h 回退失败: %s',
+                                name,
+                                ticker,
+                                fallback_error,
+                            )
+                            hourly_tail = pd.Series(dtype=float)
+
+                        if hourly_tail.empty:
+                            return 'no_data', (
+                                f'- {name}({ticker}) [{tier}]: '
+                                '数据缺失/不可比较（最近已完成交易日收盘价缺失）'
+                            )
+
+                        completed_hist = completed_hist.copy()
+                        recovered_close = float(hourly_tail.iloc[-1])
+                        completed_hist.loc[tail_date, 'Close'] = recovered_close
+                        close_values.loc[tail_date] = recovered_close
+                        logging.info(
+                            '[yfinance] %s(%s) 使用 1h 回退补齐 %s 收盘价 %.4f',
+                            name,
+                            ticker,
+                            tail_date.date(),
+                            recovered_close,
+                        )
+
+                    valid_completed_hist = completed_hist.loc[close_values.notna()].copy()
+                    if len(valid_completed_hist) < 1:
+                        return 'no_data', f'- {name}({ticker}) [{tier}]: 数据缺失/不可比较（无有效已收盘价）'
+
                     baseline_date = pd.to_datetime(prev_day_str) - pd.Timedelta(days=1)
-                    past_hist = completed_hist[completed_hist.index <= baseline_date]
+                    past_hist = valid_completed_hist[valid_completed_hist.index <= baseline_date]
 
                     if len(past_hist) > 0:
                         prev_close = past_hist['Close'].iloc[-1]
                     else:
-                        prev_close = completed_hist['Close'].iloc[0]
+                        prev_close = valid_completed_hist['Close'].iloc[0]
 
-                    curr_close = completed_hist['Close'].iloc[-1]
+                    curr_close = valid_completed_hist['Close'].iloc[-1]
 
                     if curr_close > 0 and prev_close > 0:
                         pct_change = (curr_close - prev_close) / prev_close * 100

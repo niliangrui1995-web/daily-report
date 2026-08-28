@@ -530,7 +530,14 @@ class NativeLLMAdapter(RunnableSerializable):
 
         thinking_content = ''
         original_model = self.model
-        attempted_models = [] if force_fallback and original_model == 'gpt-5.6-sol' else [original_model]
+        configured_fallback_model = str(
+            (self.extra_kwargs or {}).get('fallback_model')
+            or ('claude-opus-4-6-thinking' if original_model == 'gpt-5.6-sol' else '')
+        ).strip()
+        has_distinct_fallback = bool(
+            configured_fallback_model and configured_fallback_model != original_model
+        )
+        attempted_models = [] if force_fallback and has_distinct_fallback else [original_model]
         selected_model = original_model
         fallback_used = False
         fallback_model = ''
@@ -539,7 +546,7 @@ class NativeLLMAdapter(RunnableSerializable):
         fallback_provider = ''
         fallback_endpoint_independent = False
 
-        if force_fallback and original_model == 'gpt-5.6-sol':
+        if force_fallback and has_distinct_fallback:
             text = ''
             self._set_last_error('semantic_validation_failed', forced_fallback_reason)
         elif self.provider == 'anthropic':
@@ -557,8 +564,8 @@ class NativeLLMAdapter(RunnableSerializable):
             else:
                 text = result
 
-        # Fallback logic for gpt-5.6-sol to claude-opus-4-6-thinking.
-        if original_model == 'gpt-5.6-sol' and (not text or self.last_error_category):
+        # Fallback logic for a configured, distinct primary/backup model pair.
+        if has_distinct_fallback and (not text or self.last_error_category):
             err_msg_lower = self.last_error_message.lower()
             is_fallback_eligible = (
                 self.last_error_category in (
@@ -580,10 +587,7 @@ class NativeLLMAdapter(RunnableSerializable):
             )
             if is_fallback_eligible:
                 fallback_used = True
-                fallback_model = str(
-                    (self.extra_kwargs or {}).get('fallback_model')
-                    or 'claude-opus-4-6-thinking'
-                )
+                fallback_model = configured_fallback_model
                 fallback_reason_category = self.last_error_category
                 fallback_reason = self.last_error_message
                 attempted_models.append(fallback_model)

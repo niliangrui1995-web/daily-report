@@ -319,13 +319,13 @@ P4 ─────────┘    硬门禁          软门禁          软�
 | P3 机动搜索 | 是 | `gemini-2.5-flash` + Google Search → `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent` | Tavily 搜索 API → `https://api.tavily.com/search`；Tavily 是搜索降级通道，不是指定的备用 LLM | 主：`GEMINI_SEARCH_API_KEYS`；备：`TAVILY_API_KEY` |
 | P4 海外行情 | 否 | `yfinance` 行情数据 | 数据缺失时由阶段状态触发后续恢复 | 无模型密钥 |
 | P5 证据审计 | 是 | `claude-sonnet-4-6` → `http://127.0.0.1:8317/v1/chat/completions` | 同模型 → `https://cldapi.com/v1/messages` | 主：`PRO_OPUS_API_KEY`；备：`AUDIT_FALLBACK_API_KEY` |
-| P6 A 股映射 | 是 | `gpt-5.6-sol` → `http://127.0.0.1:8317/v1/responses` | `claude-opus-4-6-thinking` → 同一个 `/v1/responses` | 主备共用 `PRO_OPUS_API_KEY` |
+| P6 A 股映射 | 是 | `claude-opus-4-6-thinking` → `http://127.0.0.1:8317/v1/responses` | `claude-sonnet-4-6` → 同一个 `/v1/responses` | 主备共用 `PRO_OPUS_API_KEY` |
 | P7 深度研究 | 是 | 与 P3 相同的 `gemini-2.5-flash` 搜索链路 | 与 P3 相同的 Tavily 搜索降级通道 | `GEMINI_SEARCH_API_KEYS` / `TAVILY_API_KEY` |
 | P7a 深研审计 | 条件调用 | P7 正文超过 200 字时，与 P5 使用相同 Claude 主链路 | 与 P5 使用相同 Claude 备用链路；审计失败时透传原始 P7 | `PRO_OPUS_API_KEY` / `AUDIT_FALLBACK_API_KEY` |
 | P7.5 补充搜索 | 条件调用 | 与 P3 相同的 Gemini 搜索链路 | 与 P3 相同的 Tavily 搜索降级通道 | `GEMINI_SEARCH_API_KEYS` / `TAVILY_API_KEY` |
 | P7.5 补充审计 | 条件调用 | 搜索产生有效正文后，与 P5 使用相同 Claude 主链路 | 与 P5 使用相同 Claude 备用链路 | `PRO_OPUS_API_KEY` / `AUDIT_FALLBACK_API_KEY` |
 | P8 技术面 | 否 | 从 `TDX_ROOT=D:\HT` 读取本地通达信数据并计算指标 | 无可用 K 线时记录结构化降级 | `TDX_ROOT`，无模型密钥 |
-| P9 战报生成 | 是 | `gpt-5.6-sol` → `http://127.0.0.1:8317/v1/responses` | `claude-opus-4-6-thinking` → 同一个 `/v1/responses` | 主备共用 `PRO_OPUS_API_KEY` |
+| P9 战报生成 | 是 | `claude-opus-4-6-thinking` → `http://127.0.0.1:8317/v1/responses` | `claude-sonnet-4-6` → 同一个 `/v1/responses` | 主备共用 `PRO_OPUS_API_KEY` |
 | 邮件分发 | 否 | SMTP TLS 登录并发送已保存报告 | 失败后进入 `delivery_resume` | `EMAIL_ADDRESS` / `EMAIL_PASSWORD` / `RECEIVER_EMAIL` |
 | Layer ROI | 否 | 本地规则计算贡献与分层统计 | 缺失时进入 `roi_resume` | 无模型密钥 |
 
@@ -344,10 +344,10 @@ P4 ─────────┘    硬门禁          软门禁          软�
 | --- | --- | --- | --- |
 | P2 | `GROK_MODEL` 300s，单请求最多 75s | `grok-4.5` 120s | 401/403 立即切备；首次切备后锁定为 fallback-only，后续分批不再回主模型侵占备胎预算 |
 | P5 | 主审计接口 `AUDIT_MODEL` 240s | 备用审计接口 `AUDIT_MODEL` 180s | 认证、风控、权限、超时或服务端错误停止主接口重试并切备 |
-| P6 | `gpt-5.6-sol` 900s | `claude-opus-4-6-thinking` 900s | 认证、风控、权限、超时、服务端错误或 HTTP 200 空正文立即切备；JSON/完整性失败后的第二轮直接使用备胎 |
-| P9 | `gpt-5.6-sol` 900s | `claude-opus-4-6-thinking` 900s | 与 P6 相同，主备各自拥有完整 900s；无效报告修复轮不再重复消耗主模型 |
+| P6 | `claude-opus-4-6-thinking` 900s | `claude-sonnet-4-6` 900s | 认证、风控、权限、超时、服务端错误或 HTTP 200 空正文立即切备；JSON/完整性失败后的第二轮直接使用备胎 |
+| P9 | `claude-opus-4-6-thinking` 900s | `claude-sonnet-4-6` 900s | 与 P6 相同，主备各自拥有完整 900s；无效报告修复轮不再重复消耗主模型 |
 
-P2 和 P5 只有在对应备用接口及密钥已配置时才能切备。P2 已成功的分批会保留；后续分批失败时记录降级，不丢弃前面的结果。P5 的 900s 控制阶段可容纳两轮 JSON 生成/修复所需的主备调用。P6/P9 的主模型 `gpt-5.6-sol` 与备胎模型 `claude-opus-4-6-thinking` 固定复用 `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY`，并继续使用 Responses API；切备只更换模型，不会改用 `AUDIT_FALLBACK_*`。首轮最坏主备共 1800s，语义修复轮只使用 900s 备胎，3900s 控制阶段仍为落盘、P4 和进程收尾保留余量。429 限流按剩余预算做有限退避，不会无限重试挤占备胎时间。
+P2 和 P5 只有在对应备用接口及密钥已配置时才能切备。P2 已成功的分批会保留；后续分批失败时记录降级，不丢弃前面的结果。P5 的 900s 控制阶段可容纳两轮 JSON 生成/修复所需的主备调用。P6/P9 默认主模型为 `claude-opus-4-6-thinking`、备胎为 `claude-sonnet-4-6`，可通过 `OPUS_MODEL` / `OPUS_FALLBACK_MODEL` 覆盖；启动前会从认证后的 `/models` 清单确认两者均存在且不同。它们固定复用 `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` 和 Responses API；切备只更换模型，不会改用 `AUDIT_FALLBACK_*`。首轮最坏主备共 1800s，语义修复轮只使用 900s 备胎，3900s 控制阶段仍为落盘、P4 和进程收尾保留余量。429 限流按剩余预算做有限退避，不会无限重试挤占备胎时间。
 
 ### 当天断点续跑
 

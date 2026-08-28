@@ -44,6 +44,8 @@ from settings import (
     RECEIVER_EMAIL,
     GROK_API_KEY,
     INSECURE_TLS_ALLOWLIST,
+    OPUS_FALLBACK_MODEL,
+    OPUS_MODEL,
     PRO_OPUS_API_KEY,
     PRO_OPUS_BASE_URL,
     SEARCH_API_KEY_POOL,
@@ -107,7 +109,31 @@ def _probe_local_model_endpoint(base_url: str, api_key: str) -> tuple[bool, str]
         models = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(models, list) or not models:
             return False, "authenticated probe returned no models"
-        return True, f"authenticated status=200 models={len(models)} host={hostname}"
+        model_ids = {
+            str(item.get("id") or "").strip()
+            for item in models
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+        if not model_ids:
+            return False, "authenticated probe returned no models"
+        primary_model = OPUS_MODEL.strip()
+        fallback_model = OPUS_FALLBACK_MODEL.strip()
+        if not primary_model or not fallback_model:
+            return False, "P6/P9 primary or fallback model is empty"
+        if primary_model == fallback_model:
+            return False, "P6/P9 primary and fallback models must differ"
+        missing_models = [
+            model for model in (primary_model, fallback_model) if model not in model_ids
+        ]
+        if missing_models:
+            return False, (
+                f"authenticated status=200 models={len(model_ids)} host={hostname}; "
+                f"missing configured model(s): {','.join(missing_models)}"
+            )
+        return True, (
+            f"authenticated status=200 models={len(model_ids)} host={hostname}; "
+            f"P6/P9 primary={primary_model} fallback={fallback_model}"
+        )
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
 
@@ -501,6 +527,11 @@ def _collect_preflight(
     add_check("today_output", today_dir.is_dir(), str(today_dir))
     add_check("logs_dir", logs_dir.is_dir(), str(logs_dir))
     calendar_mode = "not_checked"
+    opus_model_route = {
+        "primary_model": OPUS_MODEL,
+        "fallback_model": OPUS_FALLBACK_MODEL,
+        "validated": False,
+    }
 
     if full_preflight:
         prompt_dir = Path(__file__).resolve().parent / "prompts"
@@ -512,6 +543,7 @@ def _collect_preflight(
             "configured" if ANTIGRAVITY_API_KEY else "missing",
         )
         endpoint_ok, endpoint_detail = _probe_local_model_endpoint(PRO_OPUS_BASE_URL, PRO_OPUS_API_KEY)
+        opus_model_route["validated"] = endpoint_ok
         add_check("model_endpoint", endpoint_ok, endpoint_detail)
         fallback_host = (urlparse(PRO_OPUS_BASE_URL).hostname or "").strip().lower()
         fallback_detail = (
@@ -642,6 +674,7 @@ def _collect_preflight(
             "exit_code": exit_code,
             "calendar_mode": calendar_mode,
             "search_keys_count": len(SEARCH_API_KEY_POOL),
+            "opus_model_route": opus_model_route,
         },
     }
 

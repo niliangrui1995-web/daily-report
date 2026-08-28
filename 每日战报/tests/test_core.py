@@ -974,7 +974,9 @@ class TestSettings:
         """LLM 适配器应正确初始化"""
         from settings import pro_adapter, opus_adapter
         assert pro_adapter.model == "claude-sonnet-4-6"
-        assert opus_adapter.model == "gpt-5.6-sol"
+        assert opus_adapter.model == "claude-opus-4-6-thinking"
+        assert opus_adapter.extra_kwargs["fallback_model"] == "claude-sonnet-4-6"
+        assert opus_adapter.model != opus_adapter.extra_kwargs["fallback_model"]
         assert opus_adapter.extra_kwargs["reasoning_effort"] == "max"
         assert opus_adapter.extra_kwargs["reasoning_summary"] == "auto"
         assert opus_adapter.extra_kwargs["use_responses_api"] is True

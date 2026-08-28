@@ -16,7 +16,13 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def _successful_preflight(pipeline_cli, monkeypatch, tmp_path: Path) -> None:
+def _successful_preflight(
+    pipeline_cli,
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    stub_model_probe: bool = True,
+) -> None:
     today_dir = tmp_path / "today"
     logs_dir = tmp_path / "logs"
     output_root = tmp_path / "output"
@@ -35,11 +41,12 @@ def _successful_preflight(pipeline_cli, monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(pipeline_cli, "EMAIL_ADDRESS", "sender@example.com")
     monkeypatch.setattr(pipeline_cli, "EMAIL_PASSWORD", "smtp-secret")
     monkeypatch.setattr(pipeline_cli, "RECEIVER_EMAIL", "receiver@example.com")
-    monkeypatch.setattr(
-        pipeline_cli,
-        "_probe_local_model_endpoint",
-        lambda _url, _key: (True, "authenticated status=200"),
-    )
+    if stub_model_probe:
+        monkeypatch.setattr(
+            pipeline_cli,
+            "_probe_local_model_endpoint",
+            lambda _url, _key: (True, "authenticated status=200"),
+        )
     monkeypatch.setattr(pipeline_cli, "GROK_API_KEY", "optional")
     monkeypatch.setattr(pipeline_cli, "INSECURE_TLS_ALLOWLIST", ())
     monkeypatch.setattr(pipeline_cli.importlib, "import_module", lambda _module_name: object())
@@ -661,6 +668,85 @@ def test_preflight_fails_when_local_model_endpoint_is_unreachable(monkeypatch, t
         "ok": False,
         "detail": "connection refused",
         "severity": "error",
+    }
+
+
+def test_missing_primary_model_blocks_p6_p9_before_orchestrator(monkeypatch, tmp_path):
+    """A stale primary must fail preflight without entering either daily LLM stage."""
+    from contextlib import contextmanager
+
+    import pipeline_cli
+    import requests
+
+    _successful_preflight(
+        pipeline_cli,
+        monkeypatch,
+        tmp_path,
+        stub_model_probe=False,
+    )
+    requests_seen = []
+    orchestrator_calls = []
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"data": [{"id": pipeline_cli.OPUS_FALLBACK_MODEL}]}
+
+    class FakeSession:
+        trust_env = True
+
+        def get(self, url, **_kwargs):
+            requests_seen.append(("GET", url))
+            return FakeResponse()
+
+        def post(self, *_args, **_kwargs):
+            pytest.fail("preflight must not send a P6/P9 model request")
+
+        def close(self):
+            return None
+
+    @contextmanager
+    def fake_lock(**_kwargs):
+        yield {"owner_token": "test-owner"}
+
+    real_collect_preflight = pipeline_cli._collect_preflight
+
+    def capture_preflight(strict, **kwargs):
+        result = real_collect_preflight(strict, **kwargs)
+        captured["result"] = result
+        return result
+
+    monkeypatch.setattr(requests, "Session", FakeSession)
+    monkeypatch.setattr(pipeline_cli, "acquire_run_lock", fake_lock)
+    monkeypatch.setattr(pipeline_cli, "read_run_lock", lambda: None)
+    monkeypatch.setattr(pipeline_cli, "_resolve_preflight_resume_stage", lambda _flags: "none")
+    monkeypatch.setattr(pipeline_cli, "_collect_preflight", capture_preflight)
+    monkeypatch.setattr(pipeline_cli, "_print_preflight", lambda _result: pipeline_cli.EXIT_CHECK_FAILED)
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator",
+        SimpleNamespace(orchestrator_main=lambda flags: orchestrator_calls.append(list(flags))),
+    )
+
+    result = pipeline_cli._run_orchestrator([], command_name="run")
+
+    assert result == pipeline_cli.EXIT_CHECK_FAILED
+    assert requests_seen == [("GET", "http://127.0.0.1:8317/v1/models")]
+    assert orchestrator_calls == []
+    model_endpoint = next(
+        item
+        for item in captured["result"]["checks"]
+        if item["name"] == "model_endpoint"
+    )
+    assert model_endpoint["ok"] is False
+    assert pipeline_cli.OPUS_MODEL in model_endpoint["detail"]
+    assert captured["result"]["summary"]["opus_model_route"] == {
+        "primary_model": pipeline_cli.OPUS_MODEL,
+        "fallback_model": pipeline_cli.OPUS_FALLBACK_MODEL,
+        "validated": False,
     }
 
 

@@ -782,12 +782,12 @@ def test_p9_blocks_rejected_identity_in_inputs_output_and_records_fallback_model
 
     captured = {"prompts": [], "manifest_updates": [], "text_artifacts": []}
     provenance = {
-        "requested_model": "gpt-5.6-sol",
-        "effective_model": "claude-opus-4-6-thinking",
-        "attempted_models": ["gpt-5.6-sol", "claude-opus-4-6-thinking"],
+        "requested_model": "claude-opus-4-6-thinking",
+        "effective_model": "claude-sonnet-4-6",
+        "attempted_models": ["claude-opus-4-6-thinking", "claude-sonnet-4-6"],
         "fallback_used": True,
-        "fallback_reason_category": "model_not_found",
-        "fallback_reason": "model_not_found invalid_request_error unknown provider for model gpt-5.6-sol",
+        "fallback_reason_category": "timeout",
+        "fallback_reason": "primary request timed out",
     }
     payload = {
         "x_intel_snipe": [],
@@ -887,7 +887,7 @@ def test_p9_blocks_rejected_identity_in_inputs_output_and_records_fallback_model
     assert "国际复材认证有效" in report
     reasoning_prefix, reasoning_body = captured["text_artifacts"][0]
     assert reasoning_prefix == "P9_LLM推理链"
-    assert "实际模型: claude-opus-4-6-thinking" in reasoning_body
+    assert "实际模型: claude-sonnet-4-6" in reasoning_body
     metrics = next(
         kwargs["metrics"]
         for args, kwargs in reversed(captured["manifest_updates"])

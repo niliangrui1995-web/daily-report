@@ -406,12 +406,12 @@ def test_p6_records_effective_fallback_model_in_manifest_and_reasoning(monkeypat
         "deep_research": [],
     }
     provenance = {
-        "requested_model": "gpt-5.6-sol",
-        "effective_model": "claude-opus-4-6-thinking",
-        "attempted_models": ["gpt-5.6-sol", "claude-opus-4-6-thinking"],
+        "requested_model": "claude-opus-4-6-thinking",
+        "effective_model": "claude-sonnet-4-6",
+        "attempted_models": ["claude-opus-4-6-thinking", "claude-sonnet-4-6"],
         "fallback_used": True,
-        "fallback_reason_category": "model_not_found",
-        "fallback_reason": "model_not_found invalid_request_error unknown provider for model gpt-5.6-sol",
+        "fallback_reason_category": "timeout",
+        "fallback_reason": "primary request timed out",
     }
     monkeypatch.setattr(
         p6_mapper.opus_adapter,
@@ -442,8 +442,8 @@ def test_p6_records_effective_fallback_model_in_manifest_and_reasoning(monkeypat
 
     reasoning_prefix, reasoning_body = text_artifacts[0]
     assert reasoning_prefix == "P6_LLM推理链"
-    assert "请求模型: gpt-5.6-sol" in reasoning_body
-    assert "实际模型: claude-opus-4-6-thinking" in reasoning_body
+    assert "请求模型: claude-opus-4-6-thinking" in reasoning_body
+    assert "实际模型: claude-sonnet-4-6" in reasoning_body
     metrics_provenance = manifest_updates[-1][1]["metrics"]["model_provenance"]
     assert metrics_provenance["requested_model"] == provenance["requested_model"]
     assert metrics_provenance["effective_model"] == provenance["effective_model"]

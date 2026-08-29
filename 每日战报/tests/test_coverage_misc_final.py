@@ -136,6 +136,92 @@ def test_email_fallback_preserves_authentication_failure(monkeypatch):
         )
 
 
+def test_smtp_data_failure_is_ambiguous_and_never_tries_tun_fallback(monkeypatch):
+    import p9_email
+
+    attempts = []
+
+    class DataDisconnectSMTP:
+        def __init__(self, _host, _port, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def set_debuglevel(self, _level):
+            pass
+
+        def login(self, _sender, _password):
+            pass
+
+        def sendmail(self, _sender, _receivers, _payload):
+            attempts.append("DATA")
+            raise OSError("connection dropped after DATA")
+
+    monkeypatch.setattr(p9_email.smtplib, "SMTP_SSL", DataDisconnectSMTP)
+    monkeypatch.setattr(p9_email, "_resolve_real_smtp_ips", lambda: ["203.0.113.1"])
+    monkeypatch.setattr(p9_email, "_candidate_source_ips", lambda: ["192.0.2.1"])
+
+    with pytest.raises(p9_email.SMTPDeliveryAmbiguousError) as exc_info:
+        p9_email.send_report_via_email(
+            "# report",
+            sender_email="sender@example.com",
+            sender_password="secret",  # pragma: allowlist secret
+            receiver_email="receiver@example.com",
+        )
+
+    assert attempts == ["DATA"]
+    provenance = exc_info.value.provenance
+    assert provenance["content_sha256"]
+    assert provenance["message_id"].startswith("<vcp-")
+
+
+def test_smtp_teardown_after_sendmail_is_ambiguous_and_never_tries_tun_fallback(monkeypatch):
+    import p9_email
+
+    sendmail_attempts = []
+    teardown_attempts = []
+
+    class TeardownDisconnectSMTP:
+        def __init__(self, _host, _port, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            teardown_attempts.append("QUIT")
+            raise OSError("connection dropped while waiting for QUIT")
+
+        def set_debuglevel(self, _level):
+            pass
+
+        def login(self, _sender, _password):
+            pass
+
+        def sendmail(self, _sender, _receivers, _payload):
+            sendmail_attempts.append("DATA")
+
+    monkeypatch.setattr(p9_email.smtplib, "SMTP_SSL", TeardownDisconnectSMTP)
+    monkeypatch.setattr(p9_email, "_resolve_real_smtp_ips", lambda: ["203.0.113.1"])
+    monkeypatch.setattr(p9_email, "_candidate_source_ips", lambda: ["192.0.2.1"])
+
+    with pytest.raises(p9_email.SMTPDeliveryAmbiguousError) as exc_info:
+        p9_email.send_report_via_email(
+            "# report",
+            sender_email="sender@example.com",
+            sender_password="secret",  # pragma: allowlist secret
+            receiver_email="receiver@example.com",
+        )
+
+    assert sendmail_attempts == ["DATA"]
+    assert teardown_attempts == ["QUIT"]
+    assert exc_info.value.provenance["error"] == "connection dropped while waiting for QUIT"
+
+
 def test_scheduled_launcher_covers_defensive_failures(monkeypatch):
     import scheduled_launcher
 

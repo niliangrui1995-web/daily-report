@@ -10,6 +10,7 @@ if not defined PYTHON_EXE set "PYTHON_EXE=%ROOT_DIR%.venv\Scripts\python.exe"
 set "PYTHONDONTWRITEBYTECODE=1"
 set "SCHEDULED_LAUNCHER="
 set "PIPELINE_CLI="
+set "EXIT_UNRECOVERABLE_ENTRY=3"
 if not defined RUN_DAILY_HOLD_SECONDS set "RUN_DAILY_HOLD_SECONDS=15"
 if not defined RUN_DAILY_AUTO_RESUME set "RUN_DAILY_AUTO_RESUME=on"
 if not defined RUN_DAILY_RESUME_DELAY_SECONDS set "RUN_DAILY_RESUME_DELAY_SECONDS=10"
@@ -88,6 +89,7 @@ if /I "%RUN_DAILY_AUTO_RESUME%"=="off" exit /b 0
 if /I "%RUN_DAILY_AUTO_RESUME%"=="false" exit /b 0
 if /I "%RUN_DAILY_AUTO_RESUME%"=="skip" exit /b 0
 if "%EXIT_CODE%"=="2" exit /b 0
+if "%EXIT_CODE%"=="%EXIT_UNRECOVERABLE_ENTRY%" exit /b 0
 
 echo.
 echo [WARN] Initial run failed with code: %EXIT_CODE%
@@ -112,9 +114,8 @@ if exist "%SCHEDULED_LAUNCHER%" (
     "%PYTHON_EXE%" -u "%SCHEDULED_LAUNCHER%"
     exit /b !errorlevel!
 )
-echo [WARN] scheduled_launcher.py not found, fallback to pipeline_cli.py run
-"%PYTHON_EXE%" -u "%PIPELINE_CLI%" run
-exit /b %errorlevel%
+echo [ERROR] scheduled_launcher.py not found; refusing to bypass the schedule gate
+exit /b %EXIT_UNRECOVERABLE_ENTRY%
 
 :merge_no_proxy
 set "MERGED_NO_PROXY="

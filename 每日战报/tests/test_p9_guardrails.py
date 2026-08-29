@@ -718,6 +718,71 @@ def test_p9_two_model_network_failure_delivers_validated_checkpoint_fallback(mon
     assert artifact_store.classify_stage_status("completed_no_email", delivered_metrics) == "degraded"
 
 
+def test_p9_raw_p1_unreviewed_requires_manual_review_and_local_only_delivery(monkeypatch):
+    import p9_reporter
+
+    updates = []
+    monkeypatch.setattr(p9_reporter, "get_run_timestamp", lambda: "20260830083002")
+    monkeypatch.setattr(
+        p9_reporter.opus_adapter,
+        "invoke",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("manual-review report must not invoke an LLM")
+        ),
+    )
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+
+    report, report_ts = p9_reporter.p9_risk_analysis(
+        p5_evidence="# P5 Pro 审计失败兜底\n未经审计的 P1 原始情报",
+        p7_deep="# P7 深研\n待审阅",
+        p75_supplement="# P7.5\n待审阅",
+        p6_mapping="# P6 映射\n- 标的",
+        price_data="# P8 技术面\n标的收盘价 100",
+        manual_review_required=True,
+    )
+
+    assert report_ts == "20260830083002"
+    assert "【待人工审阅】" in report
+    assert "禁止自动投递" in report
+    ready = updates[-1][1]
+    assert ready["status"] == "local_manual_review_ready"
+    assert ready["metrics"]["report_outcome"] == "manual_review_required"
+    assert ready["metrics"]["actionable_items_count"] == 0
+    assert ready["metrics"]["delivery"]["mode"] == "manual_review_required"
+
+    persisted_metrics = copy.deepcopy(ready["metrics"])
+    delivery_updates = []
+    monkeypatch.setattr(p9_reporter, "EMAIL_ADDRESS", "sender@example.com")
+    monkeypatch.setattr(p9_reporter, "EMAIL_PASSWORD", "secret")
+    monkeypatch.setattr(p9_reporter, "RECEIVER_EMAIL", "receiver@example.com")
+    monkeypatch.setattr(p9_reporter, "_load_persisted_report_outcome_metrics", lambda: persisted_metrics)
+    monkeypatch.setattr(p9_reporter, "write_text_artifact", lambda *_args, **_kwargs: "manual.md")
+    monkeypatch.setattr(
+        p9_reporter,
+        "send_report_via_email",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("manual-review report must not send email")
+        ),
+    )
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: delivery_updates.append((args, kwargs)),
+    )
+
+    delivery = p9_reporter.send_report_email(report, report_ts, email_required=False)
+
+    assert delivery == {"ok": True, "status": "completed_no_email", "report_path": "manual.md", "email_sent": False}
+    delivered = delivery_updates[-1][1]["metrics"]
+    assert delivered["email_sent"] is False
+    assert delivered["delivery"]["mode"] == "manual_review_required"
+    assert delivered["delivery"]["status"] == "completed_no_email"
+
+
 def test_p9_local_fallback_is_blocked_when_checkpoint_snapshot_is_invalid(monkeypatch):
     import p9_reporter
 

@@ -38,6 +38,11 @@ HN_FETCH_BUDGET_SECONDS = 60
 RSS_PHASE1_BUDGET_SECONDS = 180
 RSS_ENRICH_BUDGET_SECONDS = 180
 
+
+class SourceFetchError(RuntimeError):
+    """外部源请求或解析失败，供采集调度层记录为 failed。"""
+
+
 try:
     from scraper_utils import scrapling_available as _scrapling_available
 except ImportError:
@@ -74,10 +79,12 @@ def _fetch_rss(name: str, url: str, source_tag: str) -> list[dict]:
         feed = feedparser.parse(resp.content)
     except Exception as exc:
         logging.warning(f'[RSS] {name}: fetch failed, skip feed parse fallback - {exc}')
-        return []
+        raise SourceFetchError(str(exc)) from exc
         
     if getattr(feed, 'bozo', False) and not getattr(feed, 'entries', False):
-        return []
+        reason = str(getattr(feed, 'bozo_exception', '') or 'RSS 解析失败')
+        logging.warning(f'[RSS] {name}: feed parse failed - {reason}')
+        raise SourceFetchError(reason)
         
     entries = []
     for entry in feed.entries[:50]:
@@ -130,33 +137,41 @@ def _fetch_reddit(sub: str) -> list[dict]:
 def _fetch_hackernews() -> list[dict]:
     try:
         resp = _safe_external_requests_get('https://hacker-news.firebaseio.com/v0/newstories.json', timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
         ids = resp.json()[:50]
-    except Exception as e:
-        logging.debug(f'Ignored return [] exception: {e}')
-        return []
+    except Exception as exc:
+        logging.warning(f'[RSS] HackerNews: index fetch failed - {exc}')
+        raise SourceFetchError(str(exc)) from exc
         
-    def _fetch_one_hn_story(item_id: int) -> dict | None:
+    def _fetch_one_hn_story(item_id: int) -> tuple[bool, dict | None, str]:
         try:
-            item = _safe_external_requests_get(f'https://hacker-news.firebaseio.com/v0/item/{item_id}.json', timeout=5).json()
+            response = _safe_external_requests_get(
+                f'https://hacker-news.firebaseio.com/v0/item/{item_id}.json',
+                timeout=5,
+            )
+            response.raise_for_status()
+            item = response.json()
             if not item or item.get('type') != 'story':
-                return None
+                return True, None, ''
             created = item.get('time', 0)
             if created:
                 pub = datetime.fromtimestamp(created, tz=timezone.utc).astimezone(BEIJING_TZ).strftime('%Y-%m-%dT%H:%M:%S (北京时间)')
             else:
                 pub = ''
-            return {
+            return True, {
                 'title': item.get('title', ''),
                 'content': '',
                 'url': item.get('url', f'https://news.ycombinator.com/item?id={item_id}'),
                 'published_at': pub,
                 'source': 'hackernews'
-            }
-        except Exception as e:
-            logging.debug(f'Ignored continue exception: {e}')
-            return None
+            }, ''
+        except Exception as exc:
+            logging.debug(f'[RSS] HackerNews: detail fetch failed for {item_id} - {exc}')
+            return False, None, str(exc)
 
     entries = []
+    detail_successes = 0
+    detail_errors = []
     pool = ThreadPoolExecutor(max_workers=10)
     try:
         futures = {pool.submit(_fetch_one_hn_story, item_id): item_id for item_id in ids}
@@ -164,19 +179,28 @@ def _fetch_hackernews() -> list[dict]:
 
         for future in done:
             try:
-                entry = future.result()
+                detail_succeeded, entry, error = future.result()
+                if detail_succeeded:
+                    detail_successes += 1
                 if entry:
                     entries.append(entry)
-            except Exception as e:
-                logging.debug(f'Ignored continue exception: {e}')
+                elif error:
+                    detail_errors.append(error)
+            except Exception as exc:
+                logging.debug(f'[RSS] HackerNews: detail worker failed - {exc}')
+                detail_errors.append(str(exc))
 
         for future in not_done:
             future.cancel()
             item_id = futures[future]
-            logging.debug(f'Ignored timeout item_id exception: {item_id}')
+            logging.debug(f'[RSS] HackerNews: detail request timed out for {item_id}')
+            detail_errors.append(f'详情请求超时: {item_id}')
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
+    if ids and not detail_successes:
+        reason = detail_errors[-1] if detail_errors else '详情请求无有效响应'
+        raise SourceFetchError(f'HackerNews 详情请求全部失败: {reason}')
     return entries
 def _parse_published_datetime(published_at: str) -> datetime | None:
     is_beijing = '(北京时间)' in published_at

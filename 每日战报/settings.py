@@ -3,8 +3,14 @@ __doc__ = '统一配置中心 — 环境变量加载 + 全局常量 + 适配器�
 import os
 import logging
 from datetime import datetime
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlparse
+
+try:
+    from publicsuffixlist import PublicSuffixList
+except ImportError:
+    PublicSuffixList = None
 
 try:
     from dotenv import load_dotenv
@@ -44,12 +50,32 @@ for k in ('HTTP_PROXY', 'HTTPS_PROXY'):
             SYSTEM_PROXY = os.environ[k]
 
 
+_PUBLIC_SUFFIX_LIST = PublicSuffixList() if PublicSuffixList is not None else None
+
+
+def _is_valid_insecure_tls_allowlist_entry(value: str) -> bool:
+    try:
+        ip_address(value)
+        return True
+    except ValueError:
+        pass
+    if '.' not in value or _PUBLIC_SUFFIX_LIST is None:
+        return False
+    try:
+        return _PUBLIC_SUFFIX_LIST.privatesuffix(value) is not None
+    except Exception:
+        return False
+
+
 def _parse_insecure_tls_allowlist(raw_value: str | None) -> tuple[str, ...]:
     values: list[str] = []
     seen: set[str] = set()
     for item in (raw_value or '').split(','):
         normalized = item.strip().lower()
         if not normalized:
+            continue
+        if not _is_valid_insecure_tls_allowlist_entry(normalized):
+            logging.warning('Ignoring unsafe INSECURE_TLS_ALLOWLIST entry: %s', normalized)
             continue
         if normalized in seen:
             continue
@@ -79,7 +105,9 @@ def is_insecure_tls_allowed(url: str) -> bool:
     if not host:
         return False
     for candidate in INSECURE_TLS_ALLOWLIST:
-        if host == candidate or host.endswith(f'.{candidate}'):
+        if host == candidate:
+            return True
+        if candidate.endswith('.local') and host.endswith(f'.{candidate}'):
             return True
     return False
 

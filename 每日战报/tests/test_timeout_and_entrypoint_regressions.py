@@ -4,11 +4,15 @@ import json
 import concurrent.futures
 import inspect
 import multiprocessing
+import os
+import subprocess
 import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 
 def test_run_daily_uses_one_canonical_app_directory() -> None:
@@ -22,6 +26,47 @@ def test_run_daily_uses_one_canonical_app_directory() -> None:
     assert 'set "PYTHONDONTWRITEBYTECODE=1"' in batch_text
     assert 'for /d %%D in ("%ROOT_DIR%*")' not in batch_text
     assert "call :maybe_preflight" not in batch_text
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows batch behavior")
+def test_run_daily_fails_closed_when_scheduled_launcher_is_missing(tmp_path: Path) -> None:
+    repo_root = tmp_path / "project"
+    app_dir = repo_root / "每日战报"
+    app_dir.mkdir(parents=True)
+    batch_path = repo_root / "run_daily.bat"
+    batch_path.write_text(
+        (Path(__file__).resolve().parents[2] / "run_daily.bat").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    marker_path = repo_root / "pipeline-cli-was-invoked.txt"
+    (app_dir / "pipeline_cli.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker_path)!r}).write_text('invoked', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHON_EXE": sys.executable,
+            "RUN_DAILY_HOLD_SECONDS": "0",
+        }
+    )
+
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", str(batch_path)],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+
+    assert "scheduled_launcher.py not found" in result.stdout, result.stdout
+    assert result.returncode == 3
+    assert marker_path.exists() is False
+    assert "Auto-resume will retry" not in result.stdout
 
 
 def test_google_client_receives_transport_timeout(monkeypatch) -> None:

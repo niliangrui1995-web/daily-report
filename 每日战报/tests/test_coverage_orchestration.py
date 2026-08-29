@@ -1793,6 +1793,93 @@ def test_delivery_resume_validates_mode_report_and_delivery(monkeypatch):
         )
 
 
+def test_raw_p1_unreviewed_p5_forces_p9_manual_review_and_local_only_delivery(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        orchestrator,
+        "load_run_manifest",
+        lambda: {
+            "stages": {
+                "p5": {
+                    "status": "failed_empty_output_raw_p1_fallback",
+                    "metrics": {"fallback": "raw_p1_unreviewed", "data_state": "invalid"},
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(orchestrator, "_resolve_p9_checkpoint_snapshot", lambda _context: {})
+
+    def fake_p9(**kwargs):
+        captured["manual_review_required"] = kwargs.get("manual_review_required")
+        return "# manual review", "20260830083002"
+
+    def fake_delivery(_content, _report_ts, *, email_required=None):
+        captured["email_required"] = email_required
+        return {"ok": True, "status": "completed_no_email", "email_sent": False}
+
+    monkeypatch.setattr(orchestrator, "p9_risk_analysis", fake_p9)
+    monkeypatch.setattr(orchestrator, "send_report_email", fake_delivery)
+
+    orchestrator._stage_report(
+        {
+            "p5_evidence": "unreviewed P1 raw evidence",
+            "p6_mapping": "P6 mapping",
+            "p7a_audited": "P7 audit",
+            "p75_supplement": "P7.5 audit",
+            "price_data": "P8 data",
+            "p2_data": "",
+            "p3_data": "",
+            "p4_data": "",
+            "rejected_target_names": [],
+            "ckpt": {},
+        }
+    )
+
+    assert captured == {"manual_review_required": True, "email_required": False}
+
+
+@pytest.mark.parametrize(
+    "manifest_loader",
+    [
+        lambda: (_ for _ in ()).throw(OSError("manifest unavailable")),
+        lambda: {"stages": {"p5": {"metrics": "malformed"}}},
+    ],
+)
+def test_p5_review_state_read_failure_fails_closed_and_is_read_once(monkeypatch, manifest_loader):
+    captured = {"manifest_reads": 0}
+
+    def load_manifest():
+        captured["manifest_reads"] += 1
+        return manifest_loader()
+
+    monkeypatch.setattr(orchestrator, "load_run_manifest", load_manifest)
+    monkeypatch.setattr(orchestrator, "_resolve_p9_checkpoint_snapshot", lambda _context: {})
+
+    def fake_p9(**kwargs):
+        captured["manual_review_required"] = kwargs["manual_review_required"]
+        return "# local review", "20260830083002"
+
+    def fake_delivery(_content, _report_ts, *, email_required=None):
+        captured["email_required"] = email_required
+        return {"ok": True, "status": "completed_no_email", "email_sent": False}
+
+    monkeypatch.setattr(
+        orchestrator,
+        "p9_risk_analysis",
+        fake_p9,
+    )
+    monkeypatch.setattr(orchestrator, "send_report_email", fake_delivery)
+
+    orchestrator._stage_report({"p6_mapping": "P6 mapping", "ckpt": {}})
+
+    assert captured == {
+        "manifest_reads": 1,
+        "manual_review_required": True,
+        "email_required": False,
+    }
+
+
 def test_delivery_resume_does_not_downgrade_required_email_to_local_only(monkeypatch):
     monkeypatch.setattr(orchestrator, "EMAIL_ADDRESS", "sender@example.com")
     monkeypatch.setattr(orchestrator, "EMAIL_PASSWORD", "smtp-secret")
@@ -2008,6 +2095,29 @@ def test_orchestrator_p9_done_checkpoint_records_existing_report(monkeypatch):
 
     assert states[-1]["status"] == "completed_existing_report"
     assert updates[-1][1]["status"] == "completed"
+
+
+def test_orchestrator_manual_confirmation_checkpoint_does_not_run_stages(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "get_schedule_decision",
+        lambda _day: {"is_trading_day": True, "should_run": True, "reason": "ok"},
+    )
+    updates, states, _contexts = _patch_main_runtime(
+        monkeypatch,
+        checkpoint={
+            "stage": "manual_confirmation_required",
+            "files": {"war_report": "saved-report.md"},
+            "run_timestamp": "20260623090000",
+        },
+        registry_effect=lambda *_args, **_kwargs: pytest.fail("manual confirmation must not start any stage"),
+    )
+
+    orchestrator.orchestrator_main([])
+
+    assert states[-1]["status"] == "manual_confirmation_required"
+    assert states[-1]["main_flow_entered"] is False
+    assert updates[-1][1]["status"] == "manual_confirmation_required"
 
 
 @pytest.mark.parametrize(

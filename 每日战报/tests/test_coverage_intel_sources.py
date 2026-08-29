@@ -156,7 +156,8 @@ def test_classify_web_time_window_all_statuses(monkeypatch):
 
 
 def test_scrape_one_source_requires_selector(caplog):
-    assert p1_web._scrape_one_source({"url": "https://example.com", "name": "Missing"}) == []
+    with pytest.raises(p1_web.SourceFetchError, match="未配置 CSS 选择器"):
+        p1_web._scrape_one_source({"url": "https://example.com", "name": "Missing"})
     assert "未配置 CSS 选择器" in caplog.text
 
 

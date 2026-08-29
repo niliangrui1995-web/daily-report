@@ -220,7 +220,8 @@ def test_rss_fetch_failure_does_not_let_feedparser_fetch_url(monkeypatch):
     monkeypatch.setattr(p1_rss, "_safe_external_requests_get", fail_safe_get)
     monkeypatch.setattr(p1_rss.feedparser, "parse", fail_parse)
 
-    assert p1_rss._fetch_rss("Example", "https://example.com/feed.xml", "example") == []
+    with pytest.raises(p1_rss.SourceFetchError, match="network timeout"):
+        p1_rss._fetch_rss("Example", "https://example.com/feed.xml", "example")
 
 
 def test_rss_source_fetch_blocks_redirect_to_private_host(monkeypatch):
@@ -254,7 +255,8 @@ def test_rss_source_fetch_blocks_redirect_to_private_host(monkeypatch):
     monkeypatch.setattr(scraper_utils.requests, "get", fake_get)
     monkeypatch.setattr(p1_rss.feedparser, "parse", fail_parse)
 
-    assert p1_rss._fetch_rss("Example", "https://example.com/feed.xml", "example") == []
+    with pytest.raises(p1_rss.SourceFetchError):
+        p1_rss._fetch_rss("Example", "https://example.com/feed.xml", "example")
     assert calls == [("https://example.com/feed.xml", False)]
 
 
@@ -268,6 +270,9 @@ def test_social_source_fetches_use_safe_external_get(monkeypatch):
 
         def __init__(self, payload):
             self._payload = payload
+
+        def raise_for_status(self):
+            return None
 
         def json(self):
             return self._payload
@@ -320,7 +325,8 @@ def test_web_source_fetch_blocks_redirect_to_private_host(monkeypatch):
     monkeypatch.setattr(scraper_utils.socket, "getaddrinfo", fake_getaddrinfo)
     monkeypatch.setattr(scraper_utils.requests, "get", fake_get)
 
-    assert p1_web._scrape_one_source({"name": "Example", "url": "https://example.com/source", "selector": "a"}) == []
+    with pytest.raises(p1_web.SourceFetchError):
+        p1_web._scrape_one_source({"name": "Example", "url": "https://example.com/source", "selector": "a"})
     assert calls == [("https://example.com/source", False)]
 
 

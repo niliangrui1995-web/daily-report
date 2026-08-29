@@ -54,6 +54,78 @@ def _successful_preflight(
     monkeypatch.setattr(pipeline_cli, "is_trading_day", lambda _day: True)
 
 
+def test_strict_preflight_rejects_unverified_external_model_endpoint(monkeypatch, tmp_path):
+    import pipeline_cli
+    import requests
+
+    _successful_preflight(pipeline_cli, monkeypatch, tmp_path, stub_model_probe=False)
+    monkeypatch.setattr(pipeline_cli, "PRO_OPUS_BASE_URL", "https://models.example.test/v1")
+    monkeypatch.setattr(pipeline_cli, "validate_model_base_url", lambda _url: (True, False, ""))
+
+    class DeniedResponse:
+        status_code = 403
+
+    class DeniedSession:
+        def __init__(self):
+            self.trust_env = True
+
+        def get(self, _url, **_kwargs):
+            return DeniedResponse()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(requests, "Session", DeniedSession)
+
+    result = pipeline_cli._collect_preflight(strict=True)
+
+    model_endpoint = next(item for item in result["checks"] if item["name"] == "model_endpoint")
+    assert result["summary"]["exit_code"] == pipeline_cli.EXIT_CHECK_FAILED
+    assert result["summary"]["opus_model_route"]["validated"] is False
+    assert model_endpoint["ok"] is False
+    assert "HTTP 403" in model_endpoint["detail"]
+
+
+def test_model_probe_rejects_redirect_without_following_it(monkeypatch):
+    import pipeline_cli
+    import requests
+
+    monkeypatch.setattr(
+        pipeline_cli,
+        "validate_model_base_url",
+        lambda _base_url: (True, False, ""),
+    )
+
+    class RedirectResponse:
+        status_code = 302
+
+    sessions = []
+
+    class RedirectSession:
+        def __init__(self):
+            self.trust_env = True
+            sessions.append(self)
+
+        def get(self, url, **kwargs):
+            assert url == "https://models.example.test/v1/models"
+            assert kwargs["allow_redirects"] is False
+            return RedirectResponse()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(requests, "Session", RedirectSession)
+
+    verified, detail = pipeline_cli._probe_local_model_endpoint(
+        "https://models.example.test/v1",
+        "test-api-key",
+    )
+
+    assert verified is False
+    assert "HTTP 302" in detail
+    assert sessions[0].trust_env is False
+
+
 def test_standalone_preflight_preserves_run_timestamp(monkeypatch, tmp_path):
     import artifact_store
     import pipeline_cli
@@ -777,6 +849,10 @@ def test_preflight_reports_same_endpoint_opus_fallback(monkeypatch, tmp_path):
         ),
         ("roi_resume", {"output_root", "today_output", "logs_dir", "run_lock"}),
         ("p9_done", {"output_root", "today_output", "logs_dir", "run_lock"}),
+        (
+            "manual_confirmation_required",
+            {"output_root", "today_output", "logs_dir", "run_lock"},
+        ),
     ],
 )
 def test_recovery_preflight_only_checks_capabilities_needed_by_resume_stage(
@@ -971,6 +1047,85 @@ def test_run_locks_before_resolving_resume_profile_and_running_preflight(monkeyp
         },
     )
     assert ("orchestrator", []) in calls
+
+
+@pytest.mark.parametrize("command_name", ["run", "resume"])
+def test_manual_confirmation_checkpoint_stops_after_local_preflight(
+    monkeypatch,
+    command_name,
+    capsys,
+):
+    from contextlib import contextmanager
+
+    import pipeline_cli
+
+    calls = []
+    successful_result = {
+        "checks": [],
+        "summary": {
+            "total": 0,
+            "failed": 0,
+            "warnings": 0,
+            "exit_code": pipeline_cli.EXIT_OK,
+        },
+    }
+
+    @contextmanager
+    def fake_lock(**kwargs):
+        calls.append(("lock", kwargs))
+        yield {"owner_token": "owned-token"}
+
+    def fake_preflight(strict, **kwargs):
+        calls.append(("preflight", strict, kwargs))
+        return successful_result
+
+    monkeypatch.setattr(pipeline_cli, "acquire_run_lock", fake_lock)
+    monkeypatch.setattr(
+        pipeline_cli,
+        "_resolve_preflight_resume_stage",
+        lambda _flags: "manual_confirmation_required",
+    )
+    monkeypatch.setattr(pipeline_cli, "_collect_preflight", fake_preflight)
+    monkeypatch.setattr(
+        pipeline_cli,
+        "set_preflight_summary",
+        lambda _summary: pytest.fail("manual confirmation must not update run state"),
+    )
+    monkeypatch.setattr(
+        pipeline_cli,
+        "configure_run_logging",
+        lambda: pytest.fail("manual confirmation must not initialize execution logging"),
+    )
+    monkeypatch.setattr(
+        pipeline_cli,
+        "update_manifest_context",
+        lambda **_kwargs: pytest.fail("manual confirmation must not mutate the manifest"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator",
+        SimpleNamespace(
+            orchestrator_main=lambda _flags: pytest.fail(
+                "manual confirmation must not enter the orchestrator"
+            )
+        ),
+    )
+
+    result = pipeline_cli._run_orchestrator([], command_name=command_name)
+
+    assert result == pipeline_cli.EXIT_MANUAL_CONFIRMATION_REQUIRED == 3
+    assert calls == [
+        ("lock", {"command": command_name}),
+        (
+            "preflight",
+            True,
+            {
+                "resume_stage": "manual_confirmation_required",
+                "expected_lock_owner_token": "owned-token",
+            },
+        ),
+    ]
+    assert "manual_confirmation_required" in capsys.readouterr().out.lower()
 
 
 def test_force_restart_uses_full_preflight_without_reading_checkpoint(monkeypatch):

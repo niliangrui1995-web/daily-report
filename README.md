@@ -2,7 +2,7 @@
 
 > 按 A 股交易日运行的多阶段情报流水线：采集北美 AI 产业链信息，审计证据，映射 A 股受益方向，生成战报并邮件分发。
 
-Last verified: 2026-07-16
+Last verified: 2026-08-30
 
 ---
 
@@ -19,8 +19,8 @@ Last verified: 2026-07-16
 - 根目录 `run_daily.bat` 是 Windows 手工运行和计划任务入口。
 - 项目主体位于 `每日战报/` 子目录，控制面入口是 `pipeline_cli.py`。
 - `pipeline_cli.py run/resume/force-run/restart` 在取得运行锁后记录严格 preflight，通过后才进入 orchestrator。
-- `run_daily.bat` 默认失败后自动 `resume` 一次：`RUN_DAILY_AUTO_RESUME=on`，延迟 `10` 秒。
-- 无参数或参数为 `run` 时，`run_daily.bat` 优先进入 `scheduled_launcher.py`。
+- `run_daily.bat` 默认对可恢复失败自动 `resume` 一次：`RUN_DAILY_AUTO_RESUME=on`，延迟 `10` 秒；运行锁、入口缺失和待人工确认状态不会自动恢复。
+- 无参数或参数为 `run` 时，`run_daily.bat` 必须进入 `scheduled_launcher.py`；入口缺失时以不可恢复退出码 `3` 失败封闭，不会直跑控制面绕过交易日门禁。
 - `scheduled_launcher.py` 会先判断当天是否为 A 股交易日；当前代码规则是 `schedule_rule=run_every_trading_day`，交易日运行，非交易日跳过。
 - `pipeline_lock.py` 使用全局 run lock 防止重复启动。
 - `run_manifest.json` 固定写入当日输出目录根部，记录阶段状态、运行上下文和 preflight 摘要。
@@ -115,7 +115,7 @@ notepad .\每日战报\.env
 | `GROK_NATIVE_ENABLE_X_SEARCH` | 通用 Grok adapter 是否挂载 `x_search`，默认 `false` |
 | `EMAIL_ADDRESS` / `EMAIL_PASSWORD` | SMTP 发件账号和授权码 |
 | `RECEIVER_EMAIL` | 收件人，多个邮箱用逗号分隔 |
-| `INSECURE_TLS_ALLOWLIST` | 允许降级为不安全 TLS 的域名白名单，默认空 |
+| `INSECURE_TLS_ALLOWLIST` | 允许降级为不安全 TLS 的精确主机白名单，默认空；公共后缀会按内置 PSL 拒绝，只有显式 `.local` 内部域可覆盖其子域 |
 
 所有密钥只应写入 `.env` 或外部环境变量，不要写进代码。
 
@@ -285,12 +285,12 @@ P4 ─────────┘    硬门禁          软门禁          软�
 - P1/P3 会区分正常无结果、缺 Key、部分源失败和全部失败；部分成功不会再被伪装成干净完成。
 - P4 至少需要一条有效收盘价；全是“无数据/获取失败”的 Markdown 只保留为诊断文件，后续恢复会重取 P4 并重做 P6。
 - P5 同时核对通过数、删除数和实际列表；空壳审计会补跑 P5，合法“全部删除”则记录为 `completed_no_results`。通过正文与删除清单分开保存，断点恢复不会把已删除证据重新送入 P6/P9。
-- P5 主备均失败但 P1 原始证据非空时，使用明确标记的未审计 P1 降级输入，避免静默中断证据链。
+- P5 主备均失败但 P1 原始证据非空时，只生成明确标记的待人工审阅本地报告；该输入不可复用为有效 P5，也不会生成 actionable 结论或自动发邮件。
 - P6 是硬门禁：不仅要求非空，还要求有效事件、至少 5 个唯一且通过当前身份校验版本的标的和完整赛道结构；不完整输出不落盘，P9 不会启动，状态保留为可恢复的 `p6_resume`。
 - P7/P7a/P7.5 和 P8 是软门禁：模型空响应与“确实无结果”使用不同状态；合法空结果不会生成或复用旧占位文件，也不会在断点恢复时被重复调用。P7a 短输入属于原始 P7 透传，不会误判为空结果；P7.5 审计确认无有效证据后，ROI 不会重新采用被删除的原始文本。P8 请求了股票但没有任何可用本地 K 线时记为 `completed_structured_degraded`，不会伪装成干净完成。
 - P9 是硬门禁：空报告、空章节或只有结构化占位对象的报告不落入可操作完成态；合法“无可操作信号”会保留完整章节并记录独立 outcome。写 Markdown 前先登记 `report_save_in_progress`，原子保存后登记 `report_saved_pending_delivery`，再进入邮件分发和 ROI。
 - ROI 必须同时具备 Markdown、JSON 和完整分层统计，单有 `completed` 状态不能让整条任务进入终态。
-- 邮件已配置但发送失败时，ROI 暂不运行；下次只恢复邮件，成功后继续 ROI。未配置邮件时，本地报告以 `completed_no_email` 完成并继续 ROI。
+- 邮件在连接、登录或 DATA 前明确失败时，ROI 暂不运行，下次只恢复邮件；`sendmail()` 后结果不确定时进入 `manual_confirmation_required`，禁止 P9、邮件和 ROI 自动重跑。未配置邮件时，本地报告以 `completed_no_email` 完成并继续 ROI。
 
 控制阶段如下：
 
@@ -326,7 +326,7 @@ P4 ─────────┘    硬门禁          软门禁          软�
 | P7.5 补充审计 | 条件调用 | 搜索产生有效正文后，与 P5 使用相同 Claude 主链路 | 与 P5 使用相同 Claude 备用链路 | `PRO_OPUS_API_KEY` / `AUDIT_FALLBACK_API_KEY` |
 | P8 技术面 | 否 | 从 `TDX_ROOT=D:\HT` 读取本地通达信数据并计算指标 | 无可用 K 线时记录结构化降级 | `TDX_ROOT`，无模型密钥 |
 | P9 战报生成 | 是 | `claude-opus-4-6-thinking` → `http://127.0.0.1:8317/v1/responses` | `claude-sonnet-4-6` → 同一个 `/v1/responses` | 主备共用 `PRO_OPUS_API_KEY` |
-| 邮件分发 | 否 | SMTP TLS 登录并发送已保存报告 | 失败后进入 `delivery_resume` | `EMAIL_ADDRESS` / `EMAIL_PASSWORD` / `RECEIVER_EMAIL` |
+| 邮件分发 | 否 | SMTP TLS 登录并发送已保存报告 | 明确的发送前失败进入 `delivery_resume`；DATA 结果不确定时等待人工确认 | `EMAIL_ADDRESS` / `EMAIL_PASSWORD` / `RECEIVER_EMAIL` |
 | Layer ROI | 否 | 本地规则计算贡献与分层统计 | 缺失时进入 `roi_resume` | 无模型密钥 |
 
 密钥边界必须保持如下：
@@ -347,7 +347,7 @@ P4 ─────────┘    硬门禁          软门禁          软�
 | P6 | `claude-opus-4-6-thinking` 900s | `claude-sonnet-4-6` 900s | 认证、风控、权限、超时、服务端错误或 HTTP 200 空正文立即切备；JSON/完整性失败后的第二轮直接使用备胎 |
 | P9 | `claude-opus-4-6-thinking` 900s | `claude-sonnet-4-6` 900s | 与 P6 相同，主备各自拥有完整 900s；无效报告修复轮不再重复消耗主模型 |
 
-P2 和 P5 只有在对应备用接口及密钥已配置时才能切备。P2 已成功的分批会保留；后续分批失败时记录降级，不丢弃前面的结果。P5 的 900s 控制阶段可容纳两轮 JSON 生成/修复所需的主备调用。P6/P9 默认主模型为 `claude-opus-4-6-thinking`、备胎为 `claude-sonnet-4-6`，可通过 `OPUS_MODEL` / `OPUS_FALLBACK_MODEL` 覆盖；启动前会从认证后的 `/models` 清单确认两者均存在且不同。它们固定复用 `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` 和 Responses API；切备只更换模型，不会改用 `AUDIT_FALLBACK_*`。首轮最坏主备共 1800s，语义修复轮只使用 900s 备胎，3900s 控制阶段仍为落盘、P4 和进程收尾保留余量。429 限流按剩余预算做有限退避，不会无限重试挤占备胎时间。
+P2 和 P5 只有在对应备用接口及密钥已配置时才能切备。P2 已成功的分批会保留；后续分批失败时记录降级，不丢弃前面的结果。P5 的 900s 控制阶段可容纳两轮 JSON 生成/修复所需的主备调用。P6/P9 默认主模型为 `claude-opus-4-6-thinking`、备胎为 `claude-sonnet-4-6`，可通过 `OPUS_MODEL` / `OPUS_FALLBACK_MODEL` 覆盖；启动前会对本地或外部 HTTPS 端点发送不跟随重定向的认证 `/models` 请求，确认两者均存在且不同。它们固定复用 `PRO_OPUS_BASE_URL` / `PRO_OPUS_API_KEY` 和 Responses API；切备只更换模型，不会改用 `AUDIT_FALLBACK_*`。首轮最坏主备共 1800s，语义修复轮只使用 900s 备胎，3900s 控制阶段仍为落盘、P4 和进程收尾保留余量。429 限流按剩余预算做有限退避，不会无限重试挤占备胎时间。
 
 ### 当天断点续跑
 
@@ -357,22 +357,23 @@ P2 和 P5 只有在对应备用接口及密钥已配置时才能切备。P2 已�
 
 1. `p2_resume`：只有 P2 缺失或失败且无非空产物时，即使旧流程已误到达报告/邮件/ROI，也先只补跑 P2；复用已有 P1/P3/P5，然后重新进入 P6。
 2. `p9_done`：P2 完整，且报告、分发、ROI 和根状态均完整，直接结束。
-3. `delivery_resume`：已有报告但邮件未完成，只恢复原定投递策略；邮件成功后先恢复 ROI 所需的原始阶段上下文，再继续 ROI，避免用全空输入覆盖贡献统计。
-4. `roi_resume`：报告分发已完成但 ROI 缺失，只补 ROI。
-5. `intel_resume`：P1/P3 单独失败，或 P1/P2/P3 多支同时失败时，只补跑失败且无产物的分支；P1 被重采后会重做 P5，成功分支不重复运行。
-6. `p5_resume`：P1 有效但 P5 失败、空壳或计数不一致时，只重做 P5；成功后重做依赖它的 P6 及下游。
-7. `p6_resume`：P4 无有效行情，或 P6 已尝试但失败/结构不完整时，从 P4/P6 必要位置继续，不重复采集有效的 P1/P2/P3/P5。
-8. `p9_resume`：P8 存在且语义有效时，从 P9 继续；可复用状态仅包括“非空 Markdown + 至少一只有效行情”和“P6 确实没有 A 股标的”的合法空结果。
-9. `p8_resume`：研究层已完成（包括合法空结果），或 P8 为零字节、仅有 JSON、`skipped_no_vipdoc`、异常占位、请求股票但有效行情为零等可恢复状态时，从 P8 继续。
-10. 已有 P6、P5 或 P1：分别从相应 checkpoint 继续；否则从 P1 开始。
+3. `manual_confirmation_required`：SMTP DATA 结果不确定时立即停止，控制面返回不可自动恢复的退出码 `3`，等待操作者确认是否已送达。
+4. `delivery_resume`：已有报告且邮件在发送前明确失败，只恢复原定投递策略；邮件成功后先恢复 ROI 所需的原始阶段上下文，再继续 ROI，避免用全空输入覆盖贡献统计。
+5. `roi_resume`：报告分发已完成但 ROI 缺失，只补 ROI。
+6. `intel_resume`：P1/P3 单独失败，或 P1/P2/P3 多支同时失败时，只补跑失败且无产物的分支；P1 被重采后会重做 P5，成功分支不重复运行。
+7. `p5_resume`：P1 有效但 P5 失败、空壳、计数不一致或明确标记为未审阅/invalid 时，只重做 P5；成功后重做依赖它的 P6 及下游。
+8. `p6_resume`：P4 无有效行情，或 P6 已尝试但失败/结构不完整时，从 P4/P6 必要位置继续，不重复采集有效的 P1/P2/P3/P5。
+9. `p9_resume`：P8 存在且语义有效时，从 P9 继续；可复用状态仅包括“非空 Markdown + 至少一只有效行情”和“P6 确实没有 A 股标的”的合法空结果。
+10. `p8_resume`：研究层已完成（包括合法空结果），或 P8 为零字节、仅有 JSON、`skipped_no_vipdoc`、异常占位、请求股票但有效行情为零等可恢复状态时，从 P8 继续。
+11. 已有 P6、P5 或 P1：分别从相应 checkpoint 继续；否则从 P1 开始。
 
 恢复检测采用“状态优先 + 结构校验 + 上游依赖”三层判断，不再以文件存在作为成功依据。业务产物时间使用独立的 `output_updated_at`，ROI 指标回写只更新记账时间，不会把旧阶段伪装成新产物。任一上游变更或语义失效会级联移除旧下游 checkpoint；合法空结果会清掉同阶段遗留文件，但只在下游产物早于该结果时使其失效，避免误删基于该空结果生成的新报告。P6 更新后，即使新计划不再触发 P7/P7a/P7.5，也会用 `skipped_not_triggered` 写入当前 P6 哈希并清除旧哈希状态；旧研究结论、P8 和 P9 不会跨 P6 版本复用。P8 还会联合检查 manifest 状态、`stocks_requested`、`stocks_with_data`、当前 P6 唯一标的数和带数值的收盘行；JSON 只作为 P9 的辅助数据，不再被当作 P8 checkpoint 主产物。历史运行从未尝试 P8 时不会误删已保存报告，但已尝试且语义无效的 P8 会阻断 P9/ROI。
 
 ### P9 保存、邮件和 ROI 恢复
 
-P9 写 Markdown 前先记录 `report_save_in_progress`，原子保存后立即写入 `report_saved_pending_delivery`。两次状态之间中断时，只要同批次非空报告已经存在，下次就进入 `delivery_resume`，不会重新调用 P9 模型。恢复会保留原任务的“必须发邮件/仅本地保存”策略，不会因当前环境变量变化而误发或静默降级。邮件成功后若进程在 ROI 前中断，则进入 `roi_resume`，只做本地 ROI 计算。SMTP 与本地 manifest 无法组成同一事务，因此远端已接收但本地尚未记账的极端崩溃窗仍按 at-least-once 语义处理，可能重复投递但不会静默漏发。
+P9 写 Markdown 前先记录 `report_save_in_progress`，原子保存后立即写入 `report_saved_pending_delivery`。两次状态之间中断时，只要同批次非空报告已经存在，下次就进入 `delivery_resume`，不会重新调用 P9 模型。恢复会保留原任务的“必须发邮件/仅本地保存”策略，不会因当前环境变量变化而误发或静默降级。邮件成功后若进程在 ROI 前中断，则进入 `roi_resume`，只做本地 ROI 计算。每封邮件带稳定 `Message-ID` 和正文 SHA-256；`sendmail()` 抛错表示远端可能已经接收，此时记录 provenance 并进入 `manual_confirmation_required`，不会在同次调用或自动恢复中重投。
 
-恢复型 preflight 也按需要缩小范围：`delivery_resume` 只检查本地目录、运行锁和本次确实需要的邮件配置；原本就是本地报告的任务不会因缺少邮件配置卡住。`roi_resume` / `p9_done` 只检查本地目录与运行锁，不会被无关的模型或搜索接口阻塞。
+恢复型 preflight 也按需要缩小范围：`delivery_resume` 只检查本地目录、运行锁和本次确实需要的邮件配置；原本就是本地报告的任务不会因缺少邮件配置卡住。`manual_confirmation_required` / `roi_resume` / `p9_done` 只检查本地目录与运行锁，不会被无关的模型或搜索接口阻塞。
 
 ---
 
@@ -425,7 +426,7 @@ P9 写 Markdown 前先记录 `report_save_in_progress`，原子保存后立即�
 
 - `requests` 默认 `verify=True`。
 - 不全局关闭 `InsecureRequestWarning`。
-- 只有 `INSECURE_TLS_ALLOWLIST` 命中的域名允许不安全 TLS。
+- 只有 `INSECURE_TLS_ALLOWLIST` 命中的精确主机允许不安全 TLS；公共后缀由打包的 Public Suffix List 拒绝，缺少 PSL 依赖时白名单失败封闭。
 - `NO_PROXY` 会合并现有值，并补齐 `127.0.0.1,localhost,::1`，避免本地反代被代理误拦。
 
 相关入口：

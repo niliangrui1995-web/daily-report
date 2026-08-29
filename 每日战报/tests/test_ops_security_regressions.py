@@ -117,8 +117,11 @@ def test_proxy_canary_rejects_failed_inference_status(monkeypatch: pytest.Monkey
         )
 
 
-def test_inference_probe_retries_transient_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_inference_probe_retries_transient_server_error_and_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     responses = [
+        _FakeResponse({}, status_code=500, headers={"Retry-After": "0"}),
         _FakeResponse({}, status_code=429, headers={"Retry-After": "0"}),
         _FakeResponse({"id": "response-id", "output_text": "OK"}),
     ]

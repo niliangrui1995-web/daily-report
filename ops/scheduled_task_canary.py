@@ -83,7 +83,7 @@ def _post_inference_with_retry(
             json=payload,
             timeout=(5.0, 90.0),
         )
-        if response.status_code not in {429, 502, 503, 504} or attempt == 2:
+        if response.status_code not in {429, 500, 502, 503, 504} or attempt == 2:
             return response
         retry_after = response.headers.get("Retry-After", "")
         try:

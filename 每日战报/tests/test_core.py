@@ -804,6 +804,251 @@ class TestP3JinnangRecovery:
 
 
 class TestP1RssTimeWindow:
+    def test_rss_request_failure_is_reported_as_failed_source(self, monkeypatch):
+        import p1_rss
+
+        def raise_network_error(*_args, **_kwargs):
+            raise RuntimeError("simulated RSS network failure")
+
+        monkeypatch.setattr(
+            p1_rss,
+            "V2_RSS_FEEDS",
+            [{"name": "BrokenRSS", "url": "https://example.com/feed", "source": "broken"}],
+        )
+        monkeypatch.setattr(p1_rss, "V2_REDDIT_SUBS", [])
+        monkeypatch.setattr(p1_rss, "_fetch_hackernews", lambda: [])
+        monkeypatch.setattr(p1_rss, "_safe_external_requests_get", raise_network_error)
+        monkeypatch.setattr(p1_rss.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(p1_rss.random, "uniform", lambda _start, _end: 0)
+
+        _results, stats = p1_rss.collect_from_rss("24h")
+
+        assert stats["failed"] == [("BrokenRSS", "simulated RSS network failure")]
+        assert not stats["success"]
+
+    def test_hackernews_index_failure_is_reported_as_failed_source(self, monkeypatch):
+        import p1_rss
+
+        def raise_network_error(*_args, **_kwargs):
+            raise RuntimeError("simulated HackerNews index failure")
+
+        monkeypatch.setattr(p1_rss, "V2_RSS_FEEDS", [])
+        monkeypatch.setattr(p1_rss, "V2_REDDIT_SUBS", [])
+        monkeypatch.setattr(p1_rss, "_safe_external_requests_get", raise_network_error)
+        monkeypatch.setattr(p1_rss.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(p1_rss.random, "uniform", lambda _start, _end: 0)
+
+        _results, stats = p1_rss.collect_from_rss("24h")
+
+        assert stats["failed"] == [("HackerNews", "simulated HackerNews index failure")]
+        assert not stats["empty"]
+
+    def test_web_request_failure_is_reported_as_failed_source(self, monkeypatch):
+        import p1_web
+
+        def raise_timeout(*_args, **_kwargs):
+            raise p1_web.requests.exceptions.Timeout("simulated web timeout")
+
+        monkeypatch.setattr(p1_web, "_parser_available", True)
+        monkeypatch.setattr(
+            p1_web,
+            "V2_WEB_SOURCES",
+            [
+                {
+                    "name": "BrokenWeb",
+                    "url": "https://example.com/news",
+                    "selector": "article a",
+                    "category": "网页采集",
+                }
+            ],
+        )
+        monkeypatch.setattr(p1_web, "_safe_external_requests_get", raise_timeout)
+        monkeypatch.setattr(p1_web.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(p1_web.random, "uniform", lambda _start, _end: 0)
+
+        _results, stats = p1_web.collect_from_web("24h")
+
+        assert stats["failed"] == [("BrokenWeb", "simulated web timeout")]
+        assert not stats["success"]
+
+    def test_rss_parse_failure_is_reported_as_failed_source(self, monkeypatch):
+        import p1_rss
+
+        class SuccessfulResponse:
+            content = b"not an RSS document"
+
+            def raise_for_status(self):
+                return None
+
+        class BrokenFeed:
+            bozo = True
+            bozo_exception = ValueError("simulated RSS parse failure")
+            entries = []
+
+        monkeypatch.setattr(
+            p1_rss,
+            "V2_RSS_FEEDS",
+            [{"name": "MalformedRSS", "url": "https://example.com/feed", "source": "broken"}],
+        )
+        monkeypatch.setattr(p1_rss, "V2_REDDIT_SUBS", [])
+        monkeypatch.setattr(p1_rss, "_fetch_hackernews", lambda: [])
+        monkeypatch.setattr(
+            p1_rss,
+            "_safe_external_requests_get",
+            lambda *_args, **_kwargs: SuccessfulResponse(),
+        )
+        monkeypatch.setattr(p1_rss.feedparser, "parse", lambda _content: BrokenFeed())
+        monkeypatch.setattr(p1_rss.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(p1_rss.random, "uniform", lambda _start, _end: 0)
+
+        _results, stats = p1_rss.collect_from_rss("24h")
+
+        assert stats["failed"] == [("MalformedRSS", "simulated RSS parse failure")]
+        assert not stats["success"]
+
+    def test_web_parse_failure_is_reported_as_failed_source(self, monkeypatch):
+        import p1_web
+
+        class SuccessfulResponse:
+            text = "<html>broken selector input</html>"
+
+            def raise_for_status(self):
+                return None
+
+        class BrokenSelector:
+            def __init__(self, _html):
+                raise RuntimeError("simulated HTML parse failure")
+
+        monkeypatch.setattr(p1_web, "_parser_available", True)
+        monkeypatch.setattr(
+            p1_web,
+            "V2_WEB_SOURCES",
+            [
+                {
+                    "name": "MalformedWeb",
+                    "url": "https://example.com/news",
+                    "selector": "article a",
+                    "category": "网页采集",
+                }
+            ],
+        )
+        monkeypatch.setattr(p1_web, "Selector", BrokenSelector)
+        monkeypatch.setattr(
+            p1_web,
+            "_safe_external_requests_get",
+            lambda *_args, **_kwargs: SuccessfulResponse(),
+        )
+        monkeypatch.setattr(p1_web.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(p1_web.random, "uniform", lambda _start, _end: 0)
+
+        _results, stats = p1_web.collect_from_web("24h")
+
+        assert stats["failed"] == [("MalformedWeb", "simulated HTML parse failure")]
+        assert not stats["success"]
+
+    def test_web_selector_parse_failure_is_reported_as_failed_source(self, monkeypatch):
+        import p1_web
+
+        class SuccessfulResponse:
+            text = "<html>broken selector input</html>"
+
+            def raise_for_status(self):
+                return None
+
+        class BrokenCssSelector:
+            def __init__(self, _html):
+                pass
+
+            def css(self, _selector):
+                raise RuntimeError("simulated CSS selector failure")
+
+        monkeypatch.setattr(p1_web, "_parser_available", True)
+        monkeypatch.setattr(
+            p1_web,
+            "V2_WEB_SOURCES",
+            [
+                {
+                    "name": "BrokenSelectorWeb",
+                    "url": "https://example.com/news",
+                    "selector": "article a",
+                    "category": "网页采集",
+                }
+            ],
+        )
+        monkeypatch.setattr(p1_web, "Selector", BrokenCssSelector)
+        monkeypatch.setattr(
+            p1_web,
+            "_safe_external_requests_get",
+            lambda *_args, **_kwargs: SuccessfulResponse(),
+        )
+        monkeypatch.setattr(p1_web.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(p1_web.random, "uniform", lambda _start, _end: 0)
+
+        _results, stats = p1_web.collect_from_web("24h")
+
+        assert stats["failed"] == [("BrokenSelectorWeb", "simulated CSS selector failure")]
+        assert not stats["success"]
+
+    def test_web_successful_empty_source_remains_empty(self, monkeypatch):
+        import p1_web
+
+        class SuccessfulResponse:
+            text = "<html></html>"
+
+            def raise_for_status(self):
+                return None
+
+        class EmptySelector:
+            def __init__(self, _html):
+                pass
+
+            def css(self, _selector):
+                return []
+
+        monkeypatch.setattr(p1_web, "_parser_available", True)
+        monkeypatch.setattr(
+            p1_web,
+            "V2_WEB_SOURCES",
+            [
+                {
+                    "name": "QuietWeb",
+                    "url": "https://example.com/news",
+                    "selector": "article a",
+                    "category": "网页采集",
+                }
+            ],
+        )
+        monkeypatch.setattr(p1_web, "Selector", EmptySelector)
+        monkeypatch.setattr(
+            p1_web,
+            "_safe_external_requests_get",
+            lambda *_args, **_kwargs: SuccessfulResponse(),
+        )
+        monkeypatch.setattr(p1_web.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(p1_web.random, "uniform", lambda _start, _end: 0)
+
+        _results, stats = p1_web.collect_from_web("24h")
+
+        assert stats["empty"] == [("QuietWeb", "成功响应但选择器未匹配有效条目")]
+        assert not stats["failed"]
+
+    def test_web_missing_selector_is_reported_as_failed_source(self, monkeypatch):
+        import p1_web
+
+        monkeypatch.setattr(p1_web, "_parser_available", True)
+        monkeypatch.setattr(
+            p1_web,
+            "V2_WEB_SOURCES",
+            [{"name": "MissingSelector", "url": "https://example.com/news", "category": "网页采集"}],
+        )
+        monkeypatch.setattr(p1_web.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(p1_web.random, "uniform", lambda _start, _end: 0)
+
+        _results, stats = p1_web.collect_from_web("24h")
+
+        assert stats["failed"] == [("MissingSelector", "未配置 CSS 选择器")]
+        assert not stats["empty"]
+
     def test_rss_time_window_parses_fierceelectronics_dates(self):
         import p1_rss
 

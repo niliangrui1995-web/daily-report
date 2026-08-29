@@ -86,6 +86,9 @@ def test_settings_tls_helpers_cover_duplicate_empty_and_parse_failure(monkeypatc
         " Example.COM,example.com, ,api.example.com "
     ) == ("example.com", "api.example.com")
 
+    monkeypatch.setattr(settings_module, "_PUBLIC_SUFFIX_LIST", None)
+    assert settings_module._parse_insecure_tls_allowlist("example.com") == ()
+
     monkeypatch.setattr(
         settings_module,
         "urlparse",

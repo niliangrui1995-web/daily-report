@@ -81,6 +81,7 @@ CONTROL_STAGE_START = {
     "p9_resume": "market_mapping",
     "delivery_resume": "delivery_resume",
     "roi_resume": "roi",
+    "manual_confirmation_required": None,
 }
 
 CONTROL_STAGE_TIMEOUTS = {
@@ -772,8 +773,10 @@ def _run_p5_audit(context: dict[str, Any]) -> None:
             metrics={
                 "fallback": "raw_p1_unreviewed",
                 "fallback_chars": len(fallback_text),
+                "data_state": "invalid",
             },
         )
+        context["p5_manual_review_required"] = True
 
 
 def _stage_recover_p2(context: dict[str, Any]) -> None:
@@ -1329,12 +1332,31 @@ def _resolve_p9_checkpoint_snapshot(context: dict[str, Any]) -> dict[str, Any] |
         return None
 
 
+def _p5_requires_manual_review(context: dict[str, Any]) -> bool:
+    if context.get("p5_manual_review_required") is True:
+        return True
+    try:
+        p5_payload = load_run_manifest().get("stages", {}).get("p5", {})
+    except Exception as exc:
+        logging.error("[P9] failed to read P5 delivery state: %s", exc)
+        return True
+    metrics = p5_payload.get("metrics", {}) if isinstance(p5_payload, dict) else {}
+    if not isinstance(metrics, dict):
+        logging.error("[P9] malformed P5 delivery metrics; requiring manual review")
+        return True
+    return (
+        metrics.get("fallback") == "raw_p1_unreviewed"
+        or str(metrics.get("data_state") or "").strip().lower() == "invalid"
+    )
+
+
 def _stage_report(context: dict[str, Any]) -> None:
     if not str(context.get("p6_mapping", "")).strip():
         raise RuntimeError("P6 mapping is missing; P9 report generation is blocked")
 
     with log_heartbeat("P9 report"):
         try:
+            manual_review_required = _p5_requires_manual_review(context)
             final_report, report_ts = p9_risk_analysis(
                 p5_evidence=context.get("p5_evidence", ""),
                 p7_deep=context.get("p7a_audited", ""),
@@ -1346,6 +1368,7 @@ def _stage_report(context: dict[str, Any]) -> None:
                 p4_yfinance=context.get("p4_data", ""),
                 rejected_target_names=context.get("rejected_target_names", []),
                 checkpoint_snapshot=_resolve_p9_checkpoint_snapshot(context),
+                manual_review_required=manual_review_required,
             )
         except Exception as exc:
             logging.error("[P9] report generation failed: %s", exc)
@@ -1357,7 +1380,11 @@ def _stage_report(context: dict[str, Any]) -> None:
     if not final_report or not final_report.strip():
         raise RuntimeError("report generation returned an empty report")
 
-    delivery = send_report_email(final_report, report_ts)
+    delivery = send_report_email(
+        final_report,
+        report_ts,
+        email_required=False if manual_review_required else None,
+    )
     if not delivery.get("ok"):
         raise RuntimeError(f"report delivery failed: {delivery.get('status', 'unknown')}")
 
@@ -1371,6 +1398,8 @@ def _stage_delivery_resume(context: dict[str, Any]) -> None:
         raise RuntimeError("saved report is missing or empty; delivery cannot resume")
 
     p9_metrics = context.get("ckpt", {}).get("p9_metrics", {})
+    if isinstance(p9_metrics, dict) and p9_metrics.get("delivery_ambiguous") is True:
+        raise RuntimeError("delivery state is ambiguous; manual confirmation is required before resend")
     saved_email_policy = p9_metrics.get("email_configured") if isinstance(p9_metrics, dict) else None
     email_required = saved_email_policy if isinstance(saved_email_policy, bool) else None
     if email_required is True and not (EMAIL_ADDRESS and EMAIL_PASSWORD and RECEIVER_EMAIL):
@@ -1629,7 +1658,7 @@ def orchestrator_main(argv: list[str] | None = None):
 
     resume_from = ckpt["stage"]
     start_at = _resolve_start_stage(resume_from)
-    completed_after_resume = resume_from not in {"", "none", "p9_done"}
+    completed_after_resume = resume_from not in {"", "none", "p9_done", "manual_confirmation_required"}
     resume_runtime_context = {
         "resume_from": resume_from,
         "resume_start_stage": start_at or "",
@@ -1663,6 +1692,34 @@ def orchestrator_main(argv: list[str] | None = None):
         runtime_context=resume_runtime_context,
         timestamp=run_ts,
     )
+
+    if resume_from == "manual_confirmation_required":
+        reason = "SMTP delivery outcome is ambiguous; manual confirmation is required before any resend"
+        logging.error(reason)
+        update_run_manifest(
+            "orchestrator",
+            status="manual_confirmation_required",
+            metrics={
+                "resume_from": resume_from,
+                "resume_start_stage": "",
+                "completed_after_resume": False,
+                "force_restart": force_restart,
+                "force_run": force_run,
+                "automatic_progress_blocked": True,
+                "reason": reason,
+            },
+            timestamp=run_ts,
+        )
+        record_run_state(
+            status="manual_confirmation_required",
+            root_cause="delivery_ambiguous",
+            reason=reason,
+            source="orchestrator",
+            main_flow_entered=False,
+            runtime_context=resume_runtime_context,
+            timestamp=run_ts,
+        )
+        return
 
     if resume_from == "p9_done":
         logging.info("war report already exists for today, skip run")

@@ -57,6 +57,7 @@ from trading_calendar import get_calendar_status, is_trading_day
 EXIT_OK = 0
 EXIT_CHECK_FAILED = 1
 EXIT_LOCK_ACTIVE = 2
+EXIT_MANUAL_CONFIRMATION_REQUIRED = 3
 RUN_LOCK_STALE_AFTER_SECONDS = DEFAULT_STALE_AFTER_SECONDS
 
 REQUIRED_PROMPTS = (
@@ -66,7 +67,10 @@ REQUIRED_PROMPTS = (
     "p7a_audit.txt",
     "p9_report.txt",
 )
-LOCAL_ONLY_PREFLIGHT_RESUME_STAGES = frozenset({"roi_resume", "p9_done"})
+MANUAL_CONFIRMATION_REQUIRED_STAGE = "manual_confirmation_required"
+LOCAL_ONLY_PREFLIGHT_RESUME_STAGES = frozenset(
+    {"roi_resume", "p9_done", MANUAL_CONFIRMATION_REQUIRED_STAGE}
+)
 DELIVERY_PREFLIGHT_RESUME_STAGES = frozenset({"delivery_resume"})
 RUNTIME_IMPORTS = (
     ("requests", "requests", "error"),
@@ -81,15 +85,12 @@ RUNTIME_IMPORTS = (
 
 def _probe_local_model_endpoint(base_url: str, api_key: str) -> tuple[bool, str]:
     try:
-        endpoint_ok, is_loopback, endpoint_error = validate_model_base_url(base_url)
+        endpoint_ok, _is_loopback, endpoint_error = validate_model_base_url(base_url)
         if not endpoint_ok:
             return False, endpoint_error
         hostname = (urlparse(base_url).hostname or "").strip().lower()
         if not api_key:
             return False, "model endpoint API key is missing"
-        if not is_loopback:
-            return True, f"external endpoint configured host={hostname}; live probe skipped"
-
         import requests
 
         session = requests.Session()
@@ -99,6 +100,7 @@ def _probe_local_model_endpoint(base_url: str, api_key: str) -> tuple[bool, str]
                 f"{base_url.rstrip('/')}/models",
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=(3.0, 8.0),
+                allow_redirects=False,
             )
             status_code = int(response.status_code)
             if status_code != 200:
@@ -193,6 +195,12 @@ def _run_orchestrator(flags: list[str], *, command_name: str) -> int:
             if preflight_exit_code != EXIT_OK:
                 _print_preflight(preflight_result)
                 return preflight_exit_code
+            if resume_stage == MANUAL_CONFIRMATION_REQUIRED_STAGE:
+                print(
+                    "[MANUAL_CONFIRMATION_REQUIRED] delivery state is ambiguous; "
+                    "no pipeline stages will run until an operator confirms the result."
+                )
+                return EXIT_MANUAL_CONFIRMATION_REQUIRED
 
             set_preflight_summary(preflight_summary)
             configure_run_logging()

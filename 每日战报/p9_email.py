@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import smtplib
 import html as html_lib
+import hashlib
 import json
 import logging
 import socket
@@ -63,6 +64,25 @@ ALLOWED_EMAIL_ATTRIBUTES = {
 ALLOWED_EMAIL_PROTOCOLS = ['http', 'https', 'mailto']
 
 
+class SMTPDeliveryAmbiguousError(RuntimeError):
+    """Raised when SMTP DATA may have been accepted but the client lost confirmation."""
+
+    def __init__(self, provenance: dict[str, str], cause: Exception):
+        super().__init__(f"SMTP delivery outcome is ambiguous: {cause}")
+        self.provenance = {**provenance, "error_type": type(cause).__name__, "error": str(cause)}
+
+
+def _delivery_provenance(content: str, sender_email: str, receiver_email: str) -> dict[str, str]:
+    content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    route_sha256 = hashlib.sha256(
+        f"{sender_email}\0{receiver_email}\0{content_sha256}".encode("utf-8")
+    ).hexdigest()
+    return {
+        "content_sha256": content_sha256,
+        "message_id": f"<vcp-{route_sha256[:32]}@vcp-hunter.local>",
+    }
+
+
 def _render_safe_report_html(content: str) -> str:
     import bleach
     import markdown
@@ -119,6 +139,9 @@ def build_report_email_message(content: str, *, sender_email: str, receiver_emai
     msg['From'] = formataddr(('VCP Hunter', sender_email))
     msg['To'] = receiver_email
     msg['Subject'] = Header(f"【AI产业链战报】{now.strftime('%m月%d日 %H:%M')}", 'utf-8')
+    provenance = _delivery_provenance(content, sender_email, receiver_email)
+    msg['Message-ID'] = provenance['message_id']
+    msg['X-VCP-Content-SHA256'] = provenance['content_sha256']
     return msg
 
 
@@ -239,16 +262,29 @@ def _send_message(
 
     def send() -> None:
         context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(
-            SMTP_HOST,
-            SMTP_PORT,
-            timeout=SMTP_TIMEOUT_SECONDS,
-            source_address=source_address,
-            context=context,
-        ) as s:
-            s.set_debuglevel(0)
-            s.login(sender_email, sender_password)
-            s.sendmail(sender_email, _split_receivers(receiver_email), msg.as_string())
+        sendmail_attempted = False
+        try:
+            with smtplib.SMTP_SSL(
+                SMTP_HOST,
+                SMTP_PORT,
+                timeout=SMTP_TIMEOUT_SECONDS,
+                source_address=source_address,
+                context=context,
+            ) as s:
+                s.set_debuglevel(0)
+                s.login(sender_email, sender_password)
+                sendmail_attempted = True
+                s.sendmail(sender_email, _split_receivers(receiver_email), msg.as_string())
+        except Exception as exc:
+            if sendmail_attempted:
+                raise SMTPDeliveryAmbiguousError(
+                    {
+                        "message_id": str(msg.get("Message-ID") or ""),
+                        "content_sha256": str(msg.get("X-VCP-Content-SHA256") or ""),
+                    },
+                    exc,
+                ) from exc
+            raise
 
     if remote_ip:
         with _patched_smtp_dns(remote_ip):
@@ -257,7 +293,7 @@ def _send_message(
         send()
 
 
-def send_report_via_email(content: str, *, sender_email: str, sender_password: str, receiver_email: str, now: datetime | None = None) -> None:
+def send_report_via_email(content: str, *, sender_email: str, sender_password: str, receiver_email: str, now: datetime | None = None) -> dict[str, str]:
     msg = build_report_email_message(
         content,
         sender_email=sender_email,
@@ -271,8 +307,10 @@ def send_report_via_email(content: str, *, sender_email: str, sender_password: s
             sender_password=sender_password,
             receiver_email=receiver_email,
         )
-        return
+        return _delivery_provenance(content, sender_email, receiver_email)
     except smtplib.SMTPAuthenticationError:
+        raise
+    except SMTPDeliveryAmbiguousError:
         raise
     except Exception as primary_exc:
         logging.warning("[P9] primary SMTP path failed, trying TUN-safe fallback: %s", primary_exc)
@@ -291,8 +329,10 @@ def send_report_via_email(content: str, *, sender_email: str, sender_password: s
                     remote_ip=remote_ip,
                     source_ip=source_ip,
                 )
-                return
+                return _delivery_provenance(content, sender_email, receiver_email)
             except smtplib.SMTPAuthenticationError:
+                raise
+            except SMTPDeliveryAmbiguousError:
                 raise
             except Exception as exc:
                 last_exc = exc

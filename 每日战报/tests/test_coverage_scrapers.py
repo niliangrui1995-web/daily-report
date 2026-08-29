@@ -703,9 +703,11 @@ def test_parse_rss_date_and_fetch_rss_entries(monkeypatch):
     assert calls[1][1]["headers"]["User-Agent"] == p1_rss.FAKE_UA
 
     monkeypatch.setattr(p1_rss.feedparser, "parse", lambda _content: SimpleNamespace(bozo=True, entries=[]))
-    assert p1_rss._fetch_rss("Broken", "https://example.com/feed", "normal") == []
+    with pytest.raises(p1_rss.SourceFetchError, match="RSS 解析失败"):
+        p1_rss._fetch_rss("Broken", "https://example.com/feed", "normal")
     monkeypatch.setattr(p1_rss, "_safe_external_requests_get", lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.Timeout("slow")))
-    assert p1_rss._fetch_rss("Timeout", "https://example.com/feed", "normal") == []
+    with pytest.raises(p1_rss.SourceFetchError, match="slow"):
+        p1_rss._fetch_rss("Timeout", "https://example.com/feed", "normal")
 
 
 def test_fetch_reddit_json_and_rss_fallback(monkeypatch):
@@ -755,7 +757,8 @@ def test_fetch_hackernews_story_variants_and_top_level_failure(monkeypatch):
     assert three["url"] == "https://news.ycombinator.com/item?id=3"
 
     monkeypatch.setattr(p1_rss, "_safe_external_requests_get", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad ids")))
-    assert p1_rss._fetch_hackernews() == []
+    with pytest.raises(p1_rss.SourceFetchError, match="bad ids"):
+        p1_rss._fetch_hackernews()
 
 
 def test_fetch_hackernews_future_error_and_timeout(monkeypatch):
@@ -794,6 +797,28 @@ def test_fetch_hackernews_future_error_and_timeout(monkeypatch):
         return {futures[0]}, {futures[1]}
 
     monkeypatch.setattr(p1_rss, "wait", partial_wait)
+    with pytest.raises(p1_rss.SourceFetchError, match="HackerNews 详情请求全部失败"):
+        p1_rss._fetch_hackernews()
+
+
+def test_fetch_hackernews_detail_failures_require_one_successful_detail_request(monkeypatch):
+    def all_details_fail(url, **_kwargs):
+        if url.endswith("newstories.json"):
+            return FakeResponse(payload=[1, 2])
+        return FakeResponse(status_code=503, payload={"error": "detail unavailable"})
+
+    monkeypatch.setattr(p1_rss, "_safe_external_requests_get", all_details_fail)
+    with pytest.raises(p1_rss.SourceFetchError, match="HackerNews 详情请求全部失败"):
+        p1_rss._fetch_hackernews()
+
+    def one_detail_succeeds_without_story(url, **_kwargs):
+        if url.endswith("newstories.json"):
+            return FakeResponse(payload=[1, 2])
+        if url.endswith("/1.json"):
+            return FakeResponse(payload={"type": "comment", "title": "not a story"})
+        raise requests.Timeout("detail timeout")
+
+    monkeypatch.setattr(p1_rss, "_safe_external_requests_get", one_detail_succeeds_without_story)
     assert p1_rss._fetch_hackernews() == []
 
 

@@ -246,7 +246,10 @@ class TestSettingsHardening:
 
         try:
             monkeypatch.setenv("NO_PROXY", "corp.local,localhost")
-            monkeypatch.setenv("INSECURE_TLS_ALLOWLIST", "self-signed.local, Example.org")
+            monkeypatch.setenv(
+                "INSECURE_TLS_ALLOWLIST",
+                "self-signed.local, Example.org, com, co.uk, com.cn, co.jp, github.io",
+            )
 
             settings = _reload_module("settings")
             http_security = _reload_module("http_security")
@@ -255,14 +258,27 @@ class TestSettingsHardening:
             assert {"corp.local", "localhost", "127.0.0.1", "::1"}.issubset(merged)
             assert settings.MERGED_NO_PROXY == os.environ["NO_PROXY"]
             assert settings.MERGED_NO_PROXY == os.environ["no_proxy"]
+            assert settings.INSECURE_TLS_ALLOWLIST == ("self-signed.local", "example.org")
 
             insecure_policy = http_security.get_tls_policy_for_url("https://news.self-signed.local/article")
             assert insecure_policy["verify"] is False
             assert insecure_policy["tls_mode"] == "insecure_allowlisted"
 
+            explicit_host_policy = http_security.get_tls_policy_for_url("https://example.org/article")
+            assert explicit_host_policy["verify"] is False
+
+            nested_external_policy = http_security.get_tls_policy_for_url("https://news.example.org/article")
+            assert nested_external_policy["verify"] is True
+
             strict_policy = http_security.get_tls_policy_for_url("https://secure.example.net/article")
             assert strict_policy["verify"] is True
             assert strict_policy["tls_mode"] == "strict"
+
+            public_suffix_policy = http_security.get_tls_policy_for_url("https://secure.example.co.uk/article")
+            assert public_suffix_policy["verify"] is True
+
+            private_suffix_policy = http_security.get_tls_policy_for_url("https://tenant.github.io/article")
+            assert private_suffix_policy["verify"] is True
         finally:
             if original_no_proxy is None:
                 os.environ.pop("NO_PROXY", None)
@@ -879,7 +895,10 @@ class TestReportStage:
         monkeypatch.setattr(
             orchestrator,
             "send_report_email",
-            lambda content, now_str="": {"ok": False, "status": "completed_email_failed"},
+            lambda content, now_str="", **_kwargs: {
+                "ok": False,
+                "status": "completed_email_failed",
+            },
         )
         with pytest.raises(RuntimeError, match="completed_email_failed"):
             orchestrator._stage_report({"p6_mapping": "mapping"})
@@ -1472,8 +1491,34 @@ class TestModelEndpointPolicy:
         assert ok is False
         assert "HTTPS" in detail
 
-    def test_probe_accepts_external_https_without_live_probe(self):
+    def test_probe_authenticates_external_https_endpoint(self, monkeypatch):
         import pipeline_cli
+        import requests
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "data": [
+                        {"id": "claude-opus-4-6-thinking"},
+                        {"id": "claude-sonnet-4-6"},
+                    ]
+                }
+
+        class FakeSession:
+            trust_env = True
+
+            @staticmethod
+            def get(*_args, **_kwargs):
+                return FakeResponse()
+
+            @staticmethod
+            def close():
+                return None
+
+        monkeypatch.setattr(requests, "Session", FakeSession)
 
         ok, detail = pipeline_cli._probe_local_model_endpoint(
             "https://api.example.invalid/v1",
@@ -1481,7 +1526,7 @@ class TestModelEndpointPolicy:
         )
 
         assert ok is True
-        assert "live probe skipped" in detail
+        assert "authenticated status=200" in detail
 
 
 class TestTradingCalendarStatus:

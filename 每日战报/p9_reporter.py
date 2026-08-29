@@ -15,7 +15,7 @@ from artifact_store import (
     write_json_artifact,
     write_text_artifact,
 )
-from p9_email import send_report_via_email
+from p9_email import SMTPDeliveryAmbiguousError, send_report_via_email
 from p9_rendering import build_degraded_checkpoint_report, build_report_markdown
 from semantic_output import is_no_evidence_text
 from settings import EMAIL_ADDRESS, EMAIL_PASSWORD, OPUS_MODEL, RECEIVER_EMAIL, opus_adapter, require_prompt
@@ -975,6 +975,46 @@ def _apply_evidence_guardrails(data: dict[str, Any]) -> tuple[dict[str, Any], di
     return data, metrics
 
 
+def _build_manual_review_report(
+    *,
+    p5_evidence: str,
+    p7_deep: str,
+    p75_supplement: str,
+    p6_mapping: str,
+    price_data: str,
+    p4_yfinance: str,
+    today_str: str,
+) -> str:
+    """Render a local-only report when P5 fell back to unreviewed P1 evidence."""
+
+    def section(title: str, content: str, fallback: str) -> list[str]:
+        body = str(content or "").strip() or fallback
+        return [f"### {title}\n", *(f"> {line}" if line else ">" for line in body.splitlines()), ""]
+
+    lines = [
+        f"# VCP Hunter P9 战报（待人工审阅） | {today_str}\n",
+        "> 【待人工审阅】P5 审计已回退至未经审核的 P1 原始情报，不能生成常规综合结论。\n",
+        "> 【禁止自动投递】本报告仅本地保存；在 P5 审阅恢复有效前，不得作为 actionable 结论或自动邮件发送。\n",
+        "## 一、核心信号\n",
+        "以下仅保留待审阅资料，不形成自动判断。\n",
+    ]
+    lines.extend(section("P5 未审阅原始情报", p5_evidence, "（P5 未提供可审阅结果）"))
+    lines.extend(section("P7 深研", p7_deep, "（本次无 P7 数据）"))
+    lines.extend(["---\n", "## 二、标的狙击表\n", "不生成自动标的狙击结论；仅保留 P6/P8 待核对资料。\n"])
+    lines.extend(section("P6 市场映射", p6_mapping, "（本次无 P6 数据）"))
+    lines.extend(section("P8 技术面", price_data, "（本次无 P8 数据）"))
+    lines.extend(["---\n", "## 三、资金路径推演\n", "不生成自动资金路径推演。\n"])
+    lines.extend(section("P7.5 补充审计", p75_supplement, "（本次无 P7.5 数据）"))
+    lines.extend(["---\n", "## 四、今日操作建议\n", "待 P5 人工审阅完成前，不提供自动操作建议。\n"])
+    lines.extend(section("P4 核心行情", p4_yfinance, "（本次无 P4 数据）"))
+    lines.extend([
+        "---\n",
+        "## ⚠️ 风险提示\n",
+        "**审计边界：** P5 当前为 raw_p1_unreviewed / data_state=invalid；所有上游线索必须人工复核。\n",
+    ])
+    return "\n".join(lines).strip()
+
+
 def p9_risk_analysis(
     p5_evidence,
     p7_deep,
@@ -986,6 +1026,7 @@ def p9_risk_analysis(
     p4_yfinance="",
     rejected_target_names: list[str] | None = None,
     checkpoint_snapshot: dict[str, Any] | None = None,
+    manual_review_required: bool = False,
     _retry_count: int = 0,
 ):
     """
@@ -1006,6 +1047,34 @@ def p9_risk_analysis(
     p3_intel_data = normalize_common_text_mojibake(p3_intel_data or "")
     p4_yfinance = normalize_common_text_mojibake(p4_yfinance or "")
     rejected_names = normalize_rejected_stock_names(rejected_target_names)
+
+    if manual_review_required:
+        result = _build_manual_review_report(
+            p5_evidence=p5_evidence,
+            p7_deep=p7_deep,
+            p75_supplement=p75_supplement,
+            p6_mapping=p6_mapping,
+            price_data=price_data,
+            p4_yfinance=p4_yfinance,
+            today_str=datetime.now().strftime("%Y年%m月%d日 北京时间%H:%M"),
+        )
+        update_run_manifest(
+            "p9",
+            status="local_manual_review_ready",
+            metrics={
+                "structured_degraded": True,
+                "degrade_reason": "p5_raw_p1_unreviewed",
+                "report_outcome": "manual_review_required",
+                "actionable_items_count": 0,
+                "markdown_chars": len(result),
+                "delivery": {
+                    "status": "blocked_pending_review",
+                    "mode": "manual_review_required",
+                    "email_sent": False,
+                },
+            },
+        )
+        return result, run_ts
 
     input_identity_lines_removed = 0
     filtered_inputs = []
@@ -1318,6 +1387,7 @@ def p9_risk_analysis(
                 p4_yfinance=p4_yfinance,
                 rejected_target_names=rejected_names,
                 checkpoint_snapshot=checkpoint_snapshot,
+                manual_review_required=manual_review_required,
                 _retry_count=_retry_count + 1,
             )
         update_run_manifest(
@@ -1441,7 +1511,7 @@ def send_report_email(
     # SMTP has no transaction shared with the local manifest. A process crash after
     # remote acceptance can still cause at-least-once delivery on the next resume.
     try:
-        send_report_via_email(
+        delivery_provenance = send_report_via_email(
             content,
             sender_email=EMAIL_ADDRESS,
             sender_password=EMAIL_PASSWORD,
@@ -1458,12 +1528,14 @@ def send_report_email(
                 delivery_status=status,
                 email_configured=True,
                 email_sent=True,
+                delivery_provenance=delivery_provenance if isinstance(delivery_provenance, dict) else {},
             ),
         )
         return {"ok": True, "status": status, "report_path": fname, "email_sent": True}
     except Exception as exc:
         logging.error("[P9] email delivery failed: %s", exc)
-        status = "completed_email_failed"
+        delivery_ambiguous = isinstance(exc, SMTPDeliveryAmbiguousError)
+        status = "delivery_ambiguous" if delivery_ambiguous else "completed_email_failed"
         update_run_manifest(
             "p9",
             status=status,
@@ -1473,6 +1545,8 @@ def send_report_email(
                 email_configured=True,
                 email_sent=False,
                 error=str(exc),
+                delivery_ambiguous=delivery_ambiguous,
+                delivery_provenance=(exc.provenance if delivery_ambiguous else {}),
             ),
         )
         return {"ok": False, "status": status, "report_path": fname, "email_sent": False}

@@ -54,6 +54,8 @@ DELIVERY_RECOVERABLE_STATUSES = frozenset(
         "report_saved_pending_delivery",
     }
 )
+DELIVERY_AMBIGUOUS_STATUSES = frozenset({"delivery_ambiguous"})
+MANUAL_CONFIRMATION_REQUIRED_STAGE = "manual_confirmation_required"
 P6_HASHED_RESEARCH_STAGES = ("p7", "p7a", "p75")
 INTEL_STAGES = ("p1", "p2", "p3")
 P8_ACTIVE_STATUSES = frozenset({"pending", "running", "retrying", "started"})
@@ -536,6 +538,18 @@ def assess_stage_checkpoint(
         metrics = {}
     manifest_version = _nonnegative_int(manifest.get("manifest_version")) or 0
 
+    if stage_name == "p5" and (
+        str(metrics.get("fallback") or "").strip().lower() == "raw_p1_unreviewed"
+        or str(metrics.get("data_state") or "").strip().lower() == "invalid"
+    ):
+        return _checkpoint_result(
+            stage_name,
+            status,
+            False,
+            "invalid",
+            "raw_p1_unreviewed_or_invalid_data_state",
+        )
+
     valid_empty = VALID_EMPTY_STATUSES.get(stage_name, frozenset())
     if status in valid_empty:
         return _checkpoint_result(stage_name, status, True, "valid_empty", status)
@@ -595,6 +609,10 @@ def assess_stage_checkpoint(
             )
             or (
                 report_outcome == "completed_no_actionable_signals"
+                and actionable_items == 0
+            )
+            or (
+                report_outcome == "manual_review_required"
                 and actionable_items == 0
             )
         )
@@ -1207,11 +1225,23 @@ def _has_terminal_success(
 def _needs_delivery_resume(manifest: dict, files: dict[str, str]) -> bool:
     if not files.get("war_report"):
         return False
+    if _delivery_requires_manual_confirmation(manifest):
+        return False
     p9 = _current_stage_payload(manifest, "p9")
     status = str(p9.get("status", ""))
     metrics = p9.get("metrics", {})
     return status in DELIVERY_RECOVERABLE_STATUSES or (
         metrics.get("email_configured") is True and metrics.get("email_sent") is False
+    )
+
+
+def _delivery_requires_manual_confirmation(manifest: dict) -> bool:
+    p9 = _current_stage_payload(manifest, "p9")
+    status = str(p9.get("status", ""))
+    metrics = p9.get("metrics", {})
+    return bool(
+        status in DELIVERY_AMBIGUOUS_STATUSES
+        or (isinstance(metrics, dict) and metrics.get("delivery_ambiguous") is True)
     )
 
 
@@ -1440,6 +1470,8 @@ def _derive_stage(
 ) -> str:
     assessments = stage_assessments or _prepare_stage_assessments(manifest, files)
     assessment = p8_assessment or _prepare_p8_assessment(manifest, files)
+    if _delivery_requires_manual_confirmation(manifest):
+        return MANUAL_CONFIRMATION_REQUIRED_STAGE
     intel_resume_stages = _missing_intel_resume_stages(manifest, files, assessments)
     if intel_resume_stages == ["p2"]:
         return "p2_resume"

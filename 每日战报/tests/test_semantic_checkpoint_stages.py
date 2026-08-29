@@ -29,6 +29,61 @@ def _p6_hash_metrics(manifest: dict) -> dict[str, str]:
     }
 
 
+def test_delivery_ambiguous_never_auto_resumes_even_when_email_is_configured():
+    import checkpoint
+
+    manifest = {
+        "stages": {
+            "p9": {
+                "status": "delivery_ambiguous",
+                "metrics": {"email_configured": True, "email_sent": False},
+            }
+        }
+    }
+
+    assert checkpoint._needs_delivery_resume(manifest, {"war_report": "saved-report.md"}) is False
+
+
+def test_delivery_ambiguous_derives_manual_confirmation_not_any_resume(monkeypatch, tmp_path):
+    manifest = _base_manifest(tmp_path)
+    _add_valid_p8(tmp_path, manifest)
+    _add_terminal_artifacts(tmp_path, manifest)
+    manifest["status"] = "failed_exception"
+    manifest["stages"]["p9"].update(
+        {
+            "status": "delivery_ambiguous",
+            "metrics": {"email_configured": True, "email_sent": False, "delivery_ambiguous": True},
+        }
+    )
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "manual_confirmation_required"
+    assert checkpoint["stage"] not in {"delivery_resume", "p9_resume", "roi_resume"}
+
+
+def test_invalid_p5_provenance_cannot_reuse_terminal_p9_or_roi(monkeypatch, tmp_path):
+    manifest = _base_manifest(tmp_path)
+    _add_valid_p8(tmp_path, manifest)
+    _add_terminal_artifacts(tmp_path, manifest)
+    manifest["stages"]["p5"]["metrics"].update(
+        {"fallback": "raw_p1_unreviewed", "data_state": "invalid"}
+    )
+
+    checkpoint = _detect(monkeypatch, tmp_path, manifest)
+
+    assert checkpoint["stage"] == "p5_resume"
+    assert checkpoint["stage_assessments"]["p5"] == {
+        "stage": "p5",
+        "status": "completed",
+        "reusable": False,
+        "state": "invalid",
+        "reason": "raw_p1_unreviewed_or_invalid_data_state",
+    }
+    assert "war_report" not in checkpoint["files"]
+    assert "roi_json" not in checkpoint["files"]
+
+
 def _valid_report() -> str:
     return "\n".join(
         [

@@ -54,6 +54,12 @@ SOURCE_TIMEOUT = 20
 WEB_PHASE1_BUDGET_SECONDS = 180
 WEB_ENRICH_BUDGET_SECONDS = 180
 _FUTURE_TIME_GRACE = timedelta(minutes=10)
+
+
+class SourceFetchError(RuntimeError):
+    """外部源请求或 HTML 解析失败，供采集调度层记录为 failed。"""
+
+
 _ASML_NEWS_NAV_PATHS = frozenset({
     '/en/news',
     '/en/news/stories',
@@ -257,10 +263,13 @@ def _scrape_one_source(source_cfg: dict) -> list[dict]:
     max_items = source_cfg.get('max_items', 50)
     
     if not selector:
-        logging.warning(f'[Web] {name}: 未配置 CSS 选择器，跳过')
-        return []
+        logging.warning(f'[Web] {name}: 未配置 CSS 选择器')
+        raise SourceFetchError('未配置 CSS 选择器')
         
     source_timeout = source_cfg.get('timeout', SOURCE_TIMEOUT)
+    request_errors = []
+    parse_errors = []
+    parsed_successfully = False
 
     for fetch_url in _source_candidate_urls(source_cfg):
         try:
@@ -268,28 +277,35 @@ def _scrape_one_source(source_cfg: dict) -> list[dict]:
             log_tls_policy('P1 Web', fetch_url, tls_policy)
             resp = _safe_external_requests_get(fetch_url, headers=HEADERS, timeout=source_timeout, verify=tls_policy['verify'])
             resp.raise_for_status()
-        except requests.exceptions.Timeout:
+        except requests.exceptions.Timeout as exc:
             logging.warning(f'[Web] {name}: 请求超时 ({source_timeout}s) - {fetch_url}')
+            request_errors.append(str(exc))
             continue
         except requests.exceptions.HTTPError as exc:
             status_code = exc.response.status_code if exc.response is not None else 'unknown'
             logging.warning(f'[Web] {name}: HTTP {status_code} - {fetch_url}')
+            request_errors.append(str(exc))
             continue
         except Exception as exc:
             logging.warning(f'[Web] {name}: 请求失败 - {exc} - {fetch_url}')
+            request_errors.append(str(exc))
             continue
 
         try:
             page = Selector(resp.text)
         except Exception as exc:
             logging.warning(f'[Web] {name}: HTML 解析失败 - {exc} - {fetch_url}')
+            parse_errors.append(str(exc))
             continue
 
         try:
             elements = page.css(selector)
         except Exception as exc:
             logging.warning(f'[Web] {name}: CSS 选择器异常 ({selector}) - {exc} - {fetch_url}')
+            parse_errors.append(str(exc))
             continue
+
+        parsed_successfully = True
 
         if not elements:
             fallback_selectors = ['h2 a', 'h3 a', 'article a', '.title a', 'a[title]']
@@ -337,6 +353,10 @@ def _scrape_one_source(source_cfg: dict) -> list[dict]:
         if entries:
             return entries
 
+    if parse_errors and not parsed_successfully:
+        raise SourceFetchError(parse_errors[-1])
+    if request_errors and not parsed_successfully:
+        raise SourceFetchError(request_errors[-1])
     return []
 
 def _entries_to_p1_result(entries: list[dict], category: str, source_name: str, hours: int) -> dict | None:
@@ -473,7 +493,7 @@ def collect_from_web(backtrack: str = '24h') -> tuple[list[dict], dict]:
         try:
             entries = _scrape_one_source(source_cfg)
             if not entries:
-                return None, 'empty', '选择器未匹配或页面不可达'
+                return None, 'empty', '成功响应但选择器未匹配有效条目'
                 
             result = _entries_to_p1_result(entries, category, name, hours)
             if result is None:

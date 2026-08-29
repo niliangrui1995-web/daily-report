@@ -31,7 +31,7 @@ chinesecalendar==1.11.0
     # via vcp-hunter-daily-report
 colorama==0.4.6 ; sys_platform == 'win32'
     # via tqdm
-cryptography==49.0.0
+cryptography==50.0.1
     # via
     #   google-auth
     #   vcp-hunter-daily-report
@@ -100,6 +100,8 @@ platformdirs==4.10.0
     # via yfinance
 protobuf==7.35.1
     # via yfinance
+publicsuffixlist==1.0.2.20260821
+    # via vcp-hunter-daily-report
 pyasn1==0.6.4
     # via pyasn1-modules
 pyasn1-modules==0.4.2

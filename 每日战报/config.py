@@ -20,7 +20,8 @@ RSS_FEEDS = [
     {'name': 'AWS_ML_Blog', 'url': 'https://aws.amazon.com/blogs/machine-learning/feed/', 'source': 'aws_ml_blog', 'group': 'deep'},
     {'name': 'SemiEngineering', 'url': 'https://semiengineering.com/feed/', 'source': 'semiengineering', 'group': 'deep'},
     {'name': 'EETimes', 'url': 'https://www.eetimes.com/feed/', 'source': 'eetimes', 'group': 'deep'},
-    {'name': 'TechNews_TW', 'url': 'https://technews.tw/feed/', 'source': 'technews_tw', 'group': 'major'},
+    # 2026-08-31: 主站直连稳定 TLS EOF；仅回退到同域 CDN 的新鲜 RSS，保持严格证书校验。
+    {'name': 'TechNews_TW', 'url': 'https://technews.tw/feed/', 'fallback_urls': ['https://cdn.technews.tw/tn-rss/'], 'source': 'technews_tw', 'group': 'major'},
     {'name': 'DataCenterKnowledge', 'url': 'https://www.datacenterknowledge.com/rss.xml', 'source': 'datacenterknowledge', 'group': 'deep'},
     {'name': 'TheElec_KR', 'url': 'https://www.thelec.kr/rss/allArticle.xml', 'source': 'thelec_kr', 'group': 'deep'},
     {'name': 'FierceElectronics', 'url': 'https://www.fierceelectronics.com/rss/xml', 'source': 'fierceelectronics', 'group': 'deep'}

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import socket
+import ssl
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -746,6 +747,148 @@ def test_parse_rss_date_and_fetch_rss_entries(monkeypatch):
     monkeypatch.setattr(p1_rss, "_safe_external_requests_get", lambda *_args, **_kwargs: (_ for _ in ()).throw(requests.Timeout("slow")))
     with pytest.raises(p1_rss.SourceFetchError, match="slow"):
         p1_rss._fetch_rss("Timeout", "https://example.com/feed", "normal")
+
+
+def test_technews_configured_cdn_fallback_recovers_ssl_eof_without_changing_other_feed(monkeypatch):
+    """A TechNews TLS EOF must use its configured fresh CDN feed only."""
+    InlineExecutor.instances.clear()
+    technews = next(feed for feed in p1_rss.V2_RSS_FEEDS if feed["name"] == "TechNews_TW")
+    normal = next(feed for feed in p1_rss.V2_RSS_FEEDS if feed["name"] == "TechCrunch")
+    primary_url = "https://technews.tw/feed/"
+    fallback_url = "https://cdn.technews.tw/tn-rss/"
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        if url == primary_url:
+            raise requests.exceptions.SSLError(
+                ssl.SSLEOFError(8, "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+            )
+        if url == fallback_url:
+            return FakeResponse(content=b"fresh-technews")
+        if url == normal["url"]:
+            return FakeResponse(content=b"fresh-normal")
+        pytest.fail(f"unexpected RSS request: {url}")
+
+    def parse_feed(content):
+        if content == b"fresh-technews":
+            return SimpleNamespace(
+                bozo=False,
+                entries=[
+                    {
+                        "title": "Fresh TechNews",
+                        "summary": "fresh CDN RSS payload",
+                        "link": "https://technews.tw/2026/08/31/fresh-technews/",
+                        "published": "Mon, 31 Aug 2026 13:39:46 +0000",
+                    }
+                ],
+            )
+        if content == b"fresh-normal":
+            return SimpleNamespace(
+                bozo=False,
+                entries=[
+                    {
+                        "title": "Fresh normal source",
+                        "summary": "normal primary RSS payload",
+                        "link": "https://techcrunch.com/fresh-normal/",
+                        "published": "Mon, 31 Aug 2026 13:39:46 +0000",
+                    }
+                ],
+            )
+        pytest.fail(f"unexpected RSS payload: {content!r}")
+
+    monkeypatch.setattr(p1_rss, "V2_RSS_FEEDS", [dict(technews), dict(normal)])
+    monkeypatch.setattr(p1_rss, "V2_REDDIT_SUBS", [])
+    monkeypatch.setattr(p1_rss, "_safe_external_requests_get", fake_get)
+    monkeypatch.setattr(p1_rss.feedparser, "parse", parse_feed)
+    monkeypatch.setattr(p1_rss, "_fetch_hackernews", lambda: [])
+    monkeypatch.setattr(p1_rss, "_is_within_window", lambda *_args: True)
+    monkeypatch.setattr(p1_rss, "_scrapling_available", False)
+    monkeypatch.setattr(p1_rss, "ThreadPoolExecutor", InlineExecutor)
+    monkeypatch.setattr(p1_rss, "wait", _all_done)
+    monkeypatch.setattr(p1_rss.random, "uniform", lambda *_args: 0)
+
+    results, stats = p1_rss.collect_from_rss("24h")
+
+    assert stats["failed"] == []
+    assert {name for name, _count in stats["success"]} == {"TechNews_TW", "TechCrunch"}
+    assert [url for url, _kwargs in calls] == [primary_url, fallback_url, normal["url"]]
+    assert calls[0][1]["timeout"] == p1_rss.REQUEST_TIMEOUT
+    assert calls[0][1]["headers"]["User-Agent"] == p1_rss.FAKE_UA
+    text = "\n".join(result["text"] for result in results)
+    assert "Fresh TechNews" in text
+    assert "Fresh normal source" in text
+
+
+def test_technews_cdn_fallback_exhaustion_keeps_each_ssl_eof_candidate(monkeypatch):
+    primary_url = "https://technews.tw/feed/"
+    fallback_url = "https://cdn.technews.tw/tn-rss/"
+    calls = []
+
+    def fake_get(url, **_kwargs):
+        calls.append(url)
+        raise requests.exceptions.SSLError(
+            ssl.SSLEOFError(8, "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+        )
+
+    monkeypatch.setattr(p1_rss, "_safe_external_requests_get", fake_get)
+
+    with pytest.raises(p1_rss.SourceFetchError) as exc_info:
+        p1_rss._fetch_rss("TechNews_TW", primary_url, "technews_tw", (fallback_url,))
+
+    assert calls == [primary_url, fallback_url]
+    assert primary_url in str(exc_info.value)
+    assert fallback_url in str(exc_info.value)
+    assert "UNEXPECTED_EOF_WHILE_READING" in str(exc_info.value)
+
+
+def test_technews_fallback_does_not_change_other_configured_source_task_arguments(monkeypatch):
+    """Every non-TechNews source keeps the original three-argument RSS call."""
+    InlineExecutor.instances.clear()
+    feeds = [dict(feed) for feed in p1_rss.V2_RSS_FEEDS]
+    subreddits = list(p1_rss.V2_REDDIT_SUBS)
+    rss_calls = []
+
+    def entry(title, source):
+        return {
+            "title": title,
+            "content": "fresh source payload",
+            "url": f"https://example.com/{source}",
+            "published_at": "new",
+            "source": source,
+        }
+
+    def fake_fetch(*args):
+        rss_calls.append(args)
+        name, _url, source = args[:3]
+        return [entry(name, source)]
+
+    monkeypatch.setattr(p1_rss, "V2_RSS_FEEDS", feeds)
+    monkeypatch.setattr(p1_rss, "V2_REDDIT_SUBS", subreddits)
+    monkeypatch.setattr(p1_rss, "_fetch_rss", fake_fetch)
+    monkeypatch.setattr(p1_rss, "_fetch_reddit", lambda sub: [entry(f"Reddit/r/{sub}", f"reddit_{sub}")])
+    monkeypatch.setattr(p1_rss, "_fetch_hackernews", lambda: [entry("HackerNews", "hackernews")])
+    monkeypatch.setattr(p1_rss, "_is_within_window", lambda *_args: True)
+    monkeypatch.setattr(p1_rss, "_scrapling_available", False)
+    monkeypatch.setattr(p1_rss, "ThreadPoolExecutor", InlineExecutor)
+    monkeypatch.setattr(p1_rss, "wait", _all_done)
+    monkeypatch.setattr(p1_rss.random, "uniform", lambda *_args: 0)
+
+    results, stats = p1_rss.collect_from_rss("24h")
+
+    technews_call = next(args for args in rss_calls if args[0] == "TechNews_TW")
+    other_rss_calls = [args for args in rss_calls if args[0] != "TechNews_TW"]
+    assert technews_call[3] == ("https://cdn.technews.tw/tn-rss/",)
+    assert len(other_rss_calls) == len(feeds) - 1
+    assert all(len(args) == 3 for args in other_rss_calls)
+    assert {(args[0], args[1], args[2]) for args in other_rss_calls} == {
+        (feed["name"], feed["url"], feed["source"])
+        for feed in feeds
+        if feed["name"] != "TechNews_TW"
+    }
+    assert stats["failed"] == []
+    assert len(stats["success"]) == len(feeds) + len(subreddits) + 1
+    assert results
 
 
 def test_fetch_reddit_json_and_rss_fallback(monkeypatch):

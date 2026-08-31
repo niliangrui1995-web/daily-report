@@ -67,24 +67,47 @@ def _parse_rss_date(entry: dict) -> str:
     pub = entry.get('published') or entry.get('updated') or ''
     return pub[:19]
 
-def _fetch_rss(name: str, url: str, source_tag: str) -> list[dict]:
+def _fetch_rss(
+    name: str,
+    url: str,
+    source_tag: str,
+    fallback_urls: tuple[str, ...] = (),
+) -> list[dict]:
     if source_tag.startswith('sec_'):
         headers = {'User-Agent': SEC_USER_AGENT, 'Accept': 'application/atom+xml, application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8'}
     else:
         headers = {'User-Agent': FAKE_UA, 'Accept': 'application/atom+xml, application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8'}
-    
-    try:
-        resp = _safe_external_requests_get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        feed = feedparser.parse(resp.content)
-    except Exception as exc:
-        logging.warning(f'[RSS] {name}: fetch failed, skip feed parse fallback - {exc}')
-        raise SourceFetchError(str(exc)) from exc
-        
-    if getattr(feed, 'bozo', False) and not getattr(feed, 'entries', False):
-        reason = str(getattr(feed, 'bozo_exception', '') or 'RSS 解析失败')
-        logging.warning(f'[RSS] {name}: feed parse failed - {reason}')
-        raise SourceFetchError(reason)
+
+    candidate_urls = [url]
+    for fallback_url in fallback_urls:
+        fallback_url = str(fallback_url).strip()
+        if fallback_url and fallback_url not in candidate_urls:
+            candidate_urls.append(fallback_url)
+
+    failures = []
+    last_error: Exception | None = None
+    feed = None
+    for index, candidate_url in enumerate(candidate_urls):
+        try:
+            resp = _safe_external_requests_get(candidate_url, headers=headers, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.content)
+            if getattr(feed, 'bozo', False) and not getattr(feed, 'entries', False):
+                reason = str(getattr(feed, 'bozo_exception', '') or 'RSS 解析失败')
+                raise SourceFetchError(reason)
+            break
+        except Exception as exc:
+            last_error = exc
+            failures.append(f'{candidate_url}: {exc}')
+            if index + 1 < len(candidate_urls):
+                logging.warning(f'[RSS] {name}: fetch failed, trying configured fallback - {exc}')
+                continue
+            detail = '; '.join(failures) if len(candidate_urls) > 1 else str(exc)
+            logging.warning(f'[RSS] {name}: fetch failed - {detail}')
+            raise SourceFetchError(detail) from last_error
+
+    if feed is None:
+        raise SourceFetchError('RSS 请求未返回可解析内容')
         
     entries = []
     for entry in feed.entries[:50]:
@@ -379,7 +402,15 @@ def collect_from_rss(backtrack: str = '24h') -> tuple[list[dict], dict]:
         url = feed_cfg.get('url', '')
         source_tag = feed_cfg.get('source', name.lower())
         if url:
-            tasks.append((_fetch_rss, (name, url, source_tag), _rss_name_to_category(name), name))
+            fallback_urls = tuple(
+                str(item).strip()
+                for item in feed_cfg.get('fallback_urls', [])
+                if str(item).strip()
+            )
+            args = (name, url, source_tag)
+            if fallback_urls:
+                args = (*args, fallback_urls)
+            tasks.append((_fetch_rss, args, _rss_name_to_category(name), name))
             
     for sub in V2_REDDIT_SUBS:
         tasks.append((_fetch_reddit, (sub,), 'Reddit产业讨论', f'Reddit/r/{sub}'))

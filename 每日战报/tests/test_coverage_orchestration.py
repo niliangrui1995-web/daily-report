@@ -875,6 +875,56 @@ def test_collect_stage_counts_internal_p1_source_failures(monkeypatch):
     assert "rss-source" in p1_update["metrics"]["degrade_reason"]
 
 
+def test_collect_stage_keeps_technews_ssl_eof_detail_when_cdn_fallback_is_exhausted(monkeypatch):
+    updates = []
+    persisted = {}
+    failure_detail = (
+        "https://technews.tw/feed/: SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol'); "
+        "https://cdn.technews.tw/tn-rss/: SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol')"
+    )
+    fresh_result = {"title": "fresh surviving item", "text": "fresh current RSS evidence"}
+
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_from_rss",
+        lambda _value: (
+            [fresh_result],
+            {"failed": [("TechNews_TW", failure_detail)], "success": [("TechCrunch", 1)], "failed_urls": []},
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "collect_from_web", lambda _value: ([], {"failed": [], "success": []}))
+    monkeypatch.setattr(orchestrator, "collect_from_x", lambda _value: ("p2", {}))
+    monkeypatch.setattr(orchestrator, "collect_p3_parallel_only", lambda _value: ("", {"status": "empty"}))
+    monkeypatch.setattr(orchestrator, "get_run_config", lambda _now: "24h")
+    monkeypatch.setattr(orchestrator, "format_evidence", lambda _rows: "fresh current evidence")
+    monkeypatch.setattr(
+        orchestrator,
+        "write_json_artifact",
+        lambda _label, payload: persisted.setdefault("json", payload) and "p1.json",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "write_text_artifact",
+        lambda _label, payload: persisted.setdefault("md", payload) and "p1.md",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "update_run_manifest",
+        lambda stage, **kwargs: updates.append((stage, kwargs)),
+    )
+    context = {"resume_from": "none", "ckpt": {"files": {}}, "now": datetime.now()}
+
+    orchestrator._stage_collect_intel(context)
+
+    p1_update = next(payload for stage, payload in updates if stage == "p1")
+    assert p1_update["status"] == "completed_structured_degraded"
+    assert p1_update["metrics"]["source_failures"] == 1
+    assert p1_update["metrics"]["source_failure_details"] == [f"rss/TechNews_TW: {failure_detail}"]
+    assert p1_update["metrics"]["degrade_reason"] == f"rss/TechNews_TW: {failure_detail}"
+    assert persisted["json"] == [fresh_result]
+    assert persisted["md"] == "fresh current evidence"
+
+
 def test_intel_resume_reruns_only_failed_p3_branch(monkeypatch):
     calls = []
 

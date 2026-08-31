@@ -9,6 +9,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -84,6 +86,133 @@ def test_apply_evidence_guardrails_caps_single_and_soft_multi_source():
     assert metrics["confidence_caps_applied"] == 5
     assert metrics["priority_downgrades"] == 2
     assert metrics["significance_downgrades"] == 2
+
+
+@pytest.mark.parametrize("p7_ref", ["P7a: markdown fallback", "P7: markdown fallback"])
+def test_apply_evidence_guardrails_excludes_degraded_p7_from_hard_evidence(p7_ref):
+    import p9_reporter
+
+    payload = {
+        "core_signals": [
+            {
+                "source": "P7a + P8",
+                "significance": "高优先级",
+                "title": "待复核深研结论",
+                "body": "P7a 结构化数据降级后，仍需依赖 P8 交叉验证。",
+                "confidence": 0.95,
+                "evidence_refs": [p7_ref, "P8: 技术面"],
+            }
+        ],
+        "today_advice": [
+            {
+                "priority": "★★★",
+                "name": "生益科技",
+                "code": "600183",
+                "reason": "只剩 P8 单层可作为硬证据。",
+                "strategy": "观察",
+                "confidence": 0.95,
+                "evidence_refs": [p7_ref, "P8: 技术面"],
+            }
+        ],
+    }
+
+    guarded, metrics = p9_reporter._apply_evidence_guardrails(
+        copy.deepcopy(payload),
+        excluded_layers=frozenset({"P7", "P7A"}),
+    )
+
+    assert guarded["core_signals"][0]["confidence"] == 0.60
+    assert guarded["core_signals"][0]["significance"] == "🟡中"
+    assert guarded["today_advice"][0]["confidence"] == 0.60
+    assert guarded["today_advice"][0]["priority"] == "★★"
+    assert metrics["confidence_caps_applied"] == 2
+
+
+@pytest.mark.parametrize("p7_ref", ["P7a: markdown fallback", "P7: markdown fallback"])
+def test_p9_risk_analysis_excludes_degraded_p7_from_model_path(monkeypatch, p7_ref):
+    import p9_reporter
+
+    captured: dict[str, object] = {"manifest_updates": []}
+    payload = {
+        "x_intel_snipe": [],
+        "p3_machine_intel": [],
+        "core_signals": [
+            {
+                "source": "P7a + P8",
+                "significance": "高优先级",
+                "title": "待复核深研结论",
+                "body": "P7a 结构化降级后，仍需依赖 P8 交叉验证。",
+                "confidence": 0.95,
+                "evidence_refs": [p7_ref, "P8: 技术面"],
+            }
+        ],
+        "sniper_tables": [],
+        "fund_pathway": [],
+        "today_advice": [
+            {
+                "priority": "★★★",
+                "name": "生益科技",
+                "code": "600183",
+                "reason": "只剩 P8 单层可作为硬证据。",
+                "strategy": "观察",
+                "confidence": 0.95,
+                "evidence_refs": [p7_ref, "P8: 技术面"],
+            }
+        ],
+        "risk_warning": [],
+    }
+
+    monkeypatch.setattr(
+        p9_reporter,
+        "require_prompt",
+        lambda _name: (
+            "{p7_evidence_boundary}\n{today_str}\n{p5_evidence}\n{p7_section}\n"
+            "{p6_mapping}\n{p75_section}\n{price_data}\n{p2_section}\n{p3_section}\n{yfinance_section}"
+        ),
+    )
+    monkeypatch.setattr(
+        p9_reporter.opus_adapter,
+        "invoke",
+        lambda prompt: captured.setdefault("prompt", prompt)
+        and SimpleNamespace(content=json.dumps(payload, ensure_ascii=False), thinking_content=""),
+    )
+    monkeypatch.setattr(p9_reporter, "load_tdx_stock_code_map", lambda: {"生益科技": "600183"})
+    monkeypatch.setattr(p9_reporter, "_load_p8_price_db", lambda: {})
+    monkeypatch.setattr(p9_reporter, "write_text_artifact", lambda *_args, **_kwargs: "report.md")
+    monkeypatch.setattr(
+        p9_reporter,
+        "write_json_artifact",
+        lambda _prefix, data, **_kwargs: captured.setdefault("json_payload", copy.deepcopy(data)) or "report.json",
+    )
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: captured["manifest_updates"].append((args, kwargs)),
+    )
+
+    report, _ = p9_reporter.p9_risk_analysis(
+        p5_evidence="P5 公司披露。",
+        p7_deep=(
+            "> 【P7a结构化降级】JSON 解析失败；Markdown 仅供可读核验。\n\n"
+            "## 主题1：待复核主题"
+        ),
+        p75_supplement="P7.5 补充线索。",
+        p6_mapping="P6 映射。",
+        price_data="P8 技术面数据。" * 8,
+        p2_x_intel_data="P2 情报。",
+        p3_intel_data="P3 情报。",
+        p4_yfinance="P4 行情。",
+    )
+
+    rendered = captured["json_payload"]
+    assert rendered["core_signals"][0]["confidence"] == 0.60
+    assert rendered["today_advice"][0]["confidence"] == 0.60
+    assert rendered["today_advice"][0]["priority"] == "★★"
+    assert "不得将 P7/P7a 作为独立硬证据" in captured["prompt"]
+    assert "置信度 60%" in report
+    metrics = captured["manifest_updates"][-1][1]["metrics"]
+    assert metrics["upstream_p7a_structured_degraded"] is True
+    assert metrics["upstream_p7a_evidence_excluded"] is True
 
 
 def test_parse_report_payload_repairs_complete_partial_json():
@@ -382,6 +511,15 @@ def test_p9_prompt_no_longer_asks_model_for_stock_codes():
     assert "不要输出 `code` 字段" in prompt
 
 
+def test_p9_prompt_marks_p7a_structured_degradation_as_non_hard_evidence():
+    from pathlib import Path
+
+    prompt = (Path(__file__).resolve().parents[1] / "prompts" / "p9_report.txt").read_text(encoding="utf-8")
+
+    assert "【P7a结构化降级】" in prompt
+    assert "不得作为独立硬证据" in prompt
+
+
 def test_p9_risk_analysis_overrides_model_codes_from_local_tdx(monkeypatch):
     import p9_reporter
 
@@ -567,6 +705,118 @@ def test_p9_risk_analysis_applies_guardrails_before_rendering(monkeypatch):
     assert "| ★★☆ | **生益科技** | 600183 | 补充搜索与传闻共振。 | 只做观察 | 68% |" in report
 
 
+@pytest.mark.parametrize(
+    ("p7_evidence_provenance", "expected_confidence", "expected_priority", "expects_notice"),
+    [
+        (
+            {
+                "primary_source_count": 0,
+                "summary_source_count": 3,
+                "source_url_count": 4,
+                "evidence_tier": "summary_lead_pending_verification",
+            },
+            0.60,
+            "★★",
+            True,
+        ),
+        (
+            {
+                "primary_source_count": 1,
+                "summary_source_count": 2,
+                "source_url_count": 4,
+                "evidence_tier": "primary_source_backed",
+            },
+            0.88,
+            "★★★",
+            False,
+        ),
+    ],
+)
+def test_p9_p7_evidence_tier_controls_order_claim_weight_and_visible_boundary(
+    monkeypatch,
+    p7_evidence_provenance,
+    expected_confidence,
+    expected_priority,
+    expects_notice,
+):
+    import p9_reporter
+
+    captured: dict[str, object] = {"manifest_updates": []}
+    payload = {
+        "x_intel_snipe": [],
+        "p3_machine_intel": [],
+        "core_signals": [
+            {
+                "source": "P7a",
+                "significance": "🟢高",
+                "title": "示例公司订单与量产",
+                "body": "示例公司已获得设备订单并进入量产。",
+                "confidence": 0.88,
+                "evidence_refs": ["P7a:设备订单", "P5:公司披露"],
+            }
+        ],
+        "sniper_tables": [],
+        "fund_pathway": [],
+        "today_advice": [
+            {
+                "priority": "★★★",
+                "name": "示例公司",
+                "code": "000001",
+                "reason": "P7a 订单与量产催化。",
+                "strategy": "仅在披露复核后观察。",
+                "confidence": 0.88,
+                "evidence_refs": ["P7a:设备订单", "P5:公司披露"],
+            }
+        ],
+        "risk_warning": [],
+    }
+
+    monkeypatch.setattr(
+        p9_reporter,
+        "require_prompt",
+        lambda _name: "{p7_evidence_boundary}\n{today_str}\n{p5_evidence}\n{p7_section}\n{p6_mapping}\n{p75_section}\n{price_data}\n{p2_section}\n{p3_section}\n{yfinance_section}",
+    )
+    monkeypatch.setattr(
+        p9_reporter.opus_adapter,
+        "invoke",
+        lambda prompt: captured.setdefault("prompt", prompt)
+        and SimpleNamespace(content=json.dumps(payload, ensure_ascii=False), thinking_content=""),
+    )
+    monkeypatch.setattr(p9_reporter, "load_tdx_stock_code_map", lambda: {"示例公司": "000001"})
+    monkeypatch.setattr(p9_reporter, "_load_p8_price_db", lambda: {})
+    monkeypatch.setattr(p9_reporter, "write_text_artifact", lambda *_args, **_kwargs: "report.md")
+    monkeypatch.setattr(
+        p9_reporter,
+        "write_json_artifact",
+        lambda _prefix, data, **_kwargs: captured.setdefault("json_payload", copy.deepcopy(data)) or "report.json",
+    )
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: captured["manifest_updates"].append((args, kwargs)),
+    )
+
+    report, _ = p9_reporter.p9_risk_analysis(
+        p5_evidence="P5 公司披露已发布。",
+        p7_deep="P7a 示例公司订单与量产线索。",
+        p75_supplement="P7.5 补充线索。",
+        p6_mapping="P6 映射。",
+        price_data="P8 技术面数据。" * 8,
+        p2_x_intel_data="P2 情报。",
+        p3_intel_data="P3 情报。",
+        p4_yfinance="P4 行情。",
+        p7_evidence_provenance=p7_evidence_provenance,
+    )
+
+    rendered = captured["json_payload"]
+    assert rendered["core_signals"][0]["confidence"] == expected_confidence
+    assert rendered["today_advice"][0]["priority"] == expected_priority
+    assert ("摘要线索待核验" in report) is expects_notice
+    assert ("摘要线索待核验" in captured["prompt"]) is expects_notice
+    metrics = captured["manifest_updates"][-1][1]["metrics"]
+    assert metrics["p7_evidence_provenance"]["evidence_tier"] == p7_evidence_provenance["evidence_tier"]
+
+
 def test_p9_risk_analysis_blocks_raw_delivery_on_invalid_json(monkeypatch):
     import p9_reporter
 
@@ -663,7 +913,10 @@ def test_p9_two_model_network_failure_delivers_validated_checkpoint_fallback(mon
 
     report, report_ts = p9_reporter.p9_risk_analysis(
         p5_evidence="# P5 审计\n通过：8条 / 删除：1条",
-        p7_deep="# P7a 深研审计\nInP 供应约束已核验",
+        p7_deep=(
+            "> 【P7a结构化降级】JSON 解析失败，Markdown 仅供可读核验。\n\n"
+            "# P7a 深研审计\nInP 供应约束已核验"
+        ),
         p75_supplement="# P7.5 补充审计\n暂无新增硬证据",
         p6_mapping="# P6 映射\n### 赛道: 光芯片\n- 生益科技",
         price_data="# P8 技术面\n生益科技收盘价 100.00",
@@ -679,6 +932,8 @@ def test_p9_two_model_network_failure_delivers_validated_checkpoint_fallback(mon
     assert "不新增模型归纳、标的筛选、资金路径或操作建议" in report
     assert "## 一、核心信号" in report
     assert "## ⚠️ 风险提示" in report
+    assert "P7a 深研材料（以层内状态为准）" in report
+    assert "【P7a结构化降级】" in report
     assert checkpoint._report_markdown_is_complete(report) is True
     fallback_ready = updates[-1][1]
     assert fallback_ready["status"] == "local_fallback_ready"

@@ -54,9 +54,18 @@ from p1_web import collect_from_web
 from p2_x_intel import collect_from_x
 from p3_agent import collect_p3_parallel_only, render_p3_output, run_jinnang_1
 from p4_vanguard import fetch_vanguard_prices
-from audit_engine import gemini_pro_audit, p7a_deep_research_audit
+from audit_engine import (
+    P7A_STRUCTURED_DEGRADED_MARKER,
+    gemini_pro_audit,
+    p7a_deep_research_audit,
+)
 from p6_mapper import format_evidence, generate_report
-from p7_deep_research import build_research_plan, run_deep_research
+from p7_deep_research import (
+    build_p7_evidence_boundary,
+    build_research_plan,
+    normalize_p7_evidence_provenance,
+    run_deep_research,
+)
 from p8_technical import (
     extract_stocks_from_report,
     extract_stock_elasticity,
@@ -160,6 +169,60 @@ def _read_json_checkpoint(path: str, label: str):
     except Exception as exc:
         logging.warning("%s resume failed: %s", label, exc)
     return None
+
+
+def _recover_p7_evidence_provenance(ckpt: dict) -> dict | None:
+    """Recover the optional P7 provenance artifact without invalidating legacy runs."""
+    payload = _read_json_checkpoint(
+        ckpt.get("files", {}).get("p7_evidence", ""),
+        "P7 evidence provenance",
+    )
+    if not isinstance(payload, dict):
+        return None
+    aggregate = payload.get("aggregate", payload)
+    provenance = _normalize_p7_evidence_with_topics(aggregate)
+    if provenance and isinstance(payload.get("topics"), list):
+        provenance["topics"] = payload["topics"]
+    return provenance or None
+
+
+def _normalize_p7_evidence_with_topics(value: object) -> dict | None:
+    """Normalize count/tier fields while retaining per-topic artifact records."""
+    provenance = normalize_p7_evidence_provenance(value)
+    if not provenance:
+        return None
+    if isinstance(value, dict) and isinstance(value.get("topics"), list):
+        provenance["topics"] = value["topics"]
+    return provenance
+
+
+def _write_p7_evidence_artifact(context: dict[str, Any], provenance: dict | None) -> str:
+    """Persist aggregate and per-topic P7 provenance independently of Markdown output."""
+    if not provenance:
+        return ""
+    payload = {
+        "aggregate": provenance,
+        "topics": provenance.get("topics", []),
+    }
+    try:
+        path = write_json_artifact("P7_证据元数据", payload)
+    except Exception as exc:
+        logging.warning("[P7] failed to write evidence provenance: %s", exc)
+        return ""
+    context["ckpt"].setdefault("files", {})["p7_evidence"] = path
+    return path
+
+
+def _mark_p7a_unavailable_passthrough(raw_research: str, reason: str) -> str:
+    """Keep failed P7a passthroughs from being treated as audited P7 evidence."""
+    if P7A_STRUCTURED_DEGRADED_MARKER in raw_research:
+        return raw_research
+    return (
+        f"> {P7A_STRUCTURED_DEGRADED_MARKER}{reason}；未获得可用 P7a Markdown 审计正文，"
+        "以下为未经 P7a 审计的原始 P7 透传。"
+        "P9 不得将 P7/P7a 作为独立硬证据或据此提高置信度。\n\n"
+        f"{raw_research}"
+    )
 
 
 def _read_fresh_text_checkpoint(
@@ -363,6 +426,7 @@ def _build_context(now: datetime, run_ts: str, ckpt: dict, resume_from: str) -> 
         "p6_mapping": "",
         "rejected_target_names": [],
         "p7_deep": "",
+        "p7_evidence_provenance": None,
         "p7a_audited": "",
         "p75_supplement": "",
         "p75_raw_text": "",
@@ -420,6 +484,8 @@ def _build_context(now: datetime, run_ts: str, ckpt: dict, resume_from: str) -> 
             "P7 deep research",
             upstream_keys=("p6",),
         )
+        if context["p7_deep"]:
+            context["p7_evidence_provenance"] = _recover_p7_evidence_provenance(ckpt)
         context["p75_supplement"], context["p75_raw_text"] = (
             _recover_p75_checkpoint(ckpt)
         )
@@ -849,6 +915,10 @@ def _stage_market_mapping(context: dict[str, Any]) -> None:
                 "P7 deep research",
                 upstream_keys=("p6",),
             )
+            if context["p7_deep"]:
+                context["p7_evidence_provenance"] = _recover_p7_evidence_provenance(
+                    ckpt
+                )
             context["p75_supplement"], context["p75_raw_text"] = (
                 _recover_p75_checkpoint(ckpt)
             )
@@ -966,6 +1036,10 @@ def _stage_research(context: dict[str, Any]) -> None:
         return
 
     resume_from = context["resume_from"]
+    recovered_p7_evidence = _normalize_p7_evidence_with_topics(
+        context.get("p7_evidence_provenance")
+    )
+    context["p7_evidence_provenance"] = recovered_p7_evidence
     rejected_target_names = normalize_rejected_stock_names(
         context.get("rejected_target_names")
     )
@@ -1064,6 +1138,11 @@ def _stage_research(context: dict[str, Any]) -> None:
                     try:
                         p7_result = p7_future.result()
                         context["p7_deep"] = p7_result.get("text", "")
+                        result_p7_evidence = _normalize_p7_evidence_with_topics(
+                            p7_result.get("evidence_provenance")
+                        )
+                        if result_p7_evidence:
+                            context["p7_evidence_provenance"] = result_p7_evidence
                         context["p7_rejected_identity_lines_removed"] = int(
                             p7_result.get("rejected_identity_lines_removed", 0) or 0
                         )
@@ -1074,13 +1153,29 @@ def _stage_research(context: dict[str, Any]) -> None:
                                 if p7_status == "skipped_no_results" or p7_status.startswith("failed")
                                 else "failed_empty_output"
                             )
+                            p7_evidence_path = _write_p7_evidence_artifact(
+                                context,
+                                context.get("p7_evidence_provenance"),
+                            )
                             update_run_manifest(
                                 "p7",
                                 status=empty_status,
+                                files={"evidence": p7_evidence_path}
+                                if p7_evidence_path
+                                else None,
                                 metrics={
                                     "output_chars": 0,
                                     "topics_planned": int(p7_result.get("topics_planned", 0) or 0),
                                     "topics_completed": int(p7_result.get("topics_completed", 0) or 0),
+                                    **(
+                                        {
+                                            "p7_evidence_provenance": context[
+                                                "p7_evidence_provenance"
+                                            ]
+                                        }
+                                        if context.get("p7_evidence_provenance")
+                                        else {}
+                                    ),
                                     **p6_hash_metrics,
                                 },
                             )
@@ -1152,17 +1247,30 @@ def _stage_research(context: dict[str, Any]) -> None:
         context["p75_duration"] = time.time() - p75_started
 
     if context.get("p7_deep"):
+        p7_evidence = _normalize_p7_evidence_with_topics(
+            context.get("p7_evidence_provenance")
+        )
+        context["p7_evidence_provenance"] = p7_evidence
+        p7_evidence_boundary = build_p7_evidence_boundary(p7_evidence)
+        p7_evidence_prefix = (
+            f"> {p7_evidence_boundary}\n\n"
+            if p7_evidence_boundary and p7_evidence_boundary not in context["p7_deep"]
+            else ""
+        )
         p7_body = (
             "# P7 深度研究结果\n\n"
             f"> generated_at: {datetime.now().isoformat()}\n\n"
             f"> goal: {research_plan.get('goal', '')}\n"
             f"> triggers: {', '.join(research_plan.get('triggers', [])) or 'none'}\n\n"
-            f"{context['p7_deep']}"
+            f"{p7_evidence_prefix}{context['p7_deep']}"
         )
         p7_path = write_text_artifact("P7_深度研究", p7_body)
         p7_files = {"md": p7_path}
         if context["p7_plan_path"]:
             p7_files["plan"] = context["p7_plan_path"]
+        p7_evidence_path = _write_p7_evidence_artifact(context, p7_evidence)
+        if p7_evidence_path:
+            p7_files["evidence"] = p7_evidence_path
         update_run_manifest(
             "p7",
             status="completed",
@@ -1174,6 +1282,7 @@ def _stage_research(context: dict[str, Any]) -> None:
                     "p7_rejected_identity_lines_removed",
                     0,
                 ),
+                **({"p7_evidence_provenance": p7_evidence} if p7_evidence else {}),
                 **p6_hash_metrics,
             },
         )
@@ -1200,7 +1309,18 @@ def _stage_research(context: dict[str, Any]) -> None:
         p7a_checkpoint_state == "valid_passthrough"
         and not context.get("p7a_audited")
     ):
-        context["p7a_audited"] = context.get("p7_deep", "")
+        p7a_checkpoint_status = str(
+            stage_assessments.get("p7a", {}).get("status") or ""
+        ).strip().lower()
+        raw_p7_research = context.get("p7_deep", "")
+        context["p7a_audited"] = (
+            _mark_p7a_unavailable_passthrough(
+                raw_p7_research,
+                "历史 P7a 审计未生成可用结果",
+            )
+            if p7a_checkpoint_status.startswith("failed")
+            else raw_p7_research
+        )
     if not p7a_reusable_without_audit and not context.get("p7a_audited") and (
         context.get("p7_deep", "").strip() and len(context["p7_deep"].strip()) > 200
     ):
@@ -1211,6 +1331,7 @@ def _stage_research(context: dict[str, Any]) -> None:
                 context["p7a_audited"] = p7a_deep_research_audit(
                     context["p7_deep"],
                     rejected_target_names=rejected_target_names,
+                    p7_evidence_provenance=context.get("p7_evidence_provenance"),
                 )
             except Exception as exc:
                 logging.error("[P7a] audit failed unexpectedly; passing through raw P7 data: %s", exc)
@@ -1220,9 +1341,24 @@ def _stage_research(context: dict[str, Any]) -> None:
                     metrics={
                         "input_chars": len(context.get("p7_deep", "") or ""),
                         "fallback_reason": str(exc),
+                        "structured_degraded": True,
+                        "data_state": "invalid",
+                        "degrade_reason": "p7a_exception_passthrough",
+                        **(
+                            {
+                                "p7_evidence_provenance": context[
+                                    "p7_evidence_provenance"
+                                ]
+                            }
+                            if context.get("p7_evidence_provenance")
+                            else {}
+                        ),
                     },
                 )
-                context["p7a_audited"] = context.get("p7_deep", "")
+                context["p7a_audited"] = _mark_p7a_unavailable_passthrough(
+                    context.get("p7_deep", ""),
+                    "P7a 审计发生异常",
+                )
     elif not p7a_reusable_without_audit and not context.get("p7a_audited"):
         context["p7a_audited"] = context.get("p7_deep", "")
         if context["p7a_audited"].strip():
@@ -1233,6 +1369,15 @@ def _stage_research(context: dict[str, Any]) -> None:
                     "input_chars": len(context["p7a_audited"]),
                     "passthrough_chars": len(context["p7a_audited"]),
                     "data_state": "valid_passthrough",
+                    **(
+                        {
+                            "p7_evidence_provenance": context[
+                                "p7_evidence_provenance"
+                            ]
+                        }
+                        if context.get("p7_evidence_provenance")
+                        else {}
+                    ),
                     **p6_hash_metrics,
                 },
             )
@@ -1369,6 +1514,7 @@ def _stage_report(context: dict[str, Any]) -> None:
                 rejected_target_names=context.get("rejected_target_names", []),
                 checkpoint_snapshot=_resolve_p9_checkpoint_snapshot(context),
                 manual_review_required=manual_review_required,
+                p7_evidence_provenance=context.get("p7_evidence_provenance"),
             )
         except Exception as exc:
             logging.error("[P9] report generation failed: %s", exc)

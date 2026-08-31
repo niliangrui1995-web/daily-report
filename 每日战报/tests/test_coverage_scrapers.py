@@ -658,6 +658,44 @@ def test_extract_meta_from_html_and_enrich_search_urls(monkeypatch):
     assert scraper_utils.enrich_search_urls(no_enrichment)["text"] == "base"
 
 
+@pytest.mark.parametrize(
+    ("primary_body", "expected_primary_count", "expected_summary_count", "expected_tier"),
+    [
+        (False, 0, 1, "summary_lead_pending_verification"),
+        (True, 1, 0, "primary_source_backed"),
+    ],
+)
+def test_enrich_search_urls_can_attach_p7_evidence_provenance(
+    monkeypatch,
+    primary_body,
+    expected_primary_count,
+    expected_summary_count,
+    expected_tier,
+):
+    monkeypatch.setattr(scraper_utils, "scrapling_available", True)
+    monkeypatch.setattr(scraper_utils, "_is_high_value_domain", lambda _url: True)
+    monkeypatch.setattr(
+        scraper_utils,
+        "enrich_article_url",
+        lambda *_args, **_kwargs: "primary body" if primary_body else "",
+    )
+    monkeypatch.setattr(scraper_utils, "_quick_meta_extract", lambda _url: "summary body")
+
+    result = scraper_utils.enrich_search_urls(
+        {
+            "text": "base",
+            "grounding_sources": [{"url": "https://example.com/article", "title": "Example"}],
+        },
+        include_evidence_metadata=True,
+    )
+
+    provenance = result["scrapling_evidence_provenance"]
+    assert provenance["primary_source_count"] == expected_primary_count
+    assert provenance["summary_source_count"] == expected_summary_count
+    assert provenance["source_url_count"] == 1
+    assert provenance["evidence_tier"] == expected_tier
+
+
 def test_parse_rss_date_and_fetch_rss_entries(monkeypatch):
     assert p1_rss._parse_rss_date({"published_parsed": (2026, 7, 14, 1, 2, 3)}) == "2026-07-14T09:02:03 (北京时间)"
     fallback_entry = {

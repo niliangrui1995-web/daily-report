@@ -283,6 +283,21 @@ _TAVILY_ENTITY_STOPWORDS = {
     "over",
     "more",
 }
+
+
+def _enrich_search_result(result: dict, *, structured_mode: str | None) -> dict:
+    """Keep the legacy enrichment call shape outside provenance-aware P7."""
+    if structured_mode != P7_STRUCTURED_MODE:
+        return enrich_search_urls(result)
+    try:
+        return enrich_search_urls(result, include_evidence_metadata=True)
+    except TypeError as exc:
+        # Injected legacy enrichers (including integration adapters) may still
+        # expose the old one-argument callable.  Their missing provenance is
+        # treated conservatively by P7 rather than breaking the search result.
+        if "include_evidence_metadata" not in str(exc):
+            raise
+        return enrich_search_urls(result)
 _TAVILY_COVERAGE_MARKERS = {
     "cause": ("cause", "driver", "driven", "because", "due to", "原因", "驱动", "触发", "由于"),
     "winners": ("benefit", "winner", "upside", "gain", "利好", "受益", "赢家", "增长"),
@@ -866,7 +881,7 @@ def gemini_search(
                     if structured_payload:
                         result["structured"] = structured_payload
                         result["raw_text"] = text
-                    return enrich_search_urls(result)
+                    return _enrich_search_result(result, structured_mode=structured_mode)
                 except requests.exceptions.Timeout:
                     channel_breaker.record_failure(channel_name)
                     logging.warning(f"[{category}] request timeout on {channel_name}; switching to fallback")
@@ -899,7 +914,7 @@ def gemini_search(
             result["raw_text"] = result.get("text", "")
             result["structured"] = structured_payload
             result["text"] = _render_p7_structured_text(structured_payload)
-        return enrich_search_urls(result)
+        return _enrich_search_result(result, structured_mode=structured_mode)
 
     logging.error(f"[{category}] all search routes failed")
     return {}

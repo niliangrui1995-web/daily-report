@@ -645,6 +645,55 @@ def test_run_deep_research_skip_success_filter_and_worker_exception(monkeypatch)
     assert result["skipped_recent_topics"] == ["old"]
 
 
+@pytest.mark.parametrize(
+    ("primary_source_count", "expected_tier", "expects_summary_notice"),
+    [
+        (0, "summary_lead_pending_verification", True),
+        (1, "primary_source_backed", False),
+    ],
+)
+def test_run_deep_research_persists_topic_and_aggregate_evidence_provenance(
+    monkeypatch,
+    primary_source_count,
+    expected_tier,
+    expects_summary_notice,
+):
+    def worker(topic, **_kwargs):
+        return {
+            "topic": topic,
+            "text": "示例公司订单与量产线索",
+            "status": "completed",
+            "rounds_run": 1,
+            "successful_rounds": 1,
+            "evidence_provenance": {
+                "primary_source_count": primary_source_count,
+                "summary_source_count": 2,
+                "source_url_count": 3,
+                "evidence_tier": expected_tier,
+                "rounds": [
+                    {
+                        "round_index": 1,
+                        "primary_source_count": primary_source_count,
+                        "summary_source_count": 2,
+                        "source_url_count": 3,
+                        "evidence_tier": expected_tier,
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(p7, "iterative_deep_search", worker)
+    result = p7.run_deep_research({"should_run_p7": True, "deep_topics": ["示例主题"]})
+
+    aggregate = result["evidence_provenance"]
+    topic = result["topic_results"][0]["evidence_provenance"]
+    assert aggregate["primary_source_count"] == primary_source_count
+    assert aggregate["summary_source_count"] == 2
+    assert aggregate["evidence_tier"] == expected_tier
+    assert topic["evidence_tier"] == expected_tier
+    assert ("摘要线索待核验" in result["text"]) is expects_summary_notice
+
+
 def test_run_deep_research_all_empty(monkeypatch):
     monkeypatch.setattr(
         p7,
@@ -979,7 +1028,9 @@ def test_p7a_short_prompt_missing_invoke_and_short_output(monkeypatch, audit_art
         "require_prompt",
         lambda _name: (_ for _ in ()).throw(FileNotFoundError("missing")),
     )
-    assert audit_engine.p7a_deep_research_audit(raw) == raw
+    missing_prompt_result = audit_engine.p7a_deep_research_audit(raw)
+    assert missing_prompt_result.startswith("> 【P7a结构化降级】")
+    assert missing_prompt_result.endswith(raw)
     assert manifests[-1][1]["status"] == "failed_missing_prompt"
 
     monkeypatch.setattr(
@@ -992,7 +1043,9 @@ def test_p7a_short_prompt_missing_invoke_and_short_output(monkeypatch, audit_art
         "_invoke_audit_with_fallback",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("down")),
     )
-    assert audit_engine.p7a_deep_research_audit(raw) == raw
+    invoke_failure_result = audit_engine.p7a_deep_research_audit(raw)
+    assert invoke_failure_result.startswith("> 【P7a结构化降级】")
+    assert invoke_failure_result.endswith(raw)
     assert manifests[-1][1]["status"] == "failed_invoke"
 
     adapter = _Adapter(category="empty", message="too short")
@@ -1005,7 +1058,9 @@ def test_p7a_short_prompt_missing_invoke_and_short_output(monkeypatch, audit_art
             {"audit_fallback_used": True},
         ),
     )
-    assert audit_engine.p7a_deep_research_audit(raw) == raw
+    empty_output_result = audit_engine.p7a_deep_research_audit(raw)
+    assert empty_output_result.startswith("> 【P7a结构化降级】")
+    assert empty_output_result.endswith(raw)
     assert manifests[-1][1]["status"] == "failed_empty_output"
     assert manifests[-1][1]["metrics"]["failure_category"] == "empty"
 
@@ -1019,7 +1074,9 @@ def test_p7a_short_prompt_missing_invoke_and_short_output(monkeypatch, audit_art
             {"audit_fallback_used": False},
         ),
     )
-    assert audit_engine.p7a_deep_research_audit(raw) == raw
+    second_empty_output_result = audit_engine.p7a_deep_research_audit(raw)
+    assert second_empty_output_result.startswith("> 【P7a结构化降级】")
+    assert second_empty_output_result.endswith(raw)
     metrics = manifests[-1][1]["metrics"]
     assert "failure_category" not in metrics
     assert "error" not in metrics
@@ -1051,14 +1108,18 @@ def test_p7a_structured_success_identity_filter_and_artifacts(monkeypatch, audit
 
     def invoke(prompt, *args, **kwargs):
         captured["prompt"] = prompt
-        content = '```json\n{"topics":[1]}\n```===MARKDOWN===\nBadCo verified markdown ' + "x" * 120
+        content = (
+            '```json\n{"topics":[{"name":"合规主题"}]}\n```===MARKDOWN===\n'
+            '## 主题1：BadCo 合规主题\n\n'
+            '- verified markdown ' + "x" * 120
+        )
         return SimpleNamespace(content=content), _Adapter(), {"audit_fallback_used": False}
 
     monkeypatch.setattr(audit_engine, "_invoke_audit_with_fallback", invoke)
     monkeypatch.setattr(
         audit_engine,
         "extract_json_from_llm_response",
-        lambda *args, **kwargs: {"topics": [1]},
+        lambda *args, **kwargs: {"topics": [{"name": "合规主题"}]},
     )
     result = audit_engine.p7a_deep_research_audit(raw, rejected_target_names=["BadCo"])
     assert "BadCo" not in result
@@ -1077,7 +1138,8 @@ def test_p7a_json_degraded_artifact_failures_and_missing_separator(monkeypatch, 
         "require_prompt",
         lambda _name: "{today_str}|{vanguard_list}|{raw_deep_research}",
     )
-    invalid_content = "invalid json===MARKDOWN===" + "markdown body " * 20
+    valid_markdown = "## 主题1：可用 Markdown\n\n" + "markdown body " * 20
+    invalid_content = "invalid json===MARKDOWN===" + valid_markdown
     monkeypatch.setattr(
         audit_engine,
         "_invoke_audit_with_fallback",
@@ -1103,7 +1165,8 @@ def test_p7a_json_degraded_artifact_failures_and_missing_separator(monkeypatch, 
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("md disk")),
     )
     result = audit_engine.p7a_deep_research_audit(raw)
-    assert result.startswith("markdown body")
+    assert result.startswith("> 【P7a结构化降级】")
+    assert result.endswith(valid_markdown)
     assert manifests[-1][1]["status"] == "completed_structured_degraded"
     metrics = manifests[-1][1]["metrics"]
     assert metrics["structured_degraded"] is True
@@ -1111,7 +1174,7 @@ def test_p7a_json_degraded_artifact_failures_and_missing_separator(monkeypatch, 
     assert metrics["raw_json_attempt_chars"] > 0
     assert manifests[-1][1]["files"] is None
 
-    no_separator = "plain markdown without separator " * 10
+    no_separator = "## 主题1：无分隔符 Markdown\n\n" + "plain markdown without separator " * 10
     monkeypatch.setattr(
         audit_engine,
         "_invoke_audit_with_fallback",
@@ -1122,7 +1185,8 @@ def test_p7a_json_degraded_artifact_failures_and_missing_separator(monkeypatch, 
         ),
     )
     result = audit_engine.p7a_deep_research_audit(raw)
-    assert result == no_separator
+    assert result.startswith("> 【P7a结构化降级】")
+    assert result.endswith(no_separator)
     assert manifests[-1][1]["status"] == "completed_structured_degraded"
     assert manifests[-1][1]["metrics"]["degrade_reason"] == "missing_markdown_separator"
 
@@ -1146,9 +1210,10 @@ def test_p7a_degraded_empty_json_and_markdown_only_with_successful_artifacts(
     monkeypatch.setattr(
         audit_engine,
         "filter_rejected_stock_tree",
-        lambda data, names: ({"meta": {}, "raw_json_attempt": ""}, 0),
+        lambda data, names: (data, 0),
     )
-    empty_json_content = "===MARKDOWN===" + "grounded markdown body " * 10
+    grounded_markdown = "## 主题1：有正文的降级主题\n\n" + "grounded markdown body " * 10
+    empty_json_content = "===MARKDOWN===" + grounded_markdown
     monkeypatch.setattr(
         audit_engine,
         "_invoke_audit_with_fallback",
@@ -1159,13 +1224,14 @@ def test_p7a_degraded_empty_json_and_markdown_only_with_successful_artifacts(
         ),
     )
     result = audit_engine.p7a_deep_research_audit(raw)
-    assert result.startswith("grounded markdown body")
+    assert result.startswith("> 【P7a结构化降级】")
+    assert result.endswith(grounded_markdown)
     assert manifests[-1][1]["status"] == "completed_structured_degraded"
     assert "raw_json_attempt_chars" not in manifests[-1][1]["metrics"]
     assert json_writes and text_writes
     assert set(manifests[-1][1]["files"]) == {"md", "json"}
 
-    markdown_only = "markdown-only response " * 10
+    markdown_only = "## 主题1：仅 Markdown 的主题\n\n" + "markdown-only response " * 10
     monkeypatch.setattr(
         audit_engine,
         "_invoke_audit_with_fallback",
@@ -1176,8 +1242,9 @@ def test_p7a_degraded_empty_json_and_markdown_only_with_successful_artifacts(
         ),
     )
     result = audit_engine.p7a_deep_research_audit(raw)
-    assert result == markdown_only
-    assert set(manifests[-1][1]["files"]) == {"md"}
+    assert result.startswith("> 【P7a结构化降级】")
+    assert result.endswith(markdown_only)
+    assert set(manifests[-1][1]["files"]) == {"md", "json"}
 
     valid_json_only = '{"topics":[],"padding":"' + ("x" * 150) + '"}===MARKDOWN==='
     monkeypatch.setattr(
@@ -1195,7 +1262,8 @@ def test_p7a_degraded_empty_json_and_markdown_only_with_successful_artifacts(
         ),
     )
     result = audit_engine.p7a_deep_research_audit(raw)
-    assert result == raw
+    assert result.startswith("> 【P7a结构化降级】")
+    assert result.endswith(raw)
     assert manifests[-1][1]["status"] == "failed_semantic_output"
     assert manifests[-1][1]["metrics"]["semantic_error"] == "empty_markdown_output"
     assert set(manifests[-1][1]["files"]) == {"json"}

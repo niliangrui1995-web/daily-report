@@ -21,6 +21,8 @@ from tdx_stock_universe import (
 )
 
 P7_TOPIC_PREFIX = "## \u6df1\u5ea6\u7814\u7a76\uff1a"
+P7_PRIMARY_SOURCE_BACKED_TIER = "primary_source_backed"
+P7_SUMMARY_LEAD_TIER = "summary_lead_pending_verification"
 # Why: 深度研究是研究型搜索，不需要时间窗口限制
 #      空串传入 _build_search_prompt 会走 unlimited 模式
 ROUND_BACKTRACKS = ("", "", "")
@@ -29,6 +31,149 @@ ROUND_HINTS = (
     "Expand into chain transmission, winners, losers, and supplier or customer context.",
     "Fill the remaining gaps around alternatives, substitutes, and competitive response.",
 )
+
+
+def _nonnegative_evidence_count(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_p7_evidence_provenance(value: object) -> dict[str, object]:
+    """Normalize the optional P7 Scrapling enrichment provenance.
+
+    ``None`` and unrecognised values intentionally return an empty mapping so
+    older callers keep their historical behavior.  Once a payload is present,
+    the count/tier invariant is conservative: zero successful high-value body
+    enrichments is always a summary lead pending verification.
+    """
+    if not isinstance(value, dict):
+        return {}
+
+    count_keys = (
+        "primary_source_count",
+        "summary_source_count",
+        "source_url_count",
+    )
+    raw_rounds = value.get("rounds")
+    has_direct_evidence = any(key in value for key in (*count_keys, "evidence_tier"))
+    normalized_rounds: list[dict[str, object]] = []
+    if isinstance(raw_rounds, list):
+        for position, raw_round in enumerate(raw_rounds, start=1):
+            normalized_round = normalize_p7_evidence_provenance(raw_round)
+            if not normalized_round:
+                continue
+            normalized_round.pop("rounds", None)
+            normalized_round["round_index"] = _nonnegative_evidence_count(
+                raw_round.get("round_index", position) if isinstance(raw_round, dict) else position
+            ) or position
+            normalized_rounds.append(normalized_round)
+
+    if not has_direct_evidence:
+        if not normalized_rounds:
+            return {}
+        return _merge_p7_evidence_provenance(normalized_rounds, rounds=normalized_rounds)
+
+    primary_count = _nonnegative_evidence_count(value.get("primary_source_count"))
+    normalized: dict[str, object] = {
+        "primary_source_count": primary_count,
+        "summary_source_count": _nonnegative_evidence_count(value.get("summary_source_count")),
+        "source_url_count": _nonnegative_evidence_count(value.get("source_url_count")),
+        "evidence_tier": (
+            P7_PRIMARY_SOURCE_BACKED_TIER
+            if primary_count > 0
+            else P7_SUMMARY_LEAD_TIER
+        ),
+    }
+    if normalized_rounds:
+        normalized["rounds"] = normalized_rounds
+    return normalized
+
+
+def _merge_p7_evidence_provenance(
+    values: list[object],
+    *,
+    rounds: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    normalized_values = [
+        normalize_p7_evidence_provenance(value)
+        for value in values
+    ]
+    normalized_values = [value for value in normalized_values if value]
+    merged = normalize_p7_evidence_provenance(
+        {
+            "primary_source_count": sum(
+                _nonnegative_evidence_count(value.get("primary_source_count"))
+                for value in normalized_values
+            ),
+            "summary_source_count": sum(
+                _nonnegative_evidence_count(value.get("summary_source_count"))
+                for value in normalized_values
+            ),
+            "source_url_count": sum(
+                _nonnegative_evidence_count(value.get("source_url_count"))
+                for value in normalized_values
+            ),
+        }
+    )
+    if rounds:
+        merged["rounds"] = rounds
+    return merged
+
+
+def _empty_p7_evidence_provenance() -> dict[str, object]:
+    return normalize_p7_evidence_provenance(
+        {
+            "primary_source_count": 0,
+            "summary_source_count": 0,
+            "source_url_count": 0,
+        }
+    )
+
+
+def build_p7_evidence_boundary(provenance: object) -> str:
+    """Return a human-visible evidence boundary without Markdown decoration."""
+    normalized = normalize_p7_evidence_provenance(provenance)
+    if not normalized:
+        return ""
+
+    primary_count = _nonnegative_evidence_count(normalized.get("primary_source_count"))
+    summary_count = _nonnegative_evidence_count(normalized.get("summary_source_count"))
+    source_url_count = _nonnegative_evidence_count(normalized.get("source_url_count"))
+    if primary_count == 0:
+        return (
+            "【摘要线索待核验】本轮 P7 的 Scrapling 高价值正文深挖成功数为 0"
+            f"（摘要提取 {summary_count} 条、候选 URL {source_url_count} 个）。"
+            "涉及具体订单、报价、量产或公司归因的内容仅为摘要线索，不能作为硬证据。"
+        )
+    return (
+        f"P7 证据层级：{P7_PRIMARY_SOURCE_BACKED_TIER}（Scrapling 高价值正文深挖成功 "
+        f"{primary_count} 条、摘要提取 {summary_count} 条、候选 URL {source_url_count} 个）。"
+        "该计数仅描述采集路径，不等同于官方披露认证。"
+    )
+
+
+def _p7_round_evidence_provenance(result: object) -> dict[str, object]:
+    if isinstance(result, dict):
+        normalized = normalize_p7_evidence_provenance(
+            result.get("scrapling_evidence_provenance")
+        )
+        if normalized:
+            return normalized
+        sources = result.get("grounding_sources")
+        source_url_count = len(sources) if isinstance(sources, list) else 0
+    else:
+        source_url_count = 0
+    # P7 has requested a provenance-aware search.  A missing payload therefore
+    # cannot upgrade evidence; keep it as a zero-primary summary lead.
+    return normalize_p7_evidence_provenance(
+        {
+            "primary_source_count": 0,
+            "summary_source_count": 0,
+            "source_url_count": source_url_count,
+        }
+    )
 
 _TOPIC_VALUE_MARKERS = (
     "\u539f\u56e0",
@@ -815,12 +960,14 @@ def _format_round_section(
     novelty: float,
     coverage: dict[str, bool],
     new_entities_count: int,
+    evidence_provenance: dict[str, object] | None = None,
 ) -> str:
     fact_lines = _structured_claim_lines(structured, result_text)
     claim = _structured_summary(structured) or (fact_lines[0] if fact_lines else "No stable claim extracted.")
     implication_lines = _structured_implications(structured, fact_lines)
     date_lines = _structured_dates(structured, result_text)
     open_questions = _structured_open_questions(structured, coverage, query)
+    evidence_boundary = build_p7_evidence_boundary(evidence_provenance)
 
     lines = [
         f"### Round {round_index}",
@@ -829,12 +976,20 @@ def _format_round_section(
         f"- Goal: {goal or 'Explain the cause and the concrete implication.'}",
         f"- Novelty score: {novelty:.2f}",
         f"- New entities: {new_entities_count}",
-        "",
+    ]
+    if evidence_boundary:
+        lines.extend([f"> {evidence_boundary}", ""])
+    else:
+        lines.append("")
+
+    lines.extend(
+        [
         "#### Claim",
         claim,
         "",
         "#### Evidence",
-    ]
+        ]
+    )
     if fact_lines:
         lines.extend(f"- {line}" for line in fact_lines[:6])
     else:
@@ -879,6 +1034,7 @@ def iterative_deep_search(
     time.sleep(init_delay)
 
     round_sections: list[str] = []
+    round_evidence_records: list[dict[str, object]] = []
     successful_texts: list[str] = []
     successful_structured: list[dict[str, object] | None] = []
     queries_used: list[str] = []
@@ -926,6 +1082,14 @@ def iterative_deep_search(
             logging.info(f"[P7] search found no evidence for '{topic}' round {round_index + 1}")
             stop_reason = "no_evidence_first_round" if round_index == 0 else "no_further_evidence"
             break
+        round_evidence = _p7_round_evidence_provenance(result)
+        round_evidence_record = {
+            key: value
+            for key, value in round_evidence.items()
+            if key != "rounds"
+        }
+        round_evidence_record["round_index"] = round_index + 1
+        round_evidence_records.append(round_evidence_record)
         structured = result.get("structured") if isinstance(result, dict) else None
         analysis_lines = _structured_claim_lines(structured, result_text)
         analysis_text = "\n".join(analysis_lines) if analysis_lines else result_text
@@ -953,6 +1117,7 @@ def iterative_deep_search(
                 novelty=novelty,
                 coverage=coverage,
                 new_entities_count=len(new_entities),
+                evidence_provenance=round_evidence,
             )
         )
         successful_texts.append(analysis_text)
@@ -973,6 +1138,8 @@ def iterative_deep_search(
 
     if not round_sections:
         status = "skipped_no_results" if stop_reason == "no_evidence_first_round" else "failed_empty_output"
+        evidence_provenance = _merge_p7_evidence_provenance(round_evidence_records)
+        evidence_provenance["rounds"] = round_evidence_records
         return {
             "topic": topic,
             "text": "",
@@ -982,9 +1149,13 @@ def iterative_deep_search(
             "successful_rounds": 0,
             "queries_used": queries_used,
             "coverage": [],
+            "evidence_provenance": evidence_provenance,
         }
 
     coverage_list = sorted(coverage_hits)
+    evidence_provenance = _merge_p7_evidence_provenance(round_evidence_records)
+    evidence_provenance["rounds"] = round_evidence_records
+    evidence_boundary = build_p7_evidence_boundary(evidence_provenance)
     header_lines = [
         f"{P7_TOPIC_PREFIX}{topic}",
         "",
@@ -992,9 +1163,10 @@ def iterative_deep_search(
         f"> Rounds executed: {len(round_sections)}/{rounds}",
         f"> Stop reason: {stop_reason}",
         f"> Coverage: {', '.join(coverage_list) if coverage_list else 'none'}",
-        "",
-        "\n\n".join(round_sections),
     ]
+    if evidence_boundary:
+        header_lines.append(f"> {evidence_boundary}")
+    header_lines.extend(["", "\n\n".join(round_sections)])
     return {
         "topic": topic,
         "text": "\n".join(header_lines).strip(),
@@ -1004,6 +1176,7 @@ def iterative_deep_search(
         "successful_rounds": len(successful_texts),
         "queries_used": queries_used,
         "coverage": coverage_list,
+        "evidence_provenance": evidence_provenance,
     }
 
 
@@ -1021,6 +1194,7 @@ def run_deep_research(plan: dict[str, object]) -> dict[str, object]:
             "goal": plan.get("goal", ""),
             "triggers": list(plan.get("triggers") or []),
             "topic_results": [],
+            "evidence_provenance": {},
         }
 
     rounds = int(plan.get("max_rounds") or 0) or 2
@@ -1028,6 +1202,7 @@ def run_deep_research(plan: dict[str, object]) -> dict[str, object]:
     goal = str(plan.get("goal") or "")
 
     topic_results: list[dict[str, object]] = []
+    topic_evidence_records: list[dict[str, object]] = []
     all_sections: list[str] = []
     rejected_identity_lines_removed = 0
     max_workers = min(3, len(topics))
@@ -1058,6 +1233,25 @@ def run_deep_research(plan: dict[str, object]) -> dict[str, object]:
                     "queries_used": [],
                     "coverage": [],
                 }
+            topic_provenance = normalize_p7_evidence_provenance(
+                result.get("evidence_provenance")
+            )
+            if not topic_provenance:
+                topic_provenance = _empty_p7_evidence_provenance()
+            result["evidence_provenance"] = topic_provenance
+            topic_evidence_record = {
+                "topic": str(result.get("topic") or topic),
+                "status": str(result.get("status") or ""),
+                **{
+                    key: value
+                    for key, value in topic_provenance.items()
+                    if key != "rounds"
+                },
+            }
+            topic_rounds = topic_provenance.get("rounds")
+            if isinstance(topic_rounds, list):
+                topic_evidence_record["rounds"] = topic_rounds
+            topic_evidence_records.append(topic_evidence_record)
             topic_results.append(result)
             if result.get("text"):
                 filtered_text, removed_count = filter_rejected_stock_lines(
@@ -1071,6 +1265,13 @@ def run_deep_research(plan: dict[str, object]) -> dict[str, object]:
                     all_sections.append(filtered_text)
 
     combined = "\n\n".join(all_sections).strip()
+    aggregate_evidence_provenance = _merge_p7_evidence_provenance(
+        [item.get("evidence_provenance") for item in topic_results]
+    )
+    aggregate_evidence_provenance["topics"] = topic_evidence_records
+    aggregate_evidence_boundary = build_p7_evidence_boundary(aggregate_evidence_provenance)
+    if combined and aggregate_evidence_boundary:
+        combined = f"> {aggregate_evidence_boundary}\n\n{combined}"
     topic_statuses = [str(item.get("status") or "") for item in topic_results]
     if combined:
         aggregate_status = "completed"
@@ -1091,4 +1292,5 @@ def run_deep_research(plan: dict[str, object]) -> dict[str, object]:
         "skipped_recent_topics": list(plan.get("skipped_recent_topics") or []),
         "rejected_target_names": rejected_names,
         "rejected_identity_lines_removed": rejected_identity_lines_removed,
+        "evidence_provenance": aggregate_evidence_provenance,
     }

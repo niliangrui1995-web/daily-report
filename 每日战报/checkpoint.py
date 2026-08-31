@@ -18,6 +18,7 @@ FALLBACK_PATTERNS: dict[str, tuple[str, ...]] = {
     "p8": ("P8_技术面_*.md",),
     "p7a": ("P7a_深研审计_*.md",),
     "p7": ("P7_深度研究_*.md",),
+    "p7_evidence": ("P7_证据元数据_*.json",),
     "p75": ("P7.5_补充审计_*.md",),
     "p75_raw": ("P7.5_补充搜索原始数据_*.md",),
     "p6": ("P6_映射_*.md",),
@@ -249,6 +250,8 @@ def _drop_stale_downstream_files(
     for file_key, stale in (("p7", p7_stale), ("p75", p75_stale), ("p7a", p7a_stale)):
         if stale:
             files.pop(file_key, None)
+            if file_key == "p7":
+                files.pop("p7_evidence", None)
 
     if p6_dependency_stale or (files.get("p8") and is_older_than_any(files, "p8", ("p6",))):
         files.pop("p8", None)
@@ -1075,6 +1078,8 @@ def _prepare_stage_assessments(
             | VALID_PASSTHROUGH_STATUSES.get(stage_name, frozenset())
         ):
             files.pop(stage_name, None)
+            if stage_name == "p7":
+                files.pop("p7_evidence", None)
     _drop_stale_downstream_files(files, p6_input_hashes)
     stage_names = ("p1", "p2", "p3", "p4", "p5", "p6", "p7", "p7a", "p75", "p9", "roi")
     assessments = {
@@ -1153,7 +1158,7 @@ def _prepare_stage_assessments(
         "p4": ("p4",),
         "p5": ("p5",),
         "p6": ("p6",),
-        "p7": ("p7",),
+        "p7": ("p7", "p7_evidence"),
         "p7a": ("p7a",),
         "p75": ("p75", "p75_raw"),
         "p9": ("war_report",),
@@ -1171,12 +1176,12 @@ def _prepare_stage_assessments(
             files.pop(file_key, None)
 
     downstream_by_stage = {
-        "p1": ("p5", "p6", "p7", "p7a", "p75", "p75_raw", "p8", "war_report", "roi_md", "roi_json"),
-        "p2": ("p6", "p7", "p7a", "p75", "p75_raw", "p8", "war_report", "roi_md", "roi_json"),
-        "p3": ("p6", "p7", "p7a", "p75", "p75_raw", "p8", "war_report", "roi_md", "roi_json"),
-        "p4": ("p6", "p7", "p7a", "p75", "p75_raw", "p8", "war_report", "roi_md", "roi_json"),
-        "p5": ("p6", "p7", "p7a", "p75", "p75_raw", "p8", "war_report", "roi_md", "roi_json"),
-        "p6": ("p7", "p7a", "p75", "p75_raw", "p8", "war_report", "roi_md", "roi_json"),
+        "p1": ("p5", "p6", "p7", "p7_evidence", "p7a", "p75", "p75_raw", "p8", "war_report", "roi_md", "roi_json"),
+        "p2": ("p6", "p7", "p7_evidence", "p7a", "p75", "p75_raw", "p8", "war_report", "roi_md", "roi_json"),
+        "p3": ("p6", "p7", "p7_evidence", "p7a", "p75", "p75_raw", "p8", "war_report", "roi_md", "roi_json"),
+        "p4": ("p6", "p7", "p7_evidence", "p7a", "p75", "p75_raw", "p8", "war_report", "roi_md", "roi_json"),
+        "p5": ("p6", "p7", "p7_evidence", "p7a", "p75", "p75_raw", "p8", "war_report", "roi_md", "roi_json"),
+        "p6": ("p7", "p7_evidence", "p7a", "p75", "p75_raw", "p8", "war_report", "roi_md", "roi_json"),
         "p7": ("p7a", "war_report", "roi_md", "roi_json"),
         "p7a": ("war_report", "roi_md", "roi_json"),
         "p75": ("war_report", "roi_md", "roi_json"),
@@ -1368,6 +1373,7 @@ def _load_files_from_manifest(ckpt: dict, manifest: dict) -> None:
     _store("p5", "p5", "md", require_nonempty=True)
     _store("p6", "p6", "md", require_nonempty=True)
     _store("p7", "p7", "md", require_nonempty=True)
+    _store("p7", "p7_evidence", "evidence", require_nonempty=True)
     _store("p7a", "p7a", "md", require_nonempty=True)
     _store("p75", "p75", "md", require_nonempty=True)
     _store("p75", "p75_raw", "raw", require_nonempty=True)

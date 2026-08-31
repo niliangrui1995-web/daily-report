@@ -15,10 +15,12 @@ P5 / P7a / P7.5 审计层 — Sonnet/GPT-5.6 Sol/Gemini 独立审计引擎。
 
 import json
 import logging
+import re
 import time
 from datetime import datetime
 
 from artifact_store import update_run_manifest, write_json_artifact, write_text_artifact
+from p7_deep_research import build_p7_evidence_boundary, normalize_p7_evidence_provenance
 from settings import get_audit_fallback_adapter, pro_adapter, require_prompt
 from semantic_output import is_no_evidence_text
 from industry_dict import ALL_OLIGARCHS_FLAT
@@ -49,6 +51,141 @@ AUDIT_SEMANTIC_RETRY_REASONS = frozenset(
         'deleted_items_without_count',
     }
 )
+P7A_STRUCTURED_DEGRADED_MARKER = '【P7a结构化降级】'
+_P7A_MARKDOWN_TOPIC_PATTERN = re.compile(r'^##\s*主题\s*\d+\s*[:：]\s*(.+?)\s*$', re.MULTILINE)
+
+
+def _extract_p7a_markdown_topics(markdown_text: str) -> list[str]:
+    """Return ordered P7a topic names from the required Markdown headings."""
+    return [
+        match.group(1).strip()
+        for match in _P7A_MARKDOWN_TOPIC_PATTERN.finditer(markdown_text or '')
+        if match.group(1).strip()
+    ]
+
+
+def _normalize_p7a_topic_label(value: object) -> str:
+    """Normalize only presentation punctuation for JSON/Markdown topic matching."""
+    return re.sub(r'[\s\W_]+', '', str(value or ''), flags=re.UNICODE)
+
+
+def _p7a_topics_match_markdown(json_data: object, markdown_topics: list[str]) -> bool:
+    if not isinstance(json_data, dict) or not isinstance(json_data.get('topics'), list):
+        return False
+    json_topics = json_data['topics']
+    if not markdown_topics:
+        return not json_topics
+    if len(json_topics) != len(markdown_topics):
+        return False
+
+    for json_topic, markdown_topic in zip(json_topics, markdown_topics):
+        if not isinstance(json_topic, dict):
+            return False
+        json_label = json_topic.get('name') or json_topic.get('title')
+        if _normalize_p7a_topic_label(json_label) != _normalize_p7a_topic_label(markdown_topic):
+            return False
+    return True
+
+
+def _build_p7a_markdown_derived_summary(
+    markdown_text: str,
+    *,
+    input_chars: int,
+    degrade_reason: str,
+    parse_error: str = '',
+    raw_json_attempt: str = '',
+) -> dict:
+    """Keep only Markdown-derived facts when P7a JSON cannot be trusted."""
+    topic_names = _extract_p7a_markdown_topics(markdown_text)
+    meta = {
+        'input_chars': input_chars,
+        'output_chars': len(markdown_text),
+        'topics_count': len(topic_names),
+        'structured_degraded': True,
+        'degrade_reason': degrade_reason,
+        'structured_source': 'markdown_derived',
+    }
+    if parse_error:
+        meta['parse_error'] = parse_error[:500]
+
+    summary = {
+        'meta': meta,
+        'topics': [
+            {
+                'name': name,
+                'structured_source': 'markdown_derived',
+            }
+            for name in topic_names
+        ],
+    }
+    if raw_json_attempt:
+        summary['raw_json_attempt'] = raw_json_attempt[:2000]
+    return summary
+
+
+def _normalize_p7a_structured_meta(
+    json_data: dict,
+    *,
+    input_chars: int,
+    output_chars: int,
+    structured_source: str,
+    structured_repaired: bool = False,
+    p7_evidence_provenance: dict | None = None,
+) -> None:
+    """Use local artifact facts instead of model-reported counters."""
+    meta = json_data.get('meta')
+    if not isinstance(meta, dict):
+        meta = {}
+        json_data['meta'] = meta
+    topics = json_data.get('topics')
+    meta.update(
+        {
+            'input_chars': input_chars,
+            'output_chars': output_chars,
+            'topics_count': len(topics) if isinstance(topics, list) else 0,
+            'structured_source': structured_source,
+        }
+    )
+    if structured_repaired:
+        meta['structured_repaired'] = True
+    if p7_evidence_provenance:
+        meta['p7_evidence_provenance'] = p7_evidence_provenance
+
+
+def _prepend_p7_evidence_boundary(markdown_text: str, boundary: str) -> str:
+    """Keep the P7 evidence boundary visible in every P7a handoff path."""
+    if not boundary or boundary in markdown_text:
+        return markdown_text
+    return f'> {boundary}\n\n{markdown_text}'
+
+
+def _p7a_structured_degradation_banner(topic_count: int, degrade_reason: str) -> str:
+    if degrade_reason.startswith('json_parse_failed'):
+        reason = 'JSON 解析失败'
+    elif degrade_reason.startswith('missing_markdown_separator'):
+        reason = '缺少 JSON/Markdown 分隔符'
+    else:
+        reason = 'JSON 与 Markdown 主题不一致'
+    return (
+        f'> {P7A_STRUCTURED_DEGRADED_MARKER}{reason}；以下 Markdown 审计正文仍可读，'
+        f'结构化摘要仅按 Markdown 派生了 {topic_count} 个主题标题。'
+        'P9 不得将本段视为完整结构化审计或独立硬证据。\n\n'
+    )
+
+
+def _p7a_invalid_passthrough(
+    raw_deep_research: str,
+    *,
+    reason: str,
+    p7_evidence_boundary: str,
+) -> str:
+    """Mark an unusable P7a result before preserving the original P7 material."""
+    banner = (
+        f'> {P7A_STRUCTURED_DEGRADED_MARKER}{reason}；未获得可用 P7a Markdown 审计正文，'
+        '以下为未经 P7a 审计的原始 P7 透传。'
+        'P9 不得将 P7/P7a 作为独立硬证据或据此提高置信度。\n\n'
+    )
+    return banner + _prepend_p7_evidence_boundary(raw_deep_research, p7_evidence_boundary)
 
 
 class _AuditSemanticError(ValueError):
@@ -431,6 +568,7 @@ def p7a_deep_research_audit(
     raw_deep_research: str,
     *,
     rejected_target_names: list[str] | None = None,
+    p7_evidence_provenance: dict | None = None,
 ) -> str:
     """P7a 深度研究审计 — 对 P7 原始搜索数据做去重、降噪、结构化汇总。
 
@@ -445,6 +583,17 @@ def p7a_deep_research_audit(
     Returns:
         str: 审计汇总后的 Markdown 报告（纯文本，不含 JSON）
     """
+    p7_evidence = normalize_p7_evidence_provenance(p7_evidence_provenance)
+    if (
+        p7_evidence
+        and isinstance(p7_evidence_provenance, dict)
+        and isinstance(p7_evidence_provenance.get('topics'), list)
+    ):
+        p7_evidence['topics'] = p7_evidence_provenance['topics']
+    p7_evidence_boundary = build_p7_evidence_boundary(p7_evidence)
+    p7_evidence_metrics = (
+        {'p7_evidence_provenance': p7_evidence} if p7_evidence else {}
+    )
     rejected_names = normalize_rejected_stock_names(rejected_target_names)
     raw_deep_research, input_identity_lines_removed = filter_rejected_stock_lines(
         raw_deep_research,
@@ -460,9 +609,16 @@ def p7a_deep_research_audit(
         update_run_manifest(
             'p7a',
             status='skipped_short_input',
-            metrics={'input_chars': len(raw_deep_research or ''), **input_identity_metrics},
+            metrics={
+                'input_chars': len(raw_deep_research or ''),
+                **input_identity_metrics,
+                **p7_evidence_metrics,
+            },
         )
-        return raw_deep_research or ''
+        return _prepend_p7_evidence_boundary(
+            raw_deep_research or '',
+            p7_evidence_boundary,
+        )
 
     logging.info(f'[P7a 审计] 启动 Gemini Pro 深度研究审计（{len(raw_deep_research)} 字输入）')
 
@@ -476,15 +632,39 @@ def p7a_deep_research_audit(
         update_run_manifest(
             'p7a',
             status='failed_missing_prompt',
-            metrics={'input_chars': len(raw_deep_research), 'error': str(e), **input_identity_metrics},
+            metrics={
+                'input_chars': len(raw_deep_research),
+                'error': str(e),
+                'structured_degraded': True,
+                'data_state': 'invalid',
+                'degrade_reason': 'missing_p7a_prompt',
+                **input_identity_metrics,
+                **p7_evidence_metrics,
+            },
         )
-        return raw_deep_research
+        return _p7a_invalid_passthrough(
+            raw_deep_research,
+            reason='P7a 审计提示词不可用',
+            p7_evidence_boundary=p7_evidence_boundary,
+        )
 
     prompt = prompt_template.format(
         today_str=today_str,
         vanguard_list=vanguard_list,
         raw_deep_research=raw_deep_research,
+        p7_evidence_boundary=p7_evidence_boundary,
     )
+    if p7_evidence_boundary:
+        p7_guardrail = (
+            '【P7 证据层级（系统强制）】\n'
+            f'{p7_evidence_boundary}'
+        )
+        if p7_evidence.get('evidence_tier') == 'summary_lead_pending_verification':
+            p7_guardrail += (
+                '\n本轮一手源为 0。不得将具体订单、报价、量产或公司归因升格为硬证据；'
+                '此类内容必须明确标为“摘要线索待核验”或删除。'
+            )
+        prompt = f'{p7_guardrail}\n\n{prompt}'
     identity_guardrail = build_rejected_stock_guardrail(rejected_names)
     if identity_guardrail:
         prompt = f'{identity_guardrail}\n\n{prompt}'
@@ -503,9 +683,21 @@ def p7a_deep_research_audit(
         update_run_manifest(
             'p7a',
             status='failed_invoke',
-            metrics={'input_chars': len(raw_deep_research), 'error': str(e), **input_identity_metrics},
+            metrics={
+                'input_chars': len(raw_deep_research),
+                'error': str(e),
+                'structured_degraded': True,
+                'data_state': 'invalid',
+                'degrade_reason': 'p7a_invoke_failed',
+                **input_identity_metrics,
+                **p7_evidence_metrics,
+            },
         )
-        return raw_deep_research
+        return _p7a_invalid_passthrough(
+            raw_deep_research,
+            reason='P7a 审计调用失败',
+            p7_evidence_boundary=p7_evidence_boundary,
+        )
 
     elapsed = time.time() - t0
     raw_content = resp.content if resp.content else ''
@@ -527,55 +719,69 @@ def p7a_deep_research_audit(
         update_run_manifest(
             'p7a',
             status='failed_empty_output',
-            metrics=failure_metrics,
+            metrics={
+                **failure_metrics,
+                'structured_degraded': True,
+                'data_state': 'invalid',
+                'degrade_reason': 'empty_p7a_output',
+                **p7_evidence_metrics,
+            },
         )
-        return raw_deep_research
+        return _p7a_invalid_passthrough(
+            raw_deep_research,
+            reason='P7a 审计返回空结果或过短',
+            p7_evidence_boundary=p7_evidence_boundary,
+        )
 
     # Why: P7a prompt 要求按 `===MARKDOWN===` 分隔符输出 JSON + Markdown 双轨数据
     #       解析这个分隔符，分别落盘 .json 和 .md 文件
     file_prefix = 'P7a_深研审计'
 
     json_data = None
-    markdown_text = raw_content  # 默认整体作为 Markdown（降级兜底）
+    markdown_text = raw_content
     structured_degraded = False
-    degrade_reason = ""
+    structured_repaired = False
+    needs_markdown_derived_summary = False
+    degrade_reason = ''
+    parse_error = ''
+    json_part = ''
     has_markdown_separator = '===MARKDOWN===' in raw_content
 
     if has_markdown_separator:
         parts = raw_content.split('===MARKDOWN===', 1)
         json_part = parts[0].strip()
-        markdown_part = parts[1].strip() if len(parts) > 1 else ''
+        # Keep model Markdown byte-for-byte after the separator; semantic checks
+        # below use a stripped view, while callers receive the original body.
+        markdown_text = parts[1].lstrip() if len(parts) > 1 else ''
 
-        # Why: JSON 部分可能被模型包在 ```json``` 代码块里，需要剥离
-        json_part = json_part.strip('`').strip()
-        if json_part.startswith('json'):
-            json_part = json_part[4:].strip()
-
+        # Why: strict parsing is preferred; only this P7a path may retry the
+        # existing local repair for LLM fences and unescaped inner quotes.
         try:
             json_data = extract_json_from_llm_response(json_part, expect_type='dict')
             logging.info('[P7a 审计] 成功解析 JSON 结构化数据')
-        except Exception as e:
-            logging.warning(f'⚠️ [P7a 审计] JSON 解析失败（不影响 Markdown 输出）: {e}')
-            structured_degraded = True
-            degrade_reason = f'json_parse_failed: {e}'
-            # Why: JSON 解析失败时仍尝试手动构建基本结构
-            json_data = {
-                'meta': {
-                    'input_chars': len(raw_deep_research),
-                    'output_chars': len(markdown_part) if markdown_part else len(raw_content),
-                    'parse_error': str(e),
-                },
-                'raw_json_attempt': json_part[:2000],
-            }
-
-        markdown_text = markdown_part
+        except Exception as strict_error:
+            try:
+                json_data = extract_json_from_llm_response(
+                    json_part,
+                    expect_type='dict',
+                    allow_partial=True,
+                )
+                structured_repaired = True
+                logging.info('[P7a 审计] 已局部修复 JSON 结构化数据')
+            except Exception as repair_error:
+                parse_error = str(repair_error or strict_error)
+                logging.warning(f'⚠️ [P7a 审计] JSON 解析失败（不影响 Markdown 输出）: {parse_error}')
+                structured_degraded = True
+                needs_markdown_derived_summary = True
+                degrade_reason = f'json_parse_failed: {parse_error}'
     else:
-        logging.warning('[P7a 审计] 响应中未找到 ===MARKDOWN=== 分隔符，整体作为 Markdown 处理')
+        logging.warning('[P7a 审计] 响应中未找到 ===MARKDOWN=== 分隔符，等待 Markdown 结构校验')
         structured_degraded = True
+        needs_markdown_derived_summary = True
         degrade_reason = 'missing_markdown_separator'
 
     json_identity_items_removed = 0
-    if json_data:
+    if json_data is not None:
         json_data, json_identity_items_removed = filter_rejected_stock_tree(
             json_data,
             rejected_names,
@@ -595,14 +801,6 @@ def p7a_deep_research_audit(
             rejected_identity_items_removed,
         )
 
-    json_path = ''
-    if json_data:
-        try:
-            json_path = write_json_artifact(file_prefix, json_data)
-            logging.info(f'💾 [P7a 审计] JSON 数据已落盘: {json_path}')
-        except Exception as e:
-            logging.warning(f'⚠️ [P7a 审计] JSON 落盘失败: {e}')
-
     normalized_markdown = markdown_text.strip()
     filtered_to_empty = bool(not normalized_markdown and output_identity_lines_removed)
     semantic_no_results = bool(
@@ -614,7 +812,69 @@ def p7a_deep_research_audit(
         and normalized_markdown.startswith(('{', '['))
         and normalized_markdown.endswith(('}', ']'))
     )
+
+    markdown_topics = _extract_p7a_markdown_topics(markdown_text)
+    structured_topics_mismatch = False
+    # An empty Markdown section is handled below as semantic failure, but the
+    # parsed JSON remains a useful diagnostic artifact for that failure path.
+    if (
+        json_data is not None
+        and normalized_markdown
+        and not _p7a_topics_match_markdown(json_data, markdown_topics)
+    ):
+        json_topics = json_data.get('topics') if isinstance(json_data, dict) else None
+        json_topic_count = len(json_topics) if isinstance(json_topics, list) else 'invalid'
+        structured_degraded = True
+        structured_repaired = False
+        needs_markdown_derived_summary = True
+        structured_topics_mismatch = True
+        degrade_reason = (
+            'structured_topics_mismatch: '
+            f'json={json_topic_count}, markdown={len(markdown_topics)}'
+        )
+        logging.warning('[P7a 审计] JSON 与 Markdown 主题不一致，改用 Markdown 派生摘要')
+        json_data = None
+
+    json_path = ''
+    if semantic_no_results and structured_topics_mismatch:
+        reason = 'structured_topics_mismatch_no_evidence'
+        update_run_manifest(
+            'p7a',
+            status='failed_semantic_output',
+            metrics={
+                'input_chars': len(raw_deep_research),
+                'output_chars': 0,
+                'data_state': 'invalid',
+                'semantic_error': reason,
+                'structured_degraded': True,
+                'degrade_reason': degrade_reason,
+                'rejected_target_names': rejected_names,
+                'rejected_identity_items_removed': rejected_identity_items_removed,
+                **fallback_metrics,
+                **p7_evidence_metrics,
+            },
+        )
+        logging.warning('[P7a 审计] 无结果 Markdown 与非空 JSON 不一致，当前运行降级透传原始 P7')
+        return _p7a_invalid_passthrough(
+            raw_deep_research,
+            reason='JSON 与无结果 Markdown 不一致',
+            p7_evidence_boundary=p7_evidence_boundary,
+        )
     if semantic_no_results:
+        if json_data is not None:
+            _normalize_p7a_structured_meta(
+                json_data,
+                input_chars=len(raw_deep_research),
+                output_chars=len(markdown_text),
+                structured_source='model_json',
+                structured_repaired=structured_repaired,
+                p7_evidence_provenance=p7_evidence,
+            )
+            try:
+                json_path = write_json_artifact(file_prefix, json_data)
+                logging.info(f'💾 [P7a 审计] JSON 数据已落盘: {json_path}')
+            except Exception as e:
+                logging.warning(f'⚠️ [P7a 审计] JSON 落盘失败: {e}')
         update_run_manifest(
             'p7a',
             status='completed_no_results',
@@ -626,12 +886,27 @@ def p7a_deep_research_audit(
                 'rejected_target_names': rejected_names,
                 'rejected_identity_items_removed': rejected_identity_items_removed,
                 **fallback_metrics,
+                **p7_evidence_metrics,
             },
         )
         logging.info('[P7a 审计] 审计后无可用证据，记录合法空结果')
         return ''
     if not normalized_markdown or looks_like_json_only:
         reason = 'json_without_markdown' if looks_like_json_only else 'empty_markdown_output'
+        if json_data is not None:
+            _normalize_p7a_structured_meta(
+                json_data,
+                input_chars=len(raw_deep_research),
+                output_chars=len(markdown_text),
+                structured_source='model_json',
+                structured_repaired=structured_repaired,
+                p7_evidence_provenance=p7_evidence,
+            )
+            try:
+                json_path = write_json_artifact(file_prefix, json_data)
+                logging.info(f'💾 [P7a 审计] JSON 数据已落盘: {json_path}')
+            except Exception as e:
+                logging.warning(f'⚠️ [P7a 审计] JSON 落盘失败: {e}')
         update_run_manifest(
             'p7a',
             status='failed_semantic_output',
@@ -641,13 +916,78 @@ def p7a_deep_research_audit(
                 'output_chars': 0,
                 'data_state': 'invalid',
                 'semantic_error': reason,
+                'structured_degraded': True,
+                'degrade_reason': reason,
                 'rejected_target_names': rejected_names,
                 'rejected_identity_items_removed': rejected_identity_items_removed,
                 **fallback_metrics,
+                **p7_evidence_metrics,
             },
         )
         logging.warning('[P7a 审计] %s，当前运行降级透传原始 P7', reason)
-        return raw_deep_research
+        return _p7a_invalid_passthrough(
+            raw_deep_research,
+            reason='未返回可用 Markdown 审计正文',
+            p7_evidence_boundary=p7_evidence_boundary,
+        )
+    if not markdown_topics:
+        update_run_manifest(
+            'p7a',
+            status='failed_semantic_output',
+            metrics={
+                'input_chars': len(raw_deep_research),
+                'output_chars': 0,
+                'data_state': 'invalid',
+                'semantic_error': 'missing_usable_p7a_markdown',
+                'structured_degraded': True,
+                'degrade_reason': 'missing_usable_p7a_markdown',
+                'rejected_target_names': rejected_names,
+                'rejected_identity_items_removed': rejected_identity_items_removed,
+                **fallback_metrics,
+                **p7_evidence_metrics,
+            },
+        )
+        logging.warning('[P7a 审计] Markdown 缺少可用主题结构，当前运行降级透传原始 P7')
+        return _p7a_invalid_passthrough(
+            raw_deep_research,
+            reason='Markdown 缺少可用主题结构',
+            p7_evidence_boundary=p7_evidence_boundary,
+        )
+
+    if needs_markdown_derived_summary:
+        json_data = _build_p7a_markdown_derived_summary(
+            markdown_text,
+            input_chars=len(raw_deep_research),
+            degrade_reason=degrade_reason or 'structured_json_unavailable',
+            parse_error=parse_error,
+            # A parsed-but-inconsistent JSON object has no need to retain its
+            # original body in the fallback artifact; keep raw text only for
+            # a genuine parse diagnostic.
+            raw_json_attempt=json_part if parse_error else '',
+        )
+        markdown_text = _p7a_structured_degradation_banner(
+            len(markdown_topics),
+            degrade_reason or 'structured_json_unavailable',
+        ) + markdown_text
+
+    markdown_text = _prepend_p7_evidence_boundary(
+        markdown_text,
+        p7_evidence_boundary,
+    )
+
+    _normalize_p7a_structured_meta(
+        json_data,
+        input_chars=len(raw_deep_research),
+        output_chars=len(markdown_text),
+        structured_source='markdown_derived' if structured_degraded else 'model_json',
+        structured_repaired=structured_repaired,
+        p7_evidence_provenance=p7_evidence,
+    )
+    try:
+        json_path = write_json_artifact(file_prefix, json_data)
+        logging.info(f'💾 [P7a 审计] JSON 数据已落盘: {json_path}')
+    except Exception as e:
+        logging.warning(f'⚠️ [P7a 审计] JSON 落盘失败: {e}')
 
     md_body = (
         '# P7a 深度研究审计报告\n\n'
@@ -678,10 +1018,13 @@ def p7a_deep_research_audit(
         'rejected_target_names': rejected_names,
         'rejected_identity_items_removed': rejected_identity_items_removed,
         **fallback_metrics,
+        **p7_evidence_metrics,
     }
     if structured_degraded:
         manifest_metrics['structured_degraded'] = True
         manifest_metrics['degrade_reason'] = degrade_reason or 'structured_json_unavailable'
+        manifest_metrics['data_state'] = 'markdown_derived_degraded'
+        manifest_metrics['structured_source'] = 'markdown_derived'
         if isinstance(json_data, dict):
             meta = json_data.get('meta', {})
             if isinstance(meta, dict) and meta.get('parse_error'):
@@ -689,6 +1032,9 @@ def p7a_deep_research_audit(
             raw_attempt = json_data.get('raw_json_attempt')
             if raw_attempt:
                 manifest_metrics['raw_json_attempt_chars'] = len(str(raw_attempt))
+    elif structured_repaired:
+        manifest_metrics['structured_repaired'] = True
+        manifest_metrics['structured_source'] = 'model_json_repaired'
     update_run_manifest(
         'p7a',
         status=manifest_status,

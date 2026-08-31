@@ -1335,6 +1335,79 @@ def test_research_p7_only_path_skips_supplement_and_omits_missing_plan_file(monk
     assert context["p7a_audited"] == "short research"
 
 
+@pytest.mark.parametrize(
+    ("primary_source_count", "expected_tier"),
+    [
+        (0, "summary_lead_pending_verification"),
+        (1, "primary_source_backed"),
+    ],
+)
+def test_research_persists_p7_topic_and_aggregate_evidence_artifact(
+    monkeypatch,
+    primary_source_count,
+    expected_tier,
+):
+    plan = {
+        "goal": "goal",
+        "triggers": [],
+        "supplement_queries": [],
+        "should_run_p7": True,
+        "should_run_p75": False,
+    }
+    topic_provenance = {
+        "topic": "示例主题",
+        "primary_source_count": primary_source_count,
+        "summary_source_count": 2,
+        "source_url_count": 3,
+        "evidence_tier": expected_tier,
+    }
+    aggregate_provenance = {
+        "primary_source_count": primary_source_count,
+        "summary_source_count": 2,
+        "source_url_count": 3,
+        "evidence_tier": expected_tier,
+        "topics": [topic_provenance],
+    }
+    json_writes = []
+    p7a_calls = []
+    updates = []
+
+    monkeypatch.setattr(orchestrator, "build_research_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(orchestrator, "_context_p6_input_sha256", lambda _context: "")
+    monkeypatch.setattr(
+        orchestrator,
+        "run_deep_research",
+        lambda _plan: {
+            "text": "P7 research " * 30,
+            "evidence_provenance": aggregate_provenance,
+            "rejected_identity_lines_removed": 0,
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "write_json_artifact",
+        lambda prefix, data, **_kwargs: json_writes.append((prefix, data)) or f"{prefix}.json",
+    )
+    monkeypatch.setattr(orchestrator, "write_text_artifact", lambda prefix, *_args, **_kwargs: f"{prefix}.md")
+    monkeypatch.setattr(
+        orchestrator,
+        "p7a_deep_research_audit",
+        lambda _text, **kwargs: p7a_calls.append(kwargs) or "audited P7",
+    )
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda stage, **kwargs: updates.append((stage, kwargs)))
+    context = _research_context()
+
+    orchestrator._stage_research(context)
+
+    evidence_payload = next(data for prefix, data in json_writes if prefix == "P7_证据元数据")
+    assert evidence_payload["aggregate"]["evidence_tier"] == expected_tier
+    assert evidence_payload["topics"] == [topic_provenance]
+    assert context["p7_evidence_provenance"]["topics"] == [topic_provenance]
+    assert p7a_calls[-1]["p7_evidence_provenance"]["topics"] == [topic_provenance]
+    p7_update = next(payload for stage, payload in updates if stage == "p7")
+    assert p7_update["files"]["evidence"] == "P7_证据元数据.json"
+
+
 def test_research_resume_reuses_both_optional_layers(monkeypatch):
     plan = {
         "goal": "goal",
@@ -1535,7 +1608,11 @@ def test_research_resume_reuses_short_p7a_passthrough(monkeypatch):
             "p6_metrics": {},
             "stage_assessments": {
                 "p7": {"state": "valid", "reusable": True},
-                "p7a": {"state": "valid_passthrough", "reusable": True},
+                "p7a": {
+                    "state": "valid_passthrough",
+                    "status": "skipped_short_input",
+                    "reusable": True,
+                },
             },
         },
     )
@@ -1543,6 +1620,48 @@ def test_research_resume_reuses_short_p7a_passthrough(monkeypatch):
     orchestrator._stage_research(context)
 
     assert context["p7a_audited"] == raw_research
+
+
+def test_research_resume_marks_failed_p7a_passthrough(monkeypatch):
+    plan = {
+        "goal": "goal",
+        "triggers": [],
+        "supplement_queries": [],
+        "should_run_p7": False,
+        "should_run_p75": False,
+    }
+    monkeypatch.setattr(orchestrator, "build_research_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(orchestrator, "write_json_artifact", lambda *_args: "plan.json")
+    monkeypatch.setattr(orchestrator, "write_text_artifact", lambda *_args: "p7.md")
+    monkeypatch.setattr(orchestrator, "_context_p6_input_sha256", lambda _context: "hash")
+    monkeypatch.setattr(orchestrator, "update_run_manifest", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "p7a_deep_research_audit",
+        lambda *_args, **_kwargs: pytest.fail("failed P7a passthrough must not be rerun on resume"),
+    )
+    raw_research = "research evidence " * 20
+    context = _research_context(
+        resume_from="p8_resume",
+        p7_deep=raw_research,
+        ckpt={
+            "files": {"p6": "p6.md", "p7": "p7.md"},
+            "p6_metrics": {},
+            "stage_assessments": {
+                "p7": {"state": "valid", "reusable": True},
+                "p7a": {
+                    "state": "valid_passthrough",
+                    "status": "failed_semantic_output",
+                    "reusable": True,
+                },
+            },
+        },
+    )
+
+    orchestrator._stage_research(context)
+
+    assert context["p7a_audited"].startswith("> 【P7a结构化降级】")
+    assert context["p7a_audited"].endswith(raw_research)
 
 
 def test_research_short_input_records_passthrough_checkpoint(monkeypatch):
@@ -1683,7 +1802,8 @@ def test_research_p7a_failure_passes_through_long_raw_research(monkeypatch):
 
     orchestrator._stage_research(context)
 
-    assert context["p7a_audited"] == raw_research
+    assert context["p7a_audited"].startswith("> 【P7a结构化降级】")
+    assert context["p7a_audited"].endswith(raw_research)
     assert any(stage == "p7a" and payload["status"] == "failed_exception_passthrough" for stage, payload in updates)
 
 

@@ -17,6 +17,7 @@ from artifact_store import (
 )
 from p9_email import SMTPDeliveryAmbiguousError, send_report_via_email
 from p9_rendering import build_degraded_checkpoint_report, build_report_markdown
+from p7_deep_research import build_p7_evidence_boundary, normalize_p7_evidence_provenance
 from semantic_output import is_no_evidence_text
 from settings import EMAIL_ADDRESS, EMAIL_PASSWORD, OPUS_MODEL, RECEIVER_EMAIL, opus_adapter, require_prompt
 from native_llm_adapter import get_model_provenance
@@ -37,6 +38,13 @@ _HARD_EVIDENCE_LAYERS = {"P4", "P5", "P6", "P7", "P7A", "P8"}
 _SOFT_EVIDENCE_LAYERS = {"P2", "P3", "P7.5"}
 _PRIORITY_RANKS = {"★": 1.0, "★☆☆": 1.5, "★★": 2.0, "★★☆": 2.5, "★★★": 3.0}
 P9_JSON_RETRY_LIMIT = 1
+P7A_STRUCTURED_DEGRADED_MARKER = "【P7a结构化降级】"
+P7_SUMMARY_LEAD_LABEL = "摘要线索待核验"
+_P7_SUMMARY_LEAD_CLAIM_PATTERN = re.compile(
+    r"订单|报价|量产|投产|客户|供应商|供货|中标|定点|导入|认证|公司归因|归因|交付|产能|出货|营收|收入|"
+    r"order|quote|mass\s*production|customer|supplier|attribution",
+    flags=re.IGNORECASE,
+)
 _P9_LOCAL_FALLBACK_FAILURE_CATEGORIES = {
     "empty_response",
     "incomplete_response",
@@ -868,6 +876,93 @@ def _extract_evidence_layers(evidence_refs: Any) -> list[str]:
     return layers
 
 
+def _resolve_p7_evidence_provenance(value: Any) -> dict[str, Any] | None:
+    """Normalize explicit P7 provenance without changing legacy callers that omit it."""
+    if value is None:
+        return None
+    provenance = normalize_p7_evidence_provenance(value)
+    return provenance if isinstance(provenance, dict) and provenance else None
+
+
+def _has_zero_p7_primary_sources(provenance: dict[str, Any] | None) -> bool:
+    if provenance is None:
+        return False
+    try:
+        return int(provenance.get("primary_source_count", 0)) <= 0
+    except (TypeError, ValueError):
+        return True
+
+
+def _p7_evidence_boundary_for_prompt(provenance: dict[str, Any] | None) -> str:
+    if provenance is None:
+        return "（本轮未提供 P7 证据元数据；沿用既有 P7/P7a 层级，不作自动降级。）"
+
+    boundary = str(build_p7_evidence_boundary(provenance) or "").strip()
+    if _has_zero_p7_primary_sources(provenance) and P7_SUMMARY_LEAD_LABEL not in boundary:
+        boundary = f"【{P7_SUMMARY_LEAD_LABEL}】{boundary}".strip()
+    return boundary or "（P7 证据元数据为空；不得将 P7/P7a 自动计入硬证据层。）"
+
+
+def _p7_evidence_metrics(provenance: dict[str, Any] | None) -> dict[str, Any]:
+    if provenance is None:
+        return {}
+    return {"p7_evidence_provenance": provenance}
+
+
+def _append_p7_evidence_boundary(report: str, boundary: str) -> str:
+    """Expose the same P7 boundary in deterministic P9 fallback/manual reports."""
+    if not report or not boundary:
+        return report
+    quoted_boundary = "\n".join(
+        line if line.lstrip().startswith(">") else f"> {line}"
+        for line in boundary.splitlines()
+        if line.strip()
+    )
+    return f"{report.rstrip()}\n\n{quoted_boundary}" if quoted_boundary else report
+
+
+def _has_p7_evidence_ref(evidence_refs: Any) -> bool:
+    return any(layer in {"P7", "P7A"} for layer in _extract_evidence_layers(evidence_refs))
+
+
+def _annotate_p7_summary_leads(data: dict[str, Any]) -> dict[str, int]:
+    """Keep zero-primary P7/P7a references visible as leads, never as hard evidence."""
+    metrics = {
+        "p7_summary_lead_refs_reclassified": 0,
+        "p7_summary_lead_items_labeled": 0,
+        "p7_summary_lead_specific_claims_labeled": 0,
+    }
+    item_sections = (
+        ("core_signals", ("source", "title", "body"), "title"),
+        ("today_advice", ("name", "reason", "strategy"), "reason"),
+    )
+    for section, claim_fields, label_field in item_sections:
+        for item in data.get(section, []) or []:
+            if not isinstance(item, dict) or not _has_p7_evidence_ref(item.get("evidence_refs")):
+                continue
+
+            raw_refs = item.get("evidence_refs")
+            refs = raw_refs if isinstance(raw_refs, list) else [raw_refs]
+            labeled_refs: list[str] = []
+            for ref in refs:
+                ref_text = str(ref or "").strip()
+                if _normalize_layer_tag(ref_text) in {"P7", "P7A"} and P7_SUMMARY_LEAD_LABEL not in ref_text:
+                    ref_text = f"{ref_text}（{P7_SUMMARY_LEAD_LABEL}）"
+                    metrics["p7_summary_lead_refs_reclassified"] += 1
+                if ref_text:
+                    labeled_refs.append(ref_text)
+            item["evidence_refs"] = labeled_refs
+            metrics["p7_summary_lead_items_labeled"] += 1
+
+            claim_text = " ".join(str(item.get(field) or "") for field in claim_fields)
+            if _P7_SUMMARY_LEAD_CLAIM_PATTERN.search(claim_text):
+                current = str(item.get(label_field) or "").strip()
+                if P7_SUMMARY_LEAD_LABEL not in current:
+                    item[label_field] = f"【{P7_SUMMARY_LEAD_LABEL}】{current}".strip()
+                metrics["p7_summary_lead_specific_claims_labeled"] += 1
+    return metrics
+
+
 def _normalize_confidence_value(raw_value: Any) -> float | None:
     if raw_value in (None, ""):
         return None
@@ -931,7 +1026,11 @@ def _downgrade_priority(priority: Any, confidence_cap: float) -> str | Any:
     return priority
 
 
-def _apply_evidence_guardrails(data: dict[str, Any]) -> tuple[dict[str, Any], dict[str, int]]:
+def _apply_evidence_guardrails(
+    data: dict[str, Any],
+    *,
+    excluded_layers: frozenset[str] = frozenset(),
+) -> tuple[dict[str, Any], dict[str, int]]:
     metrics = {
         "confidence_caps_applied": 0,
         "priority_downgrades": 0,
@@ -941,7 +1040,11 @@ def _apply_evidence_guardrails(data: dict[str, Any]) -> tuple[dict[str, Any], di
     for item in data.get("core_signals", []) or []:
         if not isinstance(item, dict):
             continue
-        layers = _extract_evidence_layers(item.get("evidence_refs"))
+        layers = [
+            layer
+            for layer in _extract_evidence_layers(item.get("evidence_refs"))
+            if layer not in excluded_layers
+        ]
         confidence_cap = _confidence_cap_for_layers(layers)
         confidence_value = _normalize_confidence_value(item.get("confidence"))
         if confidence_value is not None:
@@ -958,7 +1061,11 @@ def _apply_evidence_guardrails(data: dict[str, Any]) -> tuple[dict[str, Any], di
     for item in data.get("today_advice", []) or []:
         if not isinstance(item, dict):
             continue
-        layers = _extract_evidence_layers(item.get("evidence_refs"))
+        layers = [
+            layer
+            for layer in _extract_evidence_layers(item.get("evidence_refs"))
+            if layer not in excluded_layers
+        ]
         confidence_cap = _confidence_cap_for_layers(layers)
         confidence_value = _normalize_confidence_value(item.get("confidence"))
         if confidence_value is not None:
@@ -1027,6 +1134,7 @@ def p9_risk_analysis(
     rejected_target_names: list[str] | None = None,
     checkpoint_snapshot: dict[str, Any] | None = None,
     manual_review_required: bool = False,
+    p7_evidence_provenance: dict[str, Any] | None = None,
     _retry_count: int = 0,
 ):
     """
@@ -1047,6 +1155,11 @@ def p9_risk_analysis(
     p3_intel_data = normalize_common_text_mojibake(p3_intel_data or "")
     p4_yfinance = normalize_common_text_mojibake(p4_yfinance or "")
     rejected_names = normalize_rejected_stock_names(rejected_target_names)
+    p7a_structured_degraded = P7A_STRUCTURED_DEGRADED_MARKER in p7_deep
+    resolved_p7_provenance = _resolve_p7_evidence_provenance(p7_evidence_provenance)
+    p7_summary_lead = _has_zero_p7_primary_sources(resolved_p7_provenance)
+    p7_evidence_boundary = _p7_evidence_boundary_for_prompt(resolved_p7_provenance)
+    p7_provenance_metrics = _p7_evidence_metrics(resolved_p7_provenance)
 
     if manual_review_required:
         result = _build_manual_review_report(
@@ -1058,6 +1171,8 @@ def p9_risk_analysis(
             p4_yfinance=p4_yfinance,
             today_str=datetime.now().strftime("%Y年%m月%d日 北京时间%H:%M"),
         )
+        if p7_summary_lead:
+            result = _append_p7_evidence_boundary(result, p7_evidence_boundary)
         update_run_manifest(
             "p9",
             status="local_manual_review_ready",
@@ -1067,6 +1182,7 @@ def p9_risk_analysis(
                 "report_outcome": "manual_review_required",
                 "actionable_items_count": 0,
                 "markdown_chars": len(result),
+                **p7_provenance_metrics,
                 "delivery": {
                     "status": "blocked_pending_review",
                     "mode": "manual_review_required",
@@ -1126,7 +1242,11 @@ def p9_risk_analysis(
         prompt_template = require_prompt("p9_report.txt")
     except FileNotFoundError as exc:
         logging.error("[P9] required prompt is missing: %s", exc)
-        update_run_manifest("p9", status="failed_missing_prompt", metrics={"error": str(exc)})
+        update_run_manifest(
+            "p9",
+            status="failed_missing_prompt",
+            metrics={"error": str(exc), **p7_provenance_metrics},
+        )
         return "", run_ts
 
     prompt = prompt_template.format(
@@ -1139,7 +1259,14 @@ def p9_risk_analysis(
         p2_section=p2_section,
         p3_section=p3_section,
         yfinance_section=yfinance_section,
+        p7_evidence_boundary=p7_evidence_boundary,
     )
+    if p7a_structured_degraded:
+        prompt = (
+            f"{prompt}\n\n"
+            "【P7a结构化降级约束】P7 区域仅保留可读 Markdown，"
+            "不是完整结构化审计；不得将 P7/P7a 作为独立硬证据或据此提高置信度。"
+        )
     identity_guardrail = build_rejected_stock_guardrail(rejected_names)
     if identity_guardrail:
         prompt = f"{identity_guardrail}\n\n{prompt}"
@@ -1210,6 +1337,8 @@ def p9_risk_analysis(
                         validated_checkpoints,
                     )
                 )
+                if p7_summary_lead:
+                    result = _append_p7_evidence_boundary(result, p7_evidence_boundary)
                 if result.strip():
                     logging.warning(
                         "[P9] both models failed; rendered a degraded report from validated P1-P8 checkpoints"
@@ -1235,6 +1364,7 @@ def p9_risk_analysis(
                             "report_outcome": "",
                             "actionable_items_count": 0,
                             "markdown_chars": len(result),
+                            **p7_provenance_metrics,
                         },
                     )
                     return result, run_ts
@@ -1249,6 +1379,7 @@ def p9_risk_analysis(
                 "model_provenance": model_provenance,
                 "schema_validation": {"status": "not_run"},
                 "model_generation": model_generation,
+                **p7_provenance_metrics,
                 "delivery": {
                     "status": "not_generated",
                     "mode": "none",
@@ -1266,11 +1397,19 @@ def p9_risk_analysis(
         generation_tracking_metrics = {
             "schema_validation": schema_validation,
             "model_generation": model_generation,
+            **p7_provenance_metrics,
             "delivery": {
                 "status": "pending",
                 "mode": "model_generated",
             },
         }
+        if p7a_structured_degraded:
+            generation_tracking_metrics.update(
+                {
+                    "upstream_p7a_structured_degraded": True,
+                    "upstream_p7a_evidence_excluded": True,
+                }
+            )
         if schema_validation.get("status") == "repaired":
             logging.warning("[P9] repaired model schema output: %s", schema_validation)
             generation_tracking_metrics.update(
@@ -1280,7 +1419,34 @@ def p9_risk_analysis(
                     "degrade_reason": "p9_schema_repair_drop_invalid_target",
                 }
             )
-        data, guardrail_metrics = _apply_evidence_guardrails(data)
+        excluded_layers = {"P7", "P7A"} if p7a_structured_degraded else set()
+        if p7_summary_lead:
+            excluded_layers.update({"P7", "P7A"})
+            data["_p7_evidence_provenance"] = resolved_p7_provenance
+            data["_p7_evidence_notice"] = p7_evidence_boundary
+            p7_summary_lead_metrics = _annotate_p7_summary_leads(data)
+            generation_tracking_metrics.update(
+                {
+                    "p7_summary_lead_pending_verification": True,
+                    "p7_hard_evidence_excluded": True,
+                }
+            )
+        else:
+            p7_summary_lead_metrics = {
+                "p7_summary_lead_refs_reclassified": 0,
+                "p7_summary_lead_items_labeled": 0,
+                "p7_summary_lead_specific_claims_labeled": 0,
+            }
+            if resolved_p7_provenance is not None:
+                data["_p7_evidence_provenance"] = resolved_p7_provenance
+
+        if excluded_layers:
+            data, guardrail_metrics = _apply_evidence_guardrails(
+                data,
+                excluded_layers=frozenset(excluded_layers),
+            )
+        else:
+            data, guardrail_metrics = _apply_evidence_guardrails(data)
         if any(guardrail_metrics.values()):
             logging.info("[P9] applied evidence guardrails: %s", guardrail_metrics)
         soft_intel_metrics = _backfill_soft_intel_sections(
@@ -1312,6 +1478,7 @@ def p9_risk_analysis(
             "model_provenance": model_provenance,
             **generation_tracking_metrics,
             **guardrail_metrics,
+            **p7_summary_lead_metrics,
             **identity_metrics,
             **code_metrics,
             **soft_intel_metrics,
@@ -1370,6 +1537,7 @@ def p9_risk_analysis(
                     "model_provenance": model_provenance,
                     "schema_validation": {"status": "invalid", "error": str(exc)},
                     "model_generation": model_generation,
+                    **p7_provenance_metrics,
                     "delivery": {
                         "status": "not_generated",
                         "mode": "none",
@@ -1388,6 +1556,7 @@ def p9_risk_analysis(
                 rejected_target_names=rejected_names,
                 checkpoint_snapshot=checkpoint_snapshot,
                 manual_review_required=manual_review_required,
+                p7_evidence_provenance=resolved_p7_provenance,
                 _retry_count=_retry_count + 1,
             )
         update_run_manifest(
@@ -1402,6 +1571,7 @@ def p9_risk_analysis(
                 "model_provenance": model_provenance,
                 "schema_validation": {"status": "invalid", "error": str(exc)},
                 "model_generation": model_generation,
+                **p7_provenance_metrics,
                 "delivery": {
                     "status": "not_generated",
                     "mode": "none",

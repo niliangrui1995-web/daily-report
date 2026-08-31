@@ -159,12 +159,38 @@ def test_p5_audit_repairs_unescaped_inner_quotes_without_retry(monkeypatch):
     assert manifest_updates[-1][1]["metrics"]["retry_count"] == 0
 
 
-def test_p7a_marks_structured_degradation_when_json_parse_fails(monkeypatch):
+def _p7a_markdown_fixture(topic_names: list[str]) -> str:
+    return "\n\n".join(
+        (
+            f"## 主题{index}：{name}\n\n"
+            "### 核心发现\n"
+            f"- {name} 的可核验事实。\n\n"
+            "### 产业链影响推演\n"
+            "- 上游到下游的传导路径。\n\n"
+            "### 数据锚点\n"
+            f"- {index} 个明确数据锚点。"
+        )
+        for index, name in enumerate(topic_names, start=1)
+    )
+
+
+def test_p7a_prompt_requires_raw_json_before_markdown():
+    from pathlib import Path
+
+    prompt = (Path(__file__).resolve().parents[1] / "prompts" / "p7a_audit.txt").read_text(encoding="utf-8")
+
+    assert "按下方“第二部分：Markdown 可读报告”的结构输出精炼报告" in prompt
+    assert "JSON 部分的第一个非空字符必须是 `{`" in prompt
+    assert "不得输出前言、解释文字或代码围栏" in prompt
+    assert "（纯文本 Markdown，不要 JSON）" not in prompt
+
+
+def test_p7a_builds_markdown_derived_summary_when_json_parse_fails(monkeypatch):
     import audit_engine
 
+    topic_names = ["覆铜板涨价", "封装级液冷", "CPO 设备"]
     raw_content = (
-        "not-json\n===MARKDOWN===\n## clean markdown\n"
-        "P7a markdown is usable. " * 8
+        "not-json\n===MARKDOWN===\n" + _p7a_markdown_fixture(topic_names)
     )
     manifest_updates = []
     json_artifacts = []
@@ -191,14 +217,200 @@ def test_p7a_marks_structured_degradation_when_json_parse_fails(monkeypatch):
 
     result = audit_engine.p7a_deep_research_audit("deep research input " * 20)
 
-    assert result.startswith("## clean markdown\nP7a markdown is usable.")
+    assert result.startswith("> 【P7a结构化降级】")
+    assert result.endswith(_p7a_markdown_fixture(topic_names))
     assert json_artifacts[-1][1]["raw_json_attempt"] == "not-json"
+    assert json_artifacts[-1][1]["meta"]["structured_degraded"] is True
+    assert json_artifacts[-1][1]["meta"]["structured_source"] == "markdown_derived"
+    assert [item["name"] for item in json_artifacts[-1][1]["topics"]] == topic_names
     assert text_artifacts[-1][0] == "P7a_深研审计"
     assert manifest_updates[-1][0] == ("p7a",)
     assert manifest_updates[-1][1]["status"] == "completed_structured_degraded"
     assert manifest_updates[-1][1]["metrics"]["structured_degraded"] is True
     assert manifest_updates[-1][1]["metrics"]["degrade_reason"].startswith("json_parse_failed:")
+    assert manifest_updates[-1][1]["metrics"]["data_state"] == "markdown_derived_degraded"
+    assert manifest_updates[-1][1]["metrics"]["topics_count"] == 3
     assert manifest_updates[-1][1]["metrics"]["raw_json_attempt_chars"] == len("not-json")
+
+
+def test_p7a_repairs_fenced_json_with_unescaped_inner_quotes(monkeypatch):
+    import audit_engine
+
+    topic_names = ["覆铜板涨价", "封装级液冷", "CPO 设备"]
+    markdown = _p7a_markdown_fixture(topic_names)
+    raw_content = (
+        "I will provide the requested audit.\n\n"
+        "```json\n"
+        '{"meta":{"input_chars":1,"output_chars":1,"topics_count":3},"topics":['
+        '{"name":"覆铜板涨价","core_findings":["铜箔涨价持续。"]},'
+        '{"name":"封装级液冷","core_findings":["TSMC称"Direct-to-Silicon Liquid Cooling"可降低热阻。"]},'
+        '{"name":"CPO 设备","core_findings":["设备订单仍待核验。"]}]}'
+        "\n```\n===MARKDOWN===\n"
+        + markdown
+    )
+    json_artifacts = []
+    manifest_updates = []
+
+    monkeypatch.setattr(audit_engine, "require_prompt", lambda _name: "{raw_deep_research}")
+    monkeypatch.setattr(
+        audit_engine,
+        "_invoke_audit_with_fallback",
+        lambda *_args, **_kwargs: (
+            SimpleNamespace(content=raw_content, thinking_content=""),
+            SimpleNamespace(last_error_category="", last_error_message=""),
+            {"audit_fallback_used": False},
+        ),
+    )
+    monkeypatch.setattr(
+        audit_engine,
+        "write_json_artifact",
+        lambda _prefix, data, **_kwargs: json_artifacts.append(data) or "p7a.json",
+    )
+    monkeypatch.setattr(audit_engine, "write_text_artifact", lambda *_args, **_kwargs: "p7a.md")
+    monkeypatch.setattr(
+        audit_engine,
+        "update_run_manifest",
+        lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+    )
+
+    result = audit_engine.p7a_deep_research_audit("deep research input " * 20)
+
+    assert result == markdown
+    assert '"Direct-to-Silicon Liquid Cooling"' in json_artifacts[-1]["topics"][1]["core_findings"][0]
+    assert json_artifacts[-1]["meta"]["input_chars"] == len("deep research input " * 20)
+    assert json_artifacts[-1]["meta"]["output_chars"] == len(markdown)
+    assert json_artifacts[-1]["meta"]["topics_count"] == 3
+    assert manifest_updates[-1][1]["status"] == "completed"
+    assert manifest_updates[-1][1]["metrics"]["structured_repaired"] is True
+    assert manifest_updates[-1][1]["metrics"]["topics_count"] == 3
+
+
+def test_p7a_uses_markdown_summary_when_same_count_topics_disagree(monkeypatch):
+    import audit_engine
+
+    markdown = _p7a_markdown_fixture(["Markdown 主题"])
+    raw_content = (
+        '{"topics":[{"name":"JSON 不一致主题","core_findings":["待核验"]}]}'
+        "\n===MARKDOWN===\n"
+        + markdown
+    )
+    json_artifacts = []
+    manifest_updates = []
+
+    monkeypatch.setattr(audit_engine, "require_prompt", lambda _name: "{raw_deep_research}")
+    monkeypatch.setattr(
+        audit_engine,
+        "_invoke_audit_with_fallback",
+        lambda *_args, **_kwargs: (
+            SimpleNamespace(content=raw_content, thinking_content=""),
+            SimpleNamespace(last_error_category="", last_error_message=""),
+            {"audit_fallback_used": False},
+        ),
+    )
+    monkeypatch.setattr(
+        audit_engine,
+        "write_json_artifact",
+        lambda _prefix, data, **_kwargs: json_artifacts.append(data) or "p7a.json",
+    )
+    monkeypatch.setattr(audit_engine, "write_text_artifact", lambda *_args, **_kwargs: "p7a.md")
+    monkeypatch.setattr(
+        audit_engine,
+        "update_run_manifest",
+        lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+    )
+
+    result = audit_engine.p7a_deep_research_audit("deep research input " * 20)
+
+    assert result.startswith("> 【P7a结构化降级】")
+    assert result.endswith(markdown)
+    assert [item["name"] for item in json_artifacts[-1]["topics"]] == ["Markdown 主题"]
+    assert json_artifacts[-1]["meta"]["structured_source"] == "markdown_derived"
+    assert manifest_updates[-1][1]["metrics"]["degrade_reason"].startswith("structured_topics_mismatch:")
+
+
+def test_p7a_does_not_accept_empty_json_object_with_markdown_topics(monkeypatch):
+    import audit_engine
+
+    topic_names = ["覆铜板涨价", "封装级液冷", "CPO 设备"]
+    markdown = _p7a_markdown_fixture(topic_names)
+    json_artifacts = []
+    manifest_updates = []
+
+    monkeypatch.setattr(audit_engine, "require_prompt", lambda _name: "{raw_deep_research}")
+    monkeypatch.setattr(
+        audit_engine,
+        "_invoke_audit_with_fallback",
+        lambda *_args, **_kwargs: (
+            SimpleNamespace(content="{}\n===MARKDOWN===\n" + markdown, thinking_content=""),
+            SimpleNamespace(last_error_category="", last_error_message=""),
+            {"audit_fallback_used": False},
+        ),
+    )
+    monkeypatch.setattr(
+        audit_engine,
+        "write_json_artifact",
+        lambda _prefix, data, **_kwargs: json_artifacts.append(data) or "p7a.json",
+    )
+    monkeypatch.setattr(audit_engine, "write_text_artifact", lambda *_args, **_kwargs: "p7a.md")
+    monkeypatch.setattr(
+        audit_engine,
+        "update_run_manifest",
+        lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+    )
+
+    result = audit_engine.p7a_deep_research_audit("deep research input " * 20)
+
+    assert result.startswith("> 【P7a结构化降级】")
+    assert result.endswith(markdown)
+    assert [item["name"] for item in json_artifacts[-1]["topics"]] == topic_names
+    assert manifest_updates[-1][1]["status"] == "completed_structured_degraded"
+    assert manifest_updates[-1][1]["metrics"]["topics_count"] == 3
+
+
+def test_p7a_rejects_response_without_usable_json_or_markdown(monkeypatch):
+    import audit_engine
+
+    raw_input = "deep research input " * 20
+    raw_content = "upstream transport transcript without audit structure " * 4
+    json_artifacts = []
+    text_artifacts = []
+    manifest_updates = []
+
+    monkeypatch.setattr(audit_engine, "require_prompt", lambda _name: "{raw_deep_research}")
+    monkeypatch.setattr(
+        audit_engine,
+        "_invoke_audit_with_fallback",
+        lambda *_args, **_kwargs: (
+            SimpleNamespace(content=raw_content, thinking_content=""),
+            SimpleNamespace(last_error_category="", last_error_message=""),
+            {"audit_fallback_used": False},
+        ),
+    )
+    monkeypatch.setattr(
+        audit_engine,
+        "write_json_artifact",
+        lambda *args, **_kwargs: json_artifacts.append(args) or "p7a.json",
+    )
+    monkeypatch.setattr(
+        audit_engine,
+        "write_text_artifact",
+        lambda *args, **_kwargs: text_artifacts.append(args) or "p7a.md",
+    )
+    monkeypatch.setattr(
+        audit_engine,
+        "update_run_manifest",
+        lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+    )
+
+    result = audit_engine.p7a_deep_research_audit(raw_input)
+
+    assert result.startswith("> 【P7a结构化降级】")
+    assert result.endswith(raw_input)
+    assert json_artifacts == []
+    assert text_artifacts == []
+    assert manifest_updates[-1][1]["status"] == "failed_semantic_output"
+    assert manifest_updates[-1][1]["metrics"]["data_state"] == "invalid"
+    assert manifest_updates[-1][1]["metrics"]["semantic_error"] == "missing_usable_p7a_markdown"
 
 
 def test_p7a_canonicalizes_known_alias_in_json_and_markdown(monkeypatch):
@@ -210,7 +422,9 @@ def test_p7a_canonicalizes_known_alias_in_json_and_markdown(monkeypatch):
         '{"title":"中国巨石供给弹性","beneficiaries":["中国巨石"]}'
         ']}'
         "\n===MARKDOWN===\n"
-        "- 宏和电子（002011）已实现量产；国际复材认证有效。\n"
+        "## 主题1：宏和电子与国际复材供给弹性\n"
+        "- 宏和电子（002011）已实现量产；国际复材认证有效。\n\n"
+        "## 主题2：中国巨石供给弹性\n"
         "- 中国巨石（600176）供给弹性明确。\n"
     )
     json_artifacts = []
@@ -285,7 +499,8 @@ def test_p7a_rejects_json_with_empty_markdown_section(monkeypatch):
 
     result = audit_engine.p7a_deep_research_audit(raw_input)
 
-    assert result == raw_input
+    assert result.startswith("> 【P7a结构化降级】")
+    assert result.endswith(raw_input)
     assert updates[-1][1]["status"] == "failed_semantic_output"
     assert updates[-1][1]["metrics"]["semantic_error"] == "empty_markdown_output"
     assert text_artifacts == []
@@ -300,7 +515,8 @@ def test_p7a_rejects_json_only_response_as_markdown(monkeypatch):
 
     result = audit_engine.p7a_deep_research_audit(raw_input)
 
-    assert result == raw_input
+    assert result.startswith("> 【P7a结构化降级】")
+    assert result.endswith(raw_input)
     assert updates[-1][1]["status"] == "failed_semantic_output"
     assert updates[-1][1]["metrics"]["semantic_error"] == "json_without_markdown"
     assert text_artifacts == []
@@ -322,3 +538,23 @@ def test_p7a_no_evidence_markdown_is_valid_empty(monkeypatch):
     assert updates[-1][1]["status"] == "completed_no_results"
     assert updates[-1][1]["metrics"]["data_state"] == "valid_empty"
     assert text_artifacts == []
+
+
+def test_p7a_rejects_nonempty_json_when_markdown_declares_no_evidence(monkeypatch):
+    import audit_engine
+
+    raw_content = (
+        '{"topics": [{"name": "不应保留的主题"}], "summary": "'
+        + ("x" * 120)
+        + '"}\n===MARKDOWN===\n未找到相关证据。'
+    )
+    updates, _ = _install_p7a_semantic_stubs(monkeypatch, audit_engine, raw_content)
+    raw_input = "deep research input " * 20
+
+    result = audit_engine.p7a_deep_research_audit(raw_input)
+
+    assert result.startswith("> 【P7a结构化降级】")
+    assert result.endswith(raw_input)
+    assert updates[-1][1]["status"] == "failed_semantic_output"
+    assert updates[-1][1]["metrics"]["data_state"] == "invalid"
+    assert updates[-1][1]["metrics"]["semantic_error"] == "structured_topics_mismatch_no_evidence"

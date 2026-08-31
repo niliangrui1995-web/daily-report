@@ -545,11 +545,51 @@ def _extract_meta_from_html(html_text: str) -> str:
         pass
     return ''
 
-def enrich_search_urls(result: dict) -> dict:
-    if not scrapling_available or not isinstance(result, dict):
+def _build_scrapling_evidence_provenance(
+    *,
+    primary_source_count: int,
+    summary_source_count: int,
+    source_url_count: int,
+) -> dict[str, int | str]:
+    """Build the optional P7 provenance payload for URL enrichment.
+
+    ``primary_source_count`` deliberately follows the existing
+    ``[Scrapling增强] 深挖 N 一手源`` log wording: it counts successful
+    high-value-URL body enrichments only.  It is not an issuer-authentication
+    result and must not be read as an official-disclosure certification.
+    """
+    primary_count = max(0, int(primary_source_count))
+    return {
+        "primary_source_count": primary_count,
+        "summary_source_count": max(0, int(summary_source_count)),
+        "source_url_count": max(0, int(source_url_count)),
+        "evidence_tier": (
+            "primary_source_backed"
+            if primary_count > 0
+            else "summary_lead_pending_verification"
+        ),
+    }
+
+
+def enrich_search_urls(result: dict, *, include_evidence_metadata: bool = False) -> dict:
+    """Append Scrapling enrichment and, for P7 only, expose its counters.
+
+    The default deliberately preserves the shared P1/P3/P7.5 result contract.
+    P7 opts in through ``include_evidence_metadata`` so its downstream audit can
+    distinguish a successful high-value body enrichment from a summary lead.
+    """
+    if not isinstance(result, dict):
         return result or {}
+
     sources = result.get('grounding_sources', [])
-    if not sources:
+    if not scrapling_available or not sources:
+        if include_evidence_metadata:
+            source_url_count = len(sources[:12]) if isinstance(sources, list) else 0
+            result["scrapling_evidence_provenance"] = _build_scrapling_evidence_provenance(
+                primary_source_count=0,
+                summary_source_count=0,
+                source_url_count=source_url_count,
+            )
         return result
         
     sorted_sources = sorted(sources[:12], key=lambda s: 0 if _is_high_value_domain(s.get('url', '')) else 1)
@@ -579,5 +619,12 @@ def enrich_search_urls(result: dict) -> dict:
     if enriched_parts:
         result['text'] = result.get('text', '') + '\n' + '\n'.join(enriched_parts)
         logging.info(f'  [Scrapling增强] 深挖 {full_count} 一手源 + {meta_count} 摘要 / {len(sorted_sources)} 个 URL')
-        
+
+    if include_evidence_metadata:
+        result["scrapling_evidence_provenance"] = _build_scrapling_evidence_provenance(
+            primary_source_count=full_count,
+            summary_source_count=meta_count,
+            source_url_count=len(sorted_sources),
+        )
+
     return result

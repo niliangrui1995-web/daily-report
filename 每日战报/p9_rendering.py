@@ -29,6 +29,15 @@ def build_report_markdown(data: dict, today_str: str) -> str:
     lines = []
     lines.append(f"# VCP Hunter P9 战报 | {today_str}\n")
 
+    p7_evidence_notice = str(data.get("_p7_evidence_notice") or "").strip()
+    if p7_evidence_notice:
+        lines.append("## ⚠️ P7/P7a 证据边界\n")
+        for notice_line in p7_evidence_notice.splitlines():
+            clean_line = notice_line.strip()
+            if clean_line:
+                lines.append(clean_line if clean_line.startswith(">") else f"> {clean_line}")
+        lines.append("\n---\n")
+
     x_intel = data.get("x_intel_snipe", [])
     if x_intel:
         lines.append("## 🔴 X平台突发 (Grok未经审计)\n")
@@ -218,9 +227,9 @@ def build_degraded_checkpoint_report(
         lines.append("")
 
     lines.append("## 一、核心信号\n")
-    lines.append("P9 未进行二次归纳；以下保留 P5 审计结果与 P7a 已审计深研 checkpoint。\n")
+    lines.append("P9 未进行二次归纳；以下保留 P5 审计结果与 P7a 深研材料（以层内状态为准）。\n")
     append_checkpoint("P5 审计结果（承接 P1）", "p5")
-    append_checkpoint("P7a 已审计深研", "p7a")
+    append_checkpoint("P7a 深研材料（以层内状态为准）", "p7a")
 
     lines.append("---\n")
     lines.append("## 二、标的狙击表\n")

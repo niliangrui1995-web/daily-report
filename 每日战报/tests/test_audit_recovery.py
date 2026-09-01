@@ -174,15 +174,92 @@ def _p7a_markdown_fixture(topic_names: list[str]) -> str:
     )
 
 
-def test_p7a_prompt_requires_raw_json_before_markdown():
+def _render_p7a_prompt_template() -> str:
     from pathlib import Path
 
-    prompt = (Path(__file__).resolve().parents[1] / "prompts" / "p7a_audit.txt").read_text(encoding="utf-8")
+    prompt_template = (Path(__file__).resolve().parents[1] / "prompts" / "p7a_audit.txt").read_text(
+        encoding="utf-8"
+    )
+    return prompt_template.format(
+        today_str="2026年09月01日 北京时间09:00",
+        vanguard_list="测试公司甲, 测试公司乙",
+        raw_deep_research="P7 原始研究哨兵文本",
+        # P7 evidence is prepended by audit_engine after formatting.  Keep the
+        # existing formatter argument so this test tracks the caller contract.
+        p7_evidence_boundary="P7 证据边界哨兵文本",
+    )
+
+
+def test_p7a_prompt_keeps_literal_json_example_braces_after_formatting():
+    prompt = _render_p7a_prompt_template()
 
     assert "按下方“第二部分：Markdown 可读报告”的结构输出精炼报告" in prompt
     assert "JSON 部分的第一个非空字符必须是 `{`" in prompt
     assert "不得输出前言、解释文字或代码围栏" in prompt
+    assert '\n{\n  "meta": {\n' in prompt
+    assert '\n  ]\n}\n\n===MARKDOWN===' in prompt
     assert "（纯文本 Markdown，不要 JSON）" not in prompt
+
+
+def test_p7a_prompt_formats_required_inputs_without_unresolved_placeholders():
+    prompt = _render_p7a_prompt_template()
+
+    assert "⚠️ 当前北京时间：2026年09月01日 北京时间09:00" in prompt
+    assert "测试公司甲, 测试公司乙" in prompt
+    assert "P7 原始研究哨兵文本" in prompt
+    for placeholder in ("{today_str}", "{vanguard_list}", "{raw_deep_research}"):
+        assert placeholder not in prompt
+
+
+def test_p7a_reaches_model_invoke_after_real_template_formatting(monkeypatch):
+    import audit_engine
+
+    calls = []
+    manifest_updates = []
+    raw_research = "P7 原始研究内容。" * 30
+    markdown = _p7a_markdown_fixture(["测试主题"])
+    raw_content = (
+        '{"meta":{"input_chars":300,"output_chars":200,"topics_count":1},'
+        '"topics":[{"name":"测试主题"}]}'
+        "\n===MARKDOWN===\n"
+        + markdown
+    )
+
+    def fake_invoke(prompt, layer_name, *, min_content_chars):
+        calls.append((prompt, layer_name, min_content_chars))
+        return (
+            SimpleNamespace(content=raw_content, thinking_content=""),
+            SimpleNamespace(last_error_category="", last_error_message=""),
+            {"audit_fallback_used": False},
+        )
+
+    monkeypatch.setattr(audit_engine, "_invoke_audit_with_fallback", fake_invoke)
+    monkeypatch.setattr(audit_engine, "write_json_artifact", lambda *_args, **_kwargs: "p7a.json")
+    monkeypatch.setattr(audit_engine, "write_text_artifact", lambda *_args, **_kwargs: "p7a.md")
+    monkeypatch.setattr(
+        audit_engine,
+        "update_run_manifest",
+        lambda *args, **kwargs: manifest_updates.append((args, kwargs)),
+    )
+
+    result = audit_engine.p7a_deep_research_audit(
+        raw_research,
+        p7_evidence_provenance={
+            "primary_source_count": 1,
+            "summary_source_count": 2,
+            "source_url_count": 3,
+        },
+    )
+
+    assert len(calls) == 1
+    prompt, layer_name, min_content_chars = calls[0]
+    assert layer_name == "P7a"
+    assert min_content_chars == 100
+    assert raw_research in prompt
+    assert "【P7 证据层级（系统强制）】" in prompt
+    assert '\n{\n  "meta": {\n' in prompt
+    assert "## 主题1：测试主题" in result
+    assert manifest_updates[-1][1]["status"] == "completed"
 
 
 def test_p7a_builds_markdown_derived_summary_when_json_parse_fails(monkeypatch):

@@ -609,6 +609,31 @@ def test_enrich_article_url_empty_skipped_and_outer_error(monkeypatch):
     }
 
 
+def test_enrich_article_url_require_body_does_not_promote_source_meta(monkeypatch):
+    class MetaOnlyPage:
+        def css(self, selector):
+            if selector.startswith("meta["):
+                return [FakeNode(content="M" * 120)]
+            return []
+
+    monkeypatch.setattr(scraper_utils, "scrapling_available", True)
+    monkeypatch.setattr(scraper_utils, "_Selector", lambda _html: MetaOnlyPage())
+    monkeypatch.setattr(scraper_utils, "_safe_url_for_fetch", lambda _url: True)
+    monkeypatch.setattr(scraper_utils.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(scraper_utils.random, "uniform", lambda *_args: 0)
+    monkeypatch.setattr(scraper_utils, "_is_high_value_domain", lambda _url: False)
+    monkeypatch.setattr(
+        scraper_utils,
+        "get_tls_policy_for_url",
+        lambda _url: {"verify": True, "tls_mode": "strict", "insecure_fetch": False},
+    )
+    monkeypatch.setattr(scraper_utils, "log_tls_policy", lambda *_args: None)
+    monkeypatch.setattr(scraper_utils, "_safe_requests_get", lambda *_args, **_kwargs: FakeResponse(text="shell"))
+
+    assert scraper_utils.enrich_article_url("https://example.com/article") == "M" * 120
+    assert scraper_utils.enrich_article_url("https://example.com/article", require_body=True) == ""
+
+
 def test_extract_meta_from_html_and_enrich_search_urls(monkeypatch):
     monkeypatch.setattr(scraper_utils, "scrapling_available", False)
     assert scraper_utils._extract_meta_from_html("html") == ""
@@ -646,7 +671,11 @@ def test_extract_meta_from_html_and_enrich_search_urls(monkeypatch):
         ],
     }
     monkeypatch.setattr(scraper_utils, "_is_high_value_domain", lambda url: "reuters" in url)
-    monkeypatch.setattr(scraper_utils, "enrich_article_url", lambda url, source_name="": "deep body" if url.endswith("deep") else "")
+    monkeypatch.setattr(
+        scraper_utils,
+        "enrich_article_url",
+        lambda url, source_name="", *, require_body=False: "deep body" if url.endswith("deep") else "",
+    )
     monkeypatch.setattr(scraper_utils, "_quick_meta_extract", lambda url: "fallback meta" if "fallback" in url else ("ordinary meta" if "example" in url else ""))
     enriched = scraper_utils.enrich_search_urls(result)
     assert "【正文深挖·一手源】Deep" in enriched["text"]
@@ -695,6 +724,183 @@ def test_enrich_search_urls_can_attach_p7_evidence_provenance(
     assert provenance["summary_source_count"] == expected_summary_count
     assert provenance["source_url_count"] == 1
     assert provenance["evidence_tier"] == expected_tier
+
+
+def test_vertex_grounding_redirect_enters_verified_target_body_path(monkeypatch):
+    wrapper_url = (
+        "https://vertexaisearch.cloud.google.com/grounding-api-redirect/opaque-token"
+    )
+    publisher_url = "https://www.reuters.com/world/verified-story"
+    redirect_response = FakeResponse(
+        status_code=302,
+        headers={"Location": publisher_url},
+        url=wrapper_url,
+        redirect=True,
+    )
+    resolver_calls = []
+    body_calls = []
+
+    monkeypatch.setattr(scraper_utils, "scrapling_available", True)
+    monkeypatch.setattr(
+        scraper_utils,
+        "get_tls_policy_for_url",
+        lambda url: {"verify": True, "tls_mode": "strict", "insecure_fetch": False, "url": url},
+    )
+    monkeypatch.setattr(scraper_utils, "log_tls_policy", lambda *_args: None)
+    monkeypatch.setattr(scraper_utils, "_safe_url_for_fetch", lambda url: url == publisher_url)
+
+    def fake_external_get(url, **kwargs):
+        resolver_calls.append((url, kwargs))
+        return redirect_response
+
+    def fake_body_enrichment(url, source_name="", *, require_body=False):
+        body_calls.append((url, source_name, require_body))
+        return "B" * 120
+
+    monkeypatch.setattr(scraper_utils, "_safe_external_requests_get", fake_external_get)
+    monkeypatch.setattr(scraper_utils, "_is_high_value_domain", lambda url: url == publisher_url)
+    monkeypatch.setattr(scraper_utils, "enrich_article_url", fake_body_enrichment)
+    monkeypatch.setattr(
+        scraper_utils,
+        "_quick_meta_extract",
+        lambda _url: pytest.fail("已解析目标页时不得回退为搜索摘要"),
+    )
+
+    result = scraper_utils.enrich_search_urls(
+        {
+            "text": "base",
+            "grounding_sources": [{"url": wrapper_url, "title": "Reuters"}],
+        },
+        include_evidence_metadata=True,
+    )
+
+    assert resolver_calls == [(wrapper_url, {"headers": scraper_utils.HEADERS, "timeout": 8, "verify": True, "follow_redirects": False})]
+    assert redirect_response.closed is True
+    assert body_calls == [(publisher_url, "", True)]
+    assert "【正文深挖·一手源】Reuters" in result["text"]
+    assert result["grounding_sources"] == [
+        {
+            "url": publisher_url,
+            "title": "Reuters",
+            "grounding_redirect_url": wrapper_url,
+        }
+    ]
+    assert result["scrapling_evidence_provenance"] == {
+        "primary_source_count": 1,
+        "summary_source_count": 0,
+        "source_url_count": 1,
+        "evidence_tier": "primary_source_backed",
+    }
+
+
+def test_vertex_redirect_without_real_body_stays_summary_lead(monkeypatch):
+    wrapper_url = (
+        "https://vertexaisearch.cloud.google.com/grounding-api-redirect/opaque-token"
+    )
+    publisher_url = "https://www.reuters.com/world/no-body"
+
+    monkeypatch.setattr(scraper_utils, "scrapling_available", True)
+    monkeypatch.setattr(
+        scraper_utils,
+        "_resolve_vertex_grounding_redirect_url",
+        lambda _url: publisher_url,
+        raising=False,
+    )
+    monkeypatch.setattr(scraper_utils, "_is_high_value_domain", lambda url: url == publisher_url)
+    monkeypatch.setattr(
+        scraper_utils,
+        "enrich_article_url",
+        lambda _url, source_name="", *, require_body=False: "",
+    )
+    seen_meta_urls = []
+
+    def fake_meta(url):
+        seen_meta_urls.append(url)
+        return "发布页 description 仅作摘要线索"
+
+    monkeypatch.setattr(scraper_utils, "_quick_meta_extract", fake_meta)
+
+    result = scraper_utils.enrich_search_urls(
+        {
+            "text": "base",
+            "grounding_sources": [{"url": wrapper_url, "title": "Reuters"}],
+        },
+        include_evidence_metadata=True,
+    )
+
+    assert seen_meta_urls == [publisher_url]
+    assert "【正文深挖·一手源】" not in result["text"]
+    assert "【摘要提取】Reuters" in result["text"]
+    assert result["scrapling_evidence_provenance"] == {
+        "primary_source_count": 0,
+        "summary_source_count": 1,
+        "source_url_count": 1,
+        "evidence_tier": "summary_lead_pending_verification",
+    }
+
+
+def test_vertex_grounding_redirect_rejects_unsafe_location(monkeypatch):
+    wrapper_url = (
+        "https://vertexaisearch.cloud.google.com/grounding-api-redirect/opaque-token"
+    )
+    redirect_response = FakeResponse(
+        status_code=302,
+        headers={"Location": "http://127.0.0.1/internal"},
+        url=wrapper_url,
+        redirect=True,
+    )
+
+    monkeypatch.setattr(
+        scraper_utils,
+        "get_tls_policy_for_url",
+        lambda _url: {"verify": True, "tls_mode": "strict", "insecure_fetch": False},
+    )
+    monkeypatch.setattr(scraper_utils, "log_tls_policy", lambda *_args: None)
+    monkeypatch.setattr(
+        scraper_utils,
+        "_safe_external_requests_get",
+        lambda *_args, **_kwargs: redirect_response,
+    )
+    monkeypatch.setattr(scraper_utils, "_safe_url_for_fetch", lambda _url: False)
+
+    assert scraper_utils._resolve_vertex_grounding_redirect_url(wrapper_url) == wrapper_url
+    assert redirect_response.closed is True
+
+
+def test_existing_publisher_body_bypasses_vertex_resolver(monkeypatch):
+    publisher_url = "https://www.reuters.com/world/existing-body"
+
+    monkeypatch.setattr(scraper_utils, "scrapling_available", True)
+    monkeypatch.setattr(
+        scraper_utils,
+        "_resolve_vertex_grounding_redirect_url",
+        lambda _url: pytest.fail("既有发布页不应进入 Vertex 跳转解析"),
+        raising=False,
+    )
+    monkeypatch.setattr(scraper_utils, "_is_high_value_domain", lambda url: url == publisher_url)
+    monkeypatch.setattr(
+        scraper_utils,
+        "enrich_article_url",
+        lambda _url, source_name="", *, require_body=False: "现有有效正文" if require_body else pytest.fail("正文路径必须要求真实正文"),
+    )
+    monkeypatch.setattr(
+        scraper_utils,
+        "_quick_meta_extract",
+        lambda _url: pytest.fail("既有有效正文不应回退为摘要"),
+    )
+
+    result = scraper_utils.enrich_search_urls(
+        {
+            "text": "base",
+            "grounding_sources": [{"url": publisher_url, "title": "Reuters"}],
+        },
+        include_evidence_metadata=True,
+    )
+
+    assert result["grounding_sources"] == [{"url": publisher_url, "title": "Reuters"}]
+    assert result["text"].endswith("【正文深挖·一手源】Reuters\n现有有效正文")
+    assert result["scrapling_evidence_provenance"]["primary_source_count"] == 1
+    assert result["scrapling_evidence_provenance"]["evidence_tier"] == "primary_source_backed"
 
 
 def test_parse_rss_date_and_fetch_rss_entries(monkeypatch):

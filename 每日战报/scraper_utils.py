@@ -64,6 +64,8 @@ BLOCKED_HOSTNAMES = frozenset({
 BLOCKED_HOST_SUFFIXES = ('.localhost', '.local', '.internal')
 MAX_SAFE_REDIRECTS = 5
 PROXY_FAKE_IP_NETWORKS = (ipaddress.ip_network('198.18.0.0/15'),)
+VERTEX_GROUNDING_REDIRECT_HOST = 'vertexaisearch.cloud.google.com'
+VERTEX_GROUNDING_REDIRECT_PATH_PREFIX = '/grounding-api-redirect/'
 
 
 def _normalize_hostname(hostname: str | bytes) -> str:
@@ -284,7 +286,13 @@ def _read_bounded_response(response, max_response_bytes: int):
         _close_response(response)
 
 
-def _safe_requests_get_checked(url: str, url_checker, **kwargs) -> requests.Response:
+def _safe_requests_get_checked(
+    url: str,
+    url_checker,
+    *,
+    follow_redirects: bool = True,
+    **kwargs,
+) -> requests.Response:
     current_url = url
     timeout = kwargs.pop('timeout', DEFAULT_FETCH_TIMEOUT)
     max_response_bytes = int(kwargs.pop('max_response_bytes', DEFAULT_MAX_RESPONSE_BYTES))
@@ -315,6 +323,9 @@ def _safe_requests_get_checked(url: str, url_checker, **kwargs) -> requests.Resp
         if not getattr(response, 'is_redirect', False) and not getattr(response, 'is_permanent_redirect', False):
             return _read_bounded_response(response, max_response_bytes)
 
+        if not follow_redirects:
+            return response
+
         location = response.headers.get('Location')
         if not location:
             return _read_bounded_response(response, max_response_bytes)
@@ -330,6 +341,61 @@ def _safe_requests_get(url: str, **kwargs) -> requests.Response:
 
 def _safe_external_requests_get(url: str, **kwargs) -> requests.Response:
     return _safe_requests_get_checked(url, _safe_external_url_for_fetch, **kwargs)
+
+
+def _is_vertex_grounding_redirect_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        return (
+            parsed.scheme.lower() == 'https'
+            and _normalize_hostname(parsed.hostname or '') == VERTEX_GROUNDING_REDIRECT_HOST
+            and parsed.path.startswith(VERTEX_GROUNDING_REDIRECT_PATH_PREFIX)
+        )
+    except Exception:
+        return False
+
+
+def _resolve_vertex_grounding_redirect_url(url: str) -> str:
+    """Resolve one known Vertex grounding wrapper before article classification.
+
+    The opaque Google URL is never treated as evidence content.  Its first
+    Location is validated as an article URL, then the existing bounded,
+    per-hop-safe article fetcher retrieves the publisher page.
+    """
+    if not _is_vertex_grounding_redirect_url(url):
+        return url
+
+    try:
+        tls_policy = get_tls_policy_for_url(url)
+        log_tls_policy('ScraperRedirect', url, tls_policy)
+        response = _safe_external_requests_get(
+            url,
+            headers=HEADERS,
+            timeout=8,
+            verify=tls_policy['verify'],
+            follow_redirects=False,
+        )
+        try:
+            if not getattr(response, 'is_redirect', False) and not getattr(response, 'is_permanent_redirect', False):
+                return url
+            location = response.headers.get('Location')
+            if not location:
+                return url
+            resolved_url = urljoin(response.url or url, location)
+        finally:
+            _close_response(response)
+
+        if _safe_url_for_fetch(resolved_url):
+            logging.debug(
+                '[Scrapling] resolved Vertex grounding redirect to publisher host %s',
+                _normalize_hostname(urlparse(resolved_url).hostname or ''),
+            )
+            return resolved_url
+    except requests.exceptions.RequestException as exc:
+        logging.debug('[Scrapling] Vertex grounding redirect resolution failed: %s', exc)
+    except Exception as exc:
+        logging.debug('[Scrapling] Vertex grounding redirect resolution failed unexpectedly: %s', exc)
+    return url
 
 
 def _is_high_value_domain(url: str) -> bool:
@@ -379,7 +445,13 @@ def _quick_meta_extract(url: str) -> str:
         logging.debug(f'[Scrapling] _quick_meta_extract 请求失败 {url}: {e}')
         return ''
 
-def extract_content_from_html(html_text: str, source_name: str = '', url: str = '') -> str:
+def extract_content_from_html(
+    html_text: str,
+    source_name: str = '',
+    url: str = '',
+    *,
+    allow_meta_fallback: bool = True,
+) -> str:
     if not scrapling_available or not _Selector:
         return ''
     page = _Selector(html_text)
@@ -407,15 +479,16 @@ def extract_content_from_html(html_text: str, source_name: str = '', url: str = 
         except Exception as e:
             logging.debug(f'[Scrapling] CSS 选择器 {sel} 未命中: {e}')
             
-    for ms in ["meta[name='description']", "meta[property='og:description']"]:
-        try:
-            metas = page.css(ms)
-            if metas:
-                c = metas[0].attrib.get('content', '').strip()
-                if c and len(c) > 30:
-                    return c[:SUMMARY_LEN]
-        except Exception as e:
-            logging.debug(f'[Scrapling] meta fallback 选择器未命中: {e}')
+    if allow_meta_fallback:
+        for ms in ["meta[name='description']", "meta[property='og:description']"]:
+            try:
+                metas = page.css(ms)
+                if metas:
+                    c = metas[0].attrib.get('content', '').strip()
+                    if c and len(c) > 30:
+                        return c[:SUMMARY_LEN]
+            except Exception as e:
+                logging.debug(f'[Scrapling] meta fallback 选择器未命中: {e}')
             
     return ''
 
@@ -450,7 +523,13 @@ def _extract_published_hint_from_html(html_text: str) -> str:
         logging.debug(f'[Scrapling] published hint 提取失败: {exc}')
     return ''
 
-def enrich_article_url(url: str, source_name: str = '', return_meta: bool = False):
+def enrich_article_url(
+    url: str,
+    source_name: str = '',
+    return_meta: bool = False,
+    *,
+    require_body: bool = False,
+):
     """一手源正文深挖——增强版。
 
     Why: 原版只用 requests.get 裸拉 HTML，对 JS 渲染站点（seekingalpha/bloomberg）
@@ -499,9 +578,16 @@ def enrich_article_url(url: str, source_name: str = '', return_meta: bool = Fals
                 published_hint = _extract_published_hint_from_html(resp.text)
                 if published_hint:
                     last_meta['published_at'] = published_hint
-                content = extract_content_from_html(resp.text, source_name=source_name, url=url)
+                content = extract_content_from_html(
+                    resp.text,
+                    source_name=source_name,
+                    url=url,
+                    allow_meta_fallback=not require_body,
+                )
                 if content and len(content) > 100:
                     return (content, last_meta) if return_meta else content
+                if require_body:
+                    continue
                 # Why: 正文提取失败（JS 渲染空壳），降级到 meta 标签
                 content = _extract_meta_from_html(resp.text)
                 if content:
@@ -592,7 +678,24 @@ def enrich_search_urls(result: dict, *, include_evidence_metadata: bool = False)
             )
         return result
         
-    sorted_sources = sorted(sources[:12], key=lambda s: 0 if _is_high_value_domain(s.get('url', '')) else 1)
+    resolved_sources = list(sources)
+    if include_evidence_metadata:
+        for index, src in enumerate(sources[:12]):
+            url = src.get('url', '')
+            if not _is_vertex_grounding_redirect_url(url):
+                continue
+            resolved_url = _resolve_vertex_grounding_redirect_url(url)
+            if resolved_url == url:
+                continue
+            resolved_source = dict(src)
+            resolved_source['url'] = resolved_url
+            resolved_source['grounding_redirect_url'] = url
+            resolved_sources[index] = resolved_source
+
+    if resolved_sources != sources:
+        result['grounding_sources'] = resolved_sources
+
+    sorted_sources = sorted(resolved_sources[:12], key=lambda s: 0 if _is_high_value_domain(s.get('url', '')) else 1)
     
     enriched_parts = []
     full_count = 0
@@ -605,7 +708,11 @@ def enrich_search_urls(result: dict, *, include_evidence_metadata: bool = False)
             continue
             
         if _is_high_value_domain(url):
-            content = enrich_article_url(url, source_name='')
+            content = enrich_article_url(
+                url,
+                source_name='',
+                require_body=include_evidence_metadata,
+            )
             if content:
                 enriched_parts.append(f'\n---\n【正文深挖·一手源】{title}\n{content}')
                 full_count += 1

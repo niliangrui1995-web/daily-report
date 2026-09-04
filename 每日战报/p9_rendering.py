@@ -29,6 +29,15 @@ def build_report_markdown(data: dict, today_str: str) -> str:
     lines = []
     lines.append(f"# VCP Hunter P9 战报 | {today_str}\n")
 
+    p5_evidence_notice = str(data.get("_p5_evidence_notice") or "").strip()
+    if p5_evidence_notice:
+        lines.append("## ⚠️ P5审计降级\n")
+        for notice_line in p5_evidence_notice.splitlines():
+            clean_line = notice_line.strip()
+            if clean_line:
+                lines.append(clean_line if clean_line.startswith(">") else f"> {clean_line}")
+        lines.append("\n---\n")
+
     p7_evidence_notice = str(data.get("_p7_evidence_notice") or "").strip()
     if p7_evidence_notice:
         lines.append("## ⚠️ P7/P7a 证据边界\n")

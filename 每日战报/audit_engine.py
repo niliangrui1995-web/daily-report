@@ -38,7 +38,7 @@ AUDIT_OUTPUT_LIMITS = """
 STRICT OUTPUT LIMITS FOR MACHINE PARSING:
 - Return raw JSON only. Do not wrap it in ```json fences.
 - Keep high_trust to at most 80 items and medium_trust to at most 80 items.
-- Keep deleted to at most 30 representative items; summary.deleted may still count all removed items.
+- Keep deleted to at most 30 representative items; summary.deleted must be at least len(deleted) and may count all removed items.
 - Set summary.passed to exactly len(high_trust) + len(medium_trust) after finalizing both arrays.
 - Do not include omitted or unlisted passed items in summary.passed.
 - If content is too long, prefer fewer items over invalid or truncated JSON.
@@ -210,6 +210,7 @@ def _validate_audit_payload(data: dict, *, allow_empty: bool = False) -> dict:
 
     passed_count = _audit_count(summary.get('passed'), 'passed')
     deleted_count = _audit_count(summary.get('deleted'), 'deleted')
+    declared_deleted_count = deleted_count
 
     collections = {}
     for field_name in ('high_trust', 'medium_trust', 'deleted'):
@@ -227,18 +228,23 @@ def _validate_audit_payload(data: dict, *, allow_empty: bool = False) -> dict:
     deleted_items = collections['deleted']
     if passed_count != len(high_trust) + len(medium_trust):
         raise _AuditSemanticError('passed_count_mismatch')
-    if deleted_count < len(deleted_items):
-        raise _AuditSemanticError('deleted_count_mismatch')
-    if deleted_count > 0 and not deleted_items:
-        raise _AuditSemanticError('deleted_count_without_items')
     if deleted_count == 0 and deleted_items:
         raise _AuditSemanticError('deleted_items_without_count')
+    if deleted_count > 0 and not deleted_items:
+        raise _AuditSemanticError('deleted_count_without_items')
+
+    deleted_count_reconciled = 0 < deleted_count < len(deleted_items)
+    if deleted_count_reconciled:
+        deleted_count = len(deleted_items)
+        summary['deleted'] = deleted_count
     if passed_count == 0 and deleted_count == 0 and not allow_empty:
         raise _AuditSemanticError('empty_audit_payload')
 
     return {
         'passed_count': passed_count,
         'deleted_count': deleted_count,
+        'declared_deleted_count': declared_deleted_count,
+        'deleted_count_reconciled': deleted_count_reconciled,
         'high_trust': high_trust,
         'medium_trust': medium_trust,
         'deleted_items': deleted_items,
@@ -364,6 +370,7 @@ def gemini_pro_audit(
             '\nRETRY CORRECTION REQUIRED:\n'
             f'- The previous response failed validation with: {_retry_reason}.\n'
             '- Recalculate every summary count from the final arrays before returning JSON.\n'
+            '- Set summary.deleted to at least len(deleted); it may be higher only when omitted deleted items are counted.\n'
         )
 
     t0 = time.time()
@@ -406,6 +413,13 @@ def gemini_pro_audit(
     try:
         data = extract_json_from_llm_response(raw_content, expect_type='dict', allow_partial=True)
         audit_state = _validate_audit_payload(data, allow_empty=audit_type != 'p5')
+        if audit_state['deleted_count_reconciled']:
+            logging.warning(
+                '[%s 审计] 已本地对齐 summary.deleted：模型声明 %s，删除清单 %s',
+                layer_name,
+                audit_state['declared_deleted_count'],
+                audit_state['deleted_count'],
+            )
         json_path = write_json_artifact(file_prefix, data)
         logging.info(f'💾 [{layer_name} 审计] 完美架构 JSON 数据已落盘: {json_path}')
 
@@ -471,11 +485,16 @@ def gemini_pro_audit(
                 'raw_output_chars': len(raw_content),
                 'elapsed_seconds': round(elapsed, 1),
                 'retry_count': _retry_count,
+                'semantic_error': '',
+                'fallback': '',
+                'fallback_chars': 0,
                 'passed_count': audit_state['passed_count'],
                 'high_trust_count': len(high_trust),
                 'medium_trust_count': len(medium_trust),
+                'declared_deleted_count': audit_state['declared_deleted_count'],
                 'deleted_count': audit_state['deleted_count'],
                 'deleted_items_count': len(deleted),
+                'deleted_count_reconciled': audit_state['deleted_count_reconciled'],
                 'data_state': 'valid_empty' if audit_state['no_results'] else 'valid',
                 **fallback_metrics,
             },

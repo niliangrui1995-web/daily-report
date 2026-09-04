@@ -412,6 +412,15 @@ def audit_harness(monkeypatch):
             },
             "deleted_count_without_items",
         ),
+        (
+            {
+                "summary": {"passed": 0, "deleted": 0},
+                "high_trust": [],
+                "medium_trust": [],
+                "deleted": [{"reason": "stale", "content": "old item"}],
+            },
+            "deleted_items_without_count",
+        ),
     ],
 )
 def test_p5_rejects_empty_or_inconsistent_structured_shells(
@@ -431,6 +440,47 @@ def test_p5_rejects_empty_or_inconsistent_structured_shells(
     assert manifests[-1][1]["metrics"]["semantic_error"] == expected_error
     assert manifests[-1][1]["files"] == {"raw": "audit.md"}
     assert text_writes[-1][0].endswith("_RAW_SEMANTIC_INVALID")
+
+
+@pytest.mark.parametrize(
+    ("passed_count", "visible_deleted_count"),
+    [
+        pytest.param(35, 31, id="20260904-first-response"),
+        pytest.param(40, 32, id="20260904-count-correction-retry"),
+    ],
+)
+def test_p5_reconciles_positive_deleted_count_lower_than_visible_deleted_items(
+    audit_harness,
+    passed_count,
+    visible_deleted_count,
+):
+    """Reconcile the 2026-09-04 P5 delete-summary undercount without retrying."""
+    payload, manifests, json_writes, text_writes = audit_harness
+    payload["value"] = {
+        "summary": {"passed": passed_count, "deleted": 30},
+        "high_trust": [f"passed item {index}" for index in range(passed_count)],
+        "medium_trust": [],
+        "deleted": [
+            {"reason": "irrelevant", "content": f"deleted item {index}"}
+            for index in range(visible_deleted_count)
+        ],
+    }
+
+    result = audit_engine.gemini_pro_audit("raw P1 evidence", audit_type="p5")
+
+    assert "passed item 0" in result
+    assert json_writes[0][1]["summary"]["deleted"] == visible_deleted_count
+    assert [prefix for prefix, _text in text_writes] == [
+        "P5_审计",
+        "P5_审计删除清单",
+    ]
+    assert manifests[-1][0] == "p5"
+    assert manifests[-1][1]["status"] == "completed"
+    metrics = manifests[-1][1]["metrics"]
+    assert metrics["retry_count"] == 0
+    assert metrics["declared_deleted_count"] == 30
+    assert metrics["deleted_count"] == visible_deleted_count
+    assert metrics["deleted_count_reconciled"] is True
 
 
 def test_p5_all_deleted_is_a_valid_no_results_state(audit_harness):

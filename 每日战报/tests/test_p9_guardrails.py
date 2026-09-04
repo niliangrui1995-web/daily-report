@@ -215,6 +215,93 @@ def test_p9_risk_analysis_excludes_degraded_p7_from_model_path(monkeypatch, p7_r
     assert metrics["upstream_p7a_evidence_excluded"] is True
 
 
+def test_p9_risk_analysis_excludes_degraded_p5_from_model_path(monkeypatch):
+    import p9_reporter
+
+    captured: dict[str, object] = {"manifest_updates": []}
+    payload = {
+        "x_intel_snipe": [],
+        "p3_machine_intel": [],
+        "core_signals": [
+            {
+                "source": "P5 原始线索 + P8",
+                "significance": "高优先级",
+                "title": "待核验的 P5 原始线索",
+                "body": "P5 未审计原始情报只能结合独立资料继续观察。",
+                "confidence": 0.95,
+                "evidence_refs": ["P5: 原始 RSS", "P8: 技术面"],
+            }
+        ],
+        "sniper_tables": [],
+        "fund_pathway": [],
+        "today_advice": [
+            {
+                "priority": "★★★",
+                "name": "生益科技",
+                "code": "600183",
+                "reason": "P5 未审计原始线索不应与 P8 合并计为双硬证据。",
+                "strategy": "观察",
+                "confidence": 0.95,
+                "evidence_refs": ["P5: 原始 RSS", "P8: 技术面"],
+            }
+        ],
+        "risk_warning": [],
+    }
+
+    monkeypatch.setattr(
+        p9_reporter,
+        "require_prompt",
+        lambda _name: (
+            "{p5_evidence_boundary}\n{p7_evidence_boundary}\n{today_str}\n{p5_evidence}\n"
+            "{p7_section}\n{p6_mapping}\n{p75_section}\n{price_data}\n{p2_section}\n"
+            "{p3_section}\n{yfinance_section}"
+        ),
+    )
+    monkeypatch.setattr(
+        p9_reporter.opus_adapter,
+        "invoke",
+        lambda prompt: captured.setdefault("prompt", prompt)
+        and SimpleNamespace(content=json.dumps(payload, ensure_ascii=False), thinking_content=""),
+    )
+    monkeypatch.setattr(p9_reporter, "load_tdx_stock_code_map", lambda: {"生益科技": "600183"})
+    monkeypatch.setattr(p9_reporter, "_load_p8_price_db", lambda: {})
+    monkeypatch.setattr(p9_reporter, "write_text_artifact", lambda *_args, **_kwargs: "report.md")
+    monkeypatch.setattr(
+        p9_reporter,
+        "write_json_artifact",
+        lambda _prefix, data, **_kwargs: captured.setdefault("json_payload", copy.deepcopy(data)) or "report.json",
+    )
+    monkeypatch.setattr(
+        p9_reporter,
+        "update_run_manifest",
+        lambda *args, **kwargs: captured["manifest_updates"].append((args, kwargs)),
+    )
+
+    report, _ = p9_reporter.p9_risk_analysis(
+        p5_evidence="## P5 Pro 审计失败兜底\n未经审计的 P1 原始情报。",
+        p7_deep="P7 深研。",
+        p75_supplement="P7.5 补充线索。",
+        p6_mapping="P6 映射。",
+        price_data="P8 技术面数据。" * 8,
+        p2_x_intel_data="P2 情报。",
+        p3_intel_data="P3 情报。",
+        p4_yfinance="P4 行情。",
+        p5_audit_degraded=True,
+    )
+
+    rendered = captured["json_payload"]
+    assert rendered["core_signals"][0]["confidence"] == 0.60
+    assert rendered["core_signals"][0]["significance"] == "🟡中"
+    assert rendered["today_advice"][0]["confidence"] == 0.60
+    assert rendered["today_advice"][0]["priority"] == "★★"
+    assert "P5审计降级" in captured["prompt"]
+    assert report.startswith("# VCP Hunter P9 战报 |")
+    assert "P5审计降级" in report
+    metrics = captured["manifest_updates"][-1][1]["metrics"]
+    assert metrics["upstream_p5_audit_degraded"] is True
+    assert metrics["upstream_p5_evidence_excluded"] is True
+
+
 def test_parse_report_payload_repairs_complete_partial_json():
     import p9_reporter
 

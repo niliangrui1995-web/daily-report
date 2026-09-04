@@ -1963,7 +1963,7 @@ def test_delivery_resume_validates_mode_report_and_delivery(monkeypatch):
         )
 
 
-def test_raw_p1_unreviewed_p5_forces_p9_manual_review_and_local_only_delivery(monkeypatch):
+def test_raw_p1_unreviewed_p5_marks_p9_degraded_and_keeps_default_delivery_policy(monkeypatch):
     captured = {}
 
     monkeypatch.setattr(
@@ -1981,8 +1981,8 @@ def test_raw_p1_unreviewed_p5_forces_p9_manual_review_and_local_only_delivery(mo
     monkeypatch.setattr(orchestrator, "_resolve_p9_checkpoint_snapshot", lambda _context: {})
 
     def fake_p9(**kwargs):
-        captured["manual_review_required"] = kwargs.get("manual_review_required")
-        return "# manual review", "20260830083002"
+        captured["p5_audit_degraded"] = kwargs.get("p5_audit_degraded")
+        return "# degraded report", "20260830083002"
 
     def fake_delivery(_content, _report_ts, *, email_required=None):
         captured["email_required"] = email_required
@@ -2006,7 +2006,44 @@ def test_raw_p1_unreviewed_p5_forces_p9_manual_review_and_local_only_delivery(mo
         }
     )
 
-    assert captured == {"manual_review_required": True, "email_required": False}
+    assert captured == {"p5_audit_degraded": True, "email_required": None}
+
+
+def test_completed_p5_overrides_stale_raw_fallback_metrics(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        orchestrator,
+        "load_run_manifest",
+        lambda: {
+            "stages": {
+                "p5": {
+                    "status": "completed",
+                    "metrics": {
+                        "fallback": "raw_p1_unreviewed",
+                        "semantic_error": "deleted_count_mismatch",
+                        "data_state": "valid",
+                    },
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(orchestrator, "_resolve_p9_checkpoint_snapshot", lambda _context: {})
+
+    def fake_p9(**kwargs):
+        captured["p5_audit_degraded"] = kwargs.get("p5_audit_degraded")
+        return "# completed P5 report", "20260904083003"
+
+    def fake_delivery(_content, _report_ts, *, email_required=None):
+        captured["email_required"] = email_required
+        return {"ok": True, "status": "completed_no_email", "email_sent": False}
+
+    monkeypatch.setattr(orchestrator, "p9_risk_analysis", fake_p9)
+    monkeypatch.setattr(orchestrator, "send_report_email", fake_delivery)
+
+    orchestrator._stage_report({"p6_mapping": "P6 mapping", "ckpt": {}})
+
+    assert captured == {"p5_audit_degraded": False, "email_required": None}
 
 
 @pytest.mark.parametrize(
@@ -2016,7 +2053,7 @@ def test_raw_p1_unreviewed_p5_forces_p9_manual_review_and_local_only_delivery(mo
         lambda: {"stages": {"p5": {"metrics": "malformed"}}},
     ],
 )
-def test_p5_review_state_read_failure_fails_closed_and_is_read_once(monkeypatch, manifest_loader):
+def test_p5_review_state_read_failure_marks_p9_degraded_and_is_read_once(monkeypatch, manifest_loader):
     captured = {"manifest_reads": 0}
 
     def load_manifest():
@@ -2027,8 +2064,8 @@ def test_p5_review_state_read_failure_fails_closed_and_is_read_once(monkeypatch,
     monkeypatch.setattr(orchestrator, "_resolve_p9_checkpoint_snapshot", lambda _context: {})
 
     def fake_p9(**kwargs):
-        captured["manual_review_required"] = kwargs["manual_review_required"]
-        return "# local review", "20260830083002"
+        captured["p5_audit_degraded"] = kwargs["p5_audit_degraded"]
+        return "# degraded report", "20260830083002"
 
     def fake_delivery(_content, _report_ts, *, email_required=None):
         captured["email_required"] = email_required
@@ -2045,8 +2082,8 @@ def test_p5_review_state_read_failure_fails_closed_and_is_read_once(monkeypatch,
 
     assert captured == {
         "manifest_reads": 1,
-        "manual_review_required": True,
-        "email_required": False,
+        "p5_audit_degraded": True,
+        "email_required": None,
     }
 
 

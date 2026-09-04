@@ -842,7 +842,7 @@ def _run_p5_audit(context: dict[str, Any]) -> None:
                 "data_state": "invalid",
             },
         )
-        context["p5_manual_review_required"] = True
+        context["p5_audit_degraded"] = True
 
 
 def _stage_recover_p2(context: dict[str, Any]) -> None:
@@ -1477,18 +1477,27 @@ def _resolve_p9_checkpoint_snapshot(context: dict[str, Any]) -> dict[str, Any] |
         return None
 
 
-def _p5_requires_manual_review(context: dict[str, Any]) -> bool:
-    if context.get("p5_manual_review_required") is True:
+def _p5_audit_is_degraded(context: dict[str, Any]) -> bool:
+    if context.get("p5_audit_degraded") is True:
         return True
     try:
         p5_payload = load_run_manifest().get("stages", {}).get("p5", {})
     except Exception as exc:
-        logging.error("[P9] failed to read P5 delivery state: %s", exc)
+        logging.error("[P9] failed to read P5 audit state; P5 will be downgraded: %s", exc)
         return True
     metrics = p5_payload.get("metrics", {}) if isinstance(p5_payload, dict) else {}
     if not isinstance(metrics, dict):
-        logging.error("[P9] malformed P5 delivery metrics; requiring manual review")
+        logging.error("[P9] malformed P5 audit metrics; P5 will be downgraded")
         return True
+    p5_status = str(p5_payload.get("status") or "").strip().lower()
+    p5_data_state = str(metrics.get("data_state") or "").strip().lower()
+    if p5_status == "completed" and p5_data_state == "valid":
+        return False
+    if (
+        p5_status in VALID_EMPTY_STATUSES.get("p5", frozenset())
+        and p5_data_state == "valid_empty"
+    ):
+        return False
     return (
         metrics.get("fallback") == "raw_p1_unreviewed"
         or str(metrics.get("data_state") or "").strip().lower() == "invalid"
@@ -1501,7 +1510,7 @@ def _stage_report(context: dict[str, Any]) -> None:
 
     with log_heartbeat("P9 report"):
         try:
-            manual_review_required = _p5_requires_manual_review(context)
+            p5_audit_degraded = _p5_audit_is_degraded(context)
             final_report, report_ts = p9_risk_analysis(
                 p5_evidence=context.get("p5_evidence", ""),
                 p7_deep=context.get("p7a_audited", ""),
@@ -1513,7 +1522,7 @@ def _stage_report(context: dict[str, Any]) -> None:
                 p4_yfinance=context.get("p4_data", ""),
                 rejected_target_names=context.get("rejected_target_names", []),
                 checkpoint_snapshot=_resolve_p9_checkpoint_snapshot(context),
-                manual_review_required=manual_review_required,
+                p5_audit_degraded=p5_audit_degraded,
                 p7_evidence_provenance=context.get("p7_evidence_provenance"),
             )
         except Exception as exc:
@@ -1526,11 +1535,7 @@ def _stage_report(context: dict[str, Any]) -> None:
     if not final_report or not final_report.strip():
         raise RuntimeError("report generation returned an empty report")
 
-    delivery = send_report_email(
-        final_report,
-        report_ts,
-        email_required=False if manual_review_required else None,
-    )
+    delivery = send_report_email(final_report, report_ts)
     if not delivery.get("ok"):
         raise RuntimeError(f"report delivery failed: {delivery.get('status', 'unknown')}")
 

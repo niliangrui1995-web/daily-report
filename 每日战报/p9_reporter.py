@@ -40,6 +40,7 @@ _PRIORITY_RANKS = {"★": 1.0, "★☆☆": 1.5, "★★": 2.0, "★★☆": 2.5
 P9_JSON_RETRY_LIMIT = 1
 P7A_STRUCTURED_DEGRADED_MARKER = "【P7a结构化降级】"
 P7_SUMMARY_LEAD_LABEL = "摘要线索待核验"
+P5_AUDIT_DEGRADED_LABEL = "P5审计降级"
 _P7_SUMMARY_LEAD_CLAIM_PATTERN = re.compile(
     r"订单|报价|量产|投产|客户|供应商|供货|中标|定点|导入|认证|公司归因|归因|交付|产能|出货|营收|收入|"
     r"order|quote|mass\s*production|customer|supplier|attribution",
@@ -884,6 +885,16 @@ def _resolve_p7_evidence_provenance(value: Any) -> dict[str, Any] | None:
     return provenance if isinstance(provenance, dict) and provenance else None
 
 
+def _p5_evidence_boundary_for_prompt(audit_degraded: bool) -> str:
+    if audit_degraded:
+        return (
+            f"【{P5_AUDIT_DEGRADED_LABEL}】P5 未通过本轮审计，内容为未经 P5 清洗的 P1 原始线索。"
+            "P5 不属于硬证据层，不得单独或与其他材料拼接确认订单、报价、量产、客户/供应商关系"
+            "或公司归因，也不得据此抬升置信度、优先级或结论确定性；P5 引用必须标为“P5未审计线索”。"
+        )
+    return "【P5审计有效】P5 已通过本轮审计，可按既有路径参与硬证据交叉验证。"
+
+
 def _has_zero_p7_primary_sources(provenance: dict[str, Any] | None) -> bool:
     if provenance is None:
         return False
@@ -1134,6 +1145,7 @@ def p9_risk_analysis(
     rejected_target_names: list[str] | None = None,
     checkpoint_snapshot: dict[str, Any] | None = None,
     manual_review_required: bool = False,
+    p5_audit_degraded: bool = False,
     p7_evidence_provenance: dict[str, Any] | None = None,
     _retry_count: int = 0,
 ):
@@ -1160,6 +1172,15 @@ def p9_risk_analysis(
     p7_summary_lead = _has_zero_p7_primary_sources(resolved_p7_provenance)
     p7_evidence_boundary = _p7_evidence_boundary_for_prompt(resolved_p7_provenance)
     p7_provenance_metrics = _p7_evidence_metrics(resolved_p7_provenance)
+    p5_evidence_boundary = _p5_evidence_boundary_for_prompt(p5_audit_degraded)
+    p5_degradation_metrics = (
+        {
+            "upstream_p5_audit_degraded": True,
+            "upstream_p5_evidence_excluded": True,
+        }
+        if p5_audit_degraded
+        else {}
+    )
 
     if manual_review_required:
         result = _build_manual_review_report(
@@ -1182,6 +1203,7 @@ def p9_risk_analysis(
                 "report_outcome": "manual_review_required",
                 "actionable_items_count": 0,
                 "markdown_chars": len(result),
+                **p5_degradation_metrics,
                 **p7_provenance_metrics,
                 "delivery": {
                     "status": "blocked_pending_review",
@@ -1245,7 +1267,7 @@ def p9_risk_analysis(
         update_run_manifest(
             "p9",
             status="failed_missing_prompt",
-            metrics={"error": str(exc), **p7_provenance_metrics},
+            metrics={"error": str(exc), **p5_degradation_metrics, **p7_provenance_metrics},
         )
         return "", run_ts
 
@@ -1259,6 +1281,7 @@ def p9_risk_analysis(
         p2_section=p2_section,
         p3_section=p3_section,
         yfinance_section=yfinance_section,
+        p5_evidence_boundary=p5_evidence_boundary,
         p7_evidence_boundary=p7_evidence_boundary,
     )
     if p7a_structured_degraded:
@@ -1364,6 +1387,7 @@ def p9_risk_analysis(
                             "report_outcome": "",
                             "actionable_items_count": 0,
                             "markdown_chars": len(result),
+                            **p5_degradation_metrics,
                             **p7_provenance_metrics,
                         },
                     )
@@ -1379,6 +1403,7 @@ def p9_risk_analysis(
                 "model_provenance": model_provenance,
                 "schema_validation": {"status": "not_run"},
                 "model_generation": model_generation,
+                **p5_degradation_metrics,
                 **p7_provenance_metrics,
                 "delivery": {
                     "status": "not_generated",
@@ -1397,6 +1422,7 @@ def p9_risk_analysis(
         generation_tracking_metrics = {
             "schema_validation": schema_validation,
             "model_generation": model_generation,
+            **p5_degradation_metrics,
             **p7_provenance_metrics,
             "delivery": {
                 "status": "pending",
@@ -1420,6 +1446,9 @@ def p9_risk_analysis(
                 }
             )
         excluded_layers = {"P7", "P7A"} if p7a_structured_degraded else set()
+        if p5_audit_degraded:
+            excluded_layers.add("P5")
+            data["_p5_evidence_notice"] = p5_evidence_boundary
         if p7_summary_lead:
             excluded_layers.update({"P7", "P7A"})
             data["_p7_evidence_provenance"] = resolved_p7_provenance
@@ -1537,6 +1566,7 @@ def p9_risk_analysis(
                     "model_provenance": model_provenance,
                     "schema_validation": {"status": "invalid", "error": str(exc)},
                     "model_generation": model_generation,
+                    **p5_degradation_metrics,
                     **p7_provenance_metrics,
                     "delivery": {
                         "status": "not_generated",
@@ -1556,6 +1586,7 @@ def p9_risk_analysis(
                 rejected_target_names=rejected_names,
                 checkpoint_snapshot=checkpoint_snapshot,
                 manual_review_required=manual_review_required,
+                p5_audit_degraded=p5_audit_degraded,
                 p7_evidence_provenance=resolved_p7_provenance,
                 _retry_count=_retry_count + 1,
             )
@@ -1571,6 +1602,7 @@ def p9_risk_analysis(
                 "model_provenance": model_provenance,
                 "schema_validation": {"status": "invalid", "error": str(exc)},
                 "model_generation": model_generation,
+                **p5_degradation_metrics,
                 **p7_provenance_metrics,
                 "delivery": {
                     "status": "not_generated",
